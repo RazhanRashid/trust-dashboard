@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Trust Level Dashboard</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="app">
+
+  <!-- Header -->
+  <header class="header">
+    <div>
+      <h1>Trust Level Dashboard</h1>
+      <div class="header-sub">Real-time facial expression · vocal · gaze analysis</div>
+    </div>
+    <div class="status-row">
+      <div class="dot-wrap"><span id="dot-face"  class="dot loading"></span> Face</div>
+      <div class="dot-wrap"><span id="dot-gaze"  class="dot loading"></span> Gaze</div>
+      <div class="dot-wrap"><span id="dot-voice" class="dot loading"></span> Voice</div>
+    </div>
+  </header>
+
+  <!-- Top row: Camera | Score | Voice -->
+  <div class="grid3">
+
+    <!-- Camera & face metrics -->
+    <div class="card">
+      <div class="card-title">Camera Feed</div>
+      <div class="cam-wrap">
+        <video id="video" autoplay muted playsinline></video>
+        <canvas id="face-canvas"></canvas>
+      </div>
+      <div class="metrics-grid">
+        <div class="metric-box">
+          <span class="m-label">Expression</span>
+          <span class="m-value" id="expr-val">—</span>
+        </div>
+        <div class="metric-box">
+          <span class="m-label">Eye Openness</span>
+          <span class="m-value" id="ear-val">—</span>
+        </div>
+        <div class="metric-box">
+          <span class="m-label">Blink Rate</span>
+          <span class="m-value" id="blink-val">—</span>
+        </div>
+        <div class="metric-box">
+          <span class="m-label">Gaze Deviation</span>
+          <span class="m-value" id="gaze-dev-val">—</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Trust score -->
+    <div class="card score-card">
+      <div class="card-title">Trust Score</div>
+
+      <div class="gauge-wrap">
+        <svg class="gauge" viewBox="0 0 200 120">
+          <!-- semicircle arc: center (100,100) radius 80, left→right -->
+          <path class="gauge-track" d="M 20 100 A 80 80 0 0 1 180 100"/>
+          <path id="gauge-arc" class="gauge-arc"  d="M 20 100 A 80 80 0 0 1 180 100"/>
+          <text id="gauge-num" class="gauge-num" x="100" y="92" text-anchor="middle">50</text>
+          <text class="gauge-sub" x="100" y="110" text-anchor="middle">TRUST LEVEL</text>
+        </svg>
+      </div>
+
+      <div class="trust-badge" id="trust-label">Calibrating…</div>
+
+      <div class="bars">
+        <div class="bar-row">
+          <span class="bar-label">Facial</span>
+          <div class="bar-track"><div id="bar-facial" class="bar-fill facial" style="width:50%"></div></div>
+          <span class="bar-num" id="num-facial">50</span>
+        </div>
+        <div class="bar-row">
+          <span class="bar-label">Vocal</span>
+          <div class="bar-track"><div id="bar-vocal"  class="bar-fill vocal"  style="width:50%"></div></div>
+          <span class="bar-num" id="num-vocal">50</span>
+        </div>
+        <div class="bar-row">
+          <span class="bar-label">Gaze</span>
+          <div class="bar-track"><div id="bar-gaze"   class="bar-fill gaze"   style="width:50%"></div></div>
+          <span class="bar-num" id="num-gaze">50</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Voice analysis -->
+    <div class="card voice-card">
+      <div class="card-title">Voice Analysis</div>
+      <canvas id="wave-canvas" class="wave-canvas" width="500" height="72"></canvas>
+      <canvas id="spec-canvas" class="spec-canvas" width="500" height="48"></canvas>
+      <div class="metrics-grid">
+        <div class="metric-box">
+          <span class="m-label">Pitch Stability</span>
+          <span class="m-value" id="pitch-val">—</span>
+        </div>
+        <div class="metric-box">
+          <span class="m-label">Voice Energy</span>
+          <span class="m-value" id="energy-val">—</span>
+        </div>
+        <div class="metric-box">
+          <span class="m-label">Tremor Index</span>
+          <span class="m-value" id="tremor-val">—</span>
+        </div>
+        <div class="metric-box">
+          <span class="m-label">Dominant Hz</span>
+          <span class="m-value" id="hz-val">—</span>
+        </div>
+        <div class="metric-box" style="grid-column: span 2">
+          <span class="m-label">Speaking</span>
+          <span class="m-value" id="speaking-val">No</span>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- History chart -->
+  <div class="card hist-card">
+    <div class="card-title">Trust History (last 30 s)</div>
+    <canvas id="hist-chart"></canvas>
+  </div>
+
+</div>
+
+<!-- Loading overlay -->
+<div class="overlay" id="loading-overlay">
+  <div class="overlay-inner">
+    <div class="spinner"></div>
+    <p id="loading-text">Loading AI models…</p>
+    <div class="progress-track">
+      <div class="progress-bar" id="loading-bar"></div>
+    </div>
+    <p style="font-size:0.72rem;color:var(--t3);margin-top:4px">
+      Camera &amp; microphone access required
+    </p>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>
