@@ -3,11 +3,14 @@
 
 const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
 
-let ws          = null;
-let histChart   = null;
-let lastChartAt = 0;
-let demoMode    = false;
-let demoT       = 0;
+let ws               = null;
+let histChart        = null;
+let summaryChart     = null;
+let lastChartAt      = 0;
+let demoMode         = false;
+let demoT            = 0;
+let sessionStartTime = null;
+let fullSessionData  = [];
 
 const GAUGE_LEN    = 251.2;
 const MAX_CHART_PTS = 60;
@@ -70,7 +73,7 @@ async function boot() {
       loopDemo();
     } else {
       txt.textContent = `Error: ${err.message}`;
-      bar.style.background = '#f87171';
+      bar.style.background = '#f87171';  /* keep red for error state */
     }
   }
 }
@@ -225,7 +228,7 @@ function renderVocalMetrics(vd) {
   set('tremor-val',   (vd.tremor_index    * 100).toFixed(0) + '%');
   set('hz-val',       vd.dominant_hz ? vd.dominant_hz.toFixed(0) + ' Hz' : '—');
   set('speaking-val', vd.is_speaking ? 'Yes' : 'No');
-  $('speaking-val').style.color = vd.is_speaking ? '#4ade80' : '#94a3b8';
+  $('speaking-val').style.color = vd.is_speaking ? '#34d399' : '#64748b';
 }
 
 // ─── History chart ────────────────────────────────────────────────────────────
@@ -237,8 +240,8 @@ function initChart() {
     data: {
       labels: [],
       datasets: [
-        { label: 'Trust',  data: [], borderColor: '#00d4ff', backgroundColor: 'rgba(0,212,255,0.07)', borderWidth: 2.5, pointRadius: 0, tension: 0.4, fill: true },
-        { label: 'Facial', data: [], borderColor: '#4ade80', borderWidth: 1.5, pointRadius: 0, tension: 0.4, borderDash: [5,4] },
+        { label: 'Trust',  data: [], borderColor: '#4f8ef7', backgroundColor: 'rgba(79,142,247,0.08)', borderWidth: 2.4, pointRadius: 0, tension: 0.4, fill: true },
+        { label: 'Facial', data: [], borderColor: '#34d399', borderWidth: 1.5, pointRadius: 0, tension: 0.4, borderDash: [5,4] },
         { label: 'Vocal',  data: [], borderColor: '#818cf8', borderWidth: 1.5, pointRadius: 0, tension: 0.4, borderDash: [5,4] },
         { label: 'Gaze',   data: [], borderColor: '#fbbf24', borderWidth: 1.5, pointRadius: 0, tension: 0.4, borderDash: [5,4] },
       ],
@@ -247,12 +250,12 @@ function initChart() {
       responsive: true,
       maintainAspectRatio: false,
       animation: false,
-      plugins: { legend: { labels: { color: '#94a3b8', boxWidth: 18, font: { size: 11 } } } },
+      plugins: { legend: { labels: { color: '#94a3b8', boxWidth: 16, font: { size: 11 } } } },
       scales: {
         x: { display: false },
         y: { min: 0, max: 100,
-             ticks: { color: '#475569', stepSize: 25 },
-             grid:  { color: 'rgba(255,255,255,0.04)' } },
+             ticks: { color: '#64748b', stepSize: 25 },
+             grid:  { color: 'rgba(42,46,63,0.8)' } },
       },
     },
   });
@@ -260,8 +263,13 @@ function initChart() {
 
 function pushChart(scores) {
   if (!histChart) return;
+  if (!sessionStartTime) sessionStartTime = Date.now();
   const hd = histChart.data;
   const t  = new Date().toLocaleTimeString('en', { hour12: false });
+
+  // Accumulate full history (no trimming) for session summary
+  fullSessionData.push({ t, total: scores.total, facial: scores.facial, vocal: scores.vocal, gaze: scores.gaze });
+
   hd.labels.push(t);
   hd.datasets[0].data.push(scores.total);
   hd.datasets[1].data.push(scores.facial);
@@ -378,14 +386,133 @@ function _drawDemoFeed() {
 function showDemoBanner() {
   const b = document.createElement('div');
   b.style.cssText = `position:fixed;bottom:14px;left:50%;transform:translateX(-50%);
-    background:#1a1a2e;border:1px solid #fbbf24;border-radius:8px;
-    padding:8px 18px;font-size:0.75rem;color:#fbbf24;z-index:50;
-    display:flex;align-items:center;gap:8px;white-space:nowrap`;
-  b.innerHTML = `<span>⚠</span> Demo mode &mdash; run
-    <code style="background:#0f0f1a;padding:2px 6px;border-radius:4px">
+    background:#1a1d27;border:1px solid #2a2e3f;border-radius:8px;
+    padding:8px 18px;font-size:0.74rem;color:#94a3b8;z-index:50;
+    display:flex;align-items:center;gap:8px;white-space:nowrap;
+    box-shadow:0 4px 16px rgba(0,0,0,0.5)`;
+  b.innerHTML = `<span style="color:#fbbf24">⚠</span> Demo mode &mdash; run
+    <code style="background:#0f1117;color:#7ba7f9;padding:2px 7px;border-radius:4px;border:1px solid #2a2e3f">
       pip install -r requirements.txt &amp;&amp; python main.py
     </code> for live analysis`;
   document.body.appendChild(b);
+}
+
+// ─── Session summary ──────────────────────────────────────────────────────────
+
+function endSession() {
+  if (fullSessionData.length < 2) {
+    alert('Not enough data yet — wait a few seconds for data to collect.');
+    return;
+  }
+  showSummary();
+}
+
+function showSummary() {
+  const d = fullSessionData;
+  const avg = key => Math.round(d.reduce((s, r) => s + (r[key] ?? 0), 0) / d.length);
+
+  const avgTrust  = avg('total');
+  const avgFacial = avg('facial');
+  const avgVocal  = avg('vocal');
+  const avgGaze   = avg('gaze');
+  const peakTrust = Math.round(Math.max(...d.map(r => r.total)));
+  const lowTrust  = Math.round(Math.min(...d.map(r => r.total)));
+
+  const durMs   = sessionStartTime ? Date.now() - sessionStartTime : 0;
+  const durSecs = Math.floor(durMs / 1000);
+  const mins    = Math.floor(durSecs / 60);
+  const secs    = durSecs % 60;
+  const durStr  = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+
+  const label = _demoLabel(avgTrust);
+
+  // Header
+  $('summary-meta').textContent = `Duration ${durStr}  ·  ${d.length} samples recorded`;
+
+  // Overall trust
+  const numEl = $('sum-trust-num');
+  numEl.textContent = avgTrust;
+  numEl.style.color = label.color;
+  const lblEl = $('sum-trust-label');
+  lblEl.textContent = label.text;
+  lblEl.style.color = label.color;
+
+  // Channel breakdown bars
+  [['facial', avgFacial], ['vocal', avgVocal], ['gaze', avgGaze]].forEach(([k, v]) => {
+    $(`sb-${k}`).style.width  = `${v}%`;
+    $(`sbn-${k}`).textContent = v;
+  });
+
+  // Stats
+  $('si-duration').textContent = durStr;
+  $('si-points').textContent   = d.length;
+  $('si-peak').textContent     = peakTrust;
+  $('si-low').textContent      = lowTrust;
+
+  // Summary chart (full session history)
+  if (summaryChart) { summaryChart.destroy(); summaryChart = null; }
+  const ctx     = $('summary-chart').getContext('2d');
+  const labels  = d.map(r => r.t);
+  const trust   = d.map(r => r.total);
+  const facial  = d.map(r => r.facial);
+  const vocal   = d.map(r => r.vocal);
+  const gaze    = d.map(r => r.gaze);
+  const avgLine = Array(d.length).fill(avgTrust);
+
+  summaryChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Trust',           data: trust,   borderColor: '#033F63', backgroundColor: 'rgba(3,63,99,0.12)', borderWidth: 2.5, pointRadius: 0, tension: 0.4, fill: true },
+        { label: 'Facial',          data: facial,  borderColor: '#28666E', borderWidth: 1.4, pointRadius: 0, tension: 0.4, borderDash: [5,4] },
+        { label: 'Vocal',           data: vocal,   borderColor: '#7C9885', borderWidth: 1.4, pointRadius: 0, tension: 0.4, borderDash: [5,4] },
+        { label: 'Gaze',            data: gaze,    borderColor: '#B5B682', borderWidth: 1.4, pointRadius: 0, tension: 0.4, borderDash: [5,4] },
+        { label: `Avg ${avgTrust}`, data: avgLine, borderColor: 'rgba(3,63,99,0.4)', borderWidth: 1.4, pointRadius: 0, borderDash: [6,4] },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      plugins: { legend: { labels: { color: '#28666E', boxWidth: 18, font: { size: 11 } } } },
+      scales: {
+        x: { display: false },
+        y: { min: 0, max: 100, ticks: { color: '#7C9885', stepSize: 25 }, grid: { color: 'rgba(124,152,133,0.18)' } },
+      },
+    },
+  });
+
+  $('session-overlay').style.display = 'block';
+}
+
+function startNewSession() {
+  $('session-overlay').style.display = 'none';
+  sessionStartTime = null;
+  fullSessionData  = [];
+  if (summaryChart) { summaryChart.destroy(); summaryChart = null; }
+  if (histChart) {
+    histChart.data.labels = [];
+    histChart.data.datasets.forEach(ds => { ds.data = []; });
+    histChart.update('none');
+  }
+  lastChartAt = 0;
+}
+
+function exportCSV() {
+  if (!fullSessionData.length) return;
+  const rows = ['Time,Trust,Facial,Vocal,Gaze',
+    ...fullSessionData.map(r => `${r.t},${r.total},${r.facial},${r.vocal},${r.gaze}`)];
+  const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+  const url  = URL.createObjectURL(blob);
+  const a    = Object.assign(document.createElement('a'), {
+    href: url,
+    download: `trust-session-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.csv`,
+  });
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -400,3 +527,7 @@ function dot(id, state) {
 }
 
 boot();
+
+$('btn-end-session').addEventListener('click', endSession);
+$('btn-new-session').addEventListener('click', startNewSession);
+$('btn-export').addEventListener('click', exportCSV);

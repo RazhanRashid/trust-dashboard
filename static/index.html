@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Trust Level Dashboard</title>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="styles.css?v=6">
 </head>
 <body>
 
@@ -14,12 +14,13 @@
   <header class="header">
     <div>
       <h1>Trust Level Dashboard</h1>
-      <div class="header-sub">Real-time facial expression · vocal · gaze analysis</div>
+      <div class="header-sub">Real-time facial · vocal · gaze · HRV · workload analysis</div>
     </div>
     <div class="status-row">
       <div class="dot-wrap"><span id="dot-face"  class="dot loading"></span> Face</div>
       <div class="dot-wrap"><span id="dot-gaze"  class="dot loading"></span> Gaze</div>
       <div class="dot-wrap"><span id="dot-voice" class="dot loading"></span> Voice</div>
+      <button class="btn-end-session" id="btn-end-session">&#9632; End Session</button>
     </div>
   </header>
 
@@ -60,8 +61,8 @@
       <div class="gauge-wrap">
         <svg class="gauge" viewBox="0 0 200 120">
           <!-- semicircle arc: center (100,100) radius 80, left→right -->
-          <path class="gauge-track" d="M 20 100 A 80 80 0 0 1 180 100" fill="none" stroke="#2a2a4e" stroke-width="14" stroke-linecap="round"/>
-          <path id="gauge-arc" class="gauge-arc" d="M 20 100 A 80 80 0 0 1 180 100" fill="none" stroke="#4ade80" stroke-width="14" stroke-linecap="round" stroke-dasharray="251.2" stroke-dashoffset="125.6"/>
+          <path class="gauge-track" d="M 20 100 A 80 80 0 0 1 180 100" fill="none" stroke="#e6e8ec" stroke-width="14" stroke-linecap="round"/>
+          <path id="gauge-arc" class="gauge-arc" d="M 20 100 A 80 80 0 0 1 180 100" fill="none" stroke="#16a34a" stroke-width="14" stroke-linecap="round" stroke-dasharray="251.2" stroke-dashoffset="125.6"/>
           <text id="gauge-num" class="gauge-num" x="100" y="92" text-anchor="middle">50</text>
           <text class="gauge-sub" x="100" y="110" text-anchor="middle">TRUST LEVEL</text>
         </svg>
@@ -127,6 +128,84 @@
 
 </div>
 
+<!-- Session Summary Overlay -->
+<div class="session-overlay" id="session-overlay" style="display:none">
+  <div class="session-summary">
+
+    <div class="summary-header">
+      <div>
+        <h2>Session Complete</h2>
+        <div class="summary-meta" id="summary-meta">—</div>
+      </div>
+    </div>
+
+    <div class="summary-cards">
+
+      <!-- Overall Trust -->
+      <div class="summary-card">
+        <div class="summary-card-title">Overall Trust</div>
+        <div class="summary-big-num" id="sum-trust-num">—</div>
+        <div class="summary-trust-label" id="sum-trust-label">—</div>
+        <div class="summary-hint">session average</div>
+      </div>
+
+      <!-- Channel Breakdown -->
+      <div class="summary-card">
+        <div class="summary-card-title">Channel Breakdown</div>
+        <div class="summary-bar-row">
+          <span class="summary-bar-label">Facial</span>
+          <div class="bar-track"><div id="sb-facial" class="bar-fill facial" style="width:0%"></div></div>
+          <span class="summary-bar-num" id="sbn-facial">—</span>
+        </div>
+        <div class="summary-bar-row">
+          <span class="summary-bar-label">Vocal</span>
+          <div class="bar-track"><div id="sb-vocal" class="bar-fill vocal" style="width:0%"></div></div>
+          <span class="summary-bar-num" id="sbn-vocal">—</span>
+        </div>
+        <div class="summary-bar-row">
+          <span class="summary-bar-label">Gaze</span>
+          <div class="bar-track"><div id="sb-gaze" class="bar-fill gaze" style="width:0%"></div></div>
+          <span class="summary-bar-num" id="sbn-gaze">—</span>
+        </div>
+      </div>
+
+      <!-- Session Stats -->
+      <div class="summary-card">
+        <div class="summary-card-title">Session Info</div>
+        <div class="summary-stat-row">
+          <span class="summary-stat-label">Duration</span>
+          <span class="summary-stat-val" id="si-duration">—</span>
+        </div>
+        <div class="summary-stat-row">
+          <span class="summary-stat-label">Data points</span>
+          <span class="summary-stat-val" id="si-points">—</span>
+        </div>
+        <div class="summary-stat-row">
+          <span class="summary-stat-label">Peak trust</span>
+          <span class="summary-stat-val" id="si-peak">—</span>
+        </div>
+        <div class="summary-stat-row">
+          <span class="summary-stat-label">Lowest trust</span>
+          <span class="summary-stat-val" id="si-low">—</span>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Full session history chart -->
+    <div class="summary-chart-card">
+      <div class="summary-chart-title">Trust Score History</div>
+      <canvas id="summary-chart"></canvas>
+    </div>
+
+    <div class="summary-footer">
+      <button class="btn-new-session" id="btn-new-session">&#8635;  New Session</button>
+      <button class="btn-export" id="btn-export">&#8681;  Export CSV</button>
+    </div>
+
+  </div>
+</div>
+
 <!-- Loading overlay -->
 <div class="overlay" id="loading-overlay">
   <div class="overlay-inner">
@@ -142,6 +221,6 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-<script type="module" src="/static/client.js"></script>
+<script type="module" src="client.js"></script>
 </body>
 </html>

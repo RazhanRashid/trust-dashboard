@@ -159,6 +159,23 @@ class FaceAnalyzer:
             except Exception:
                 pose_dev = avg_gaze
 
+            # ── Iris/pupil diameter estimate ───────────────────────────────
+            # Left iris:  center=468, edges=469-472
+            # Right iris: center=473, edges=474-477
+            # Normalise by inter-ocular distance so head distance cancels out.
+            def iris_radius(center_idx, edge_idxs):
+                c = pt(center_idx)
+                return float(np.mean([np.linalg.norm(pt(e) - c) for e in edge_idxs]))
+
+            try:
+                l_iris_r  = iris_radius(468, [469, 470, 471, 472])
+                r_iris_r  = iris_radius(473, [474, 475, 476, 477])
+                avg_iris  = (l_iris_r + r_iris_r) / 2.0
+                inter_ocu = float(np.linalg.norm(pt(33) - pt(263)))
+                pupil_norm = avg_iris / (inter_ocu + 1e-9)
+            except Exception:
+                pupil_norm = None
+
             # ── Face bounding box from landmark extents ────────────────────
             xs = [lm.x for lm in lms]
             ys = [lm.y for lm in lms]
@@ -185,6 +202,7 @@ class FaceAnalyzer:
                 "r_ear":          float(r_ear),
                 "blink_rate":     float(self.blink_rate),
                 "gaze_deviation": float(pose_dev),
+                "pupil_norm":     pupil_norm,    # iris radius / inter-ocular dist
                 "box_norm":       [bx, by, bw_, bh_],
                 "eye_norm":       {"l": l_pts, "r": r_pts},
             }

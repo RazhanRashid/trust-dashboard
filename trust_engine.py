@@ -1,18 +1,22 @@
 class TrustEngine:
     def __init__(self):
-        self.smoothed = {"total": 50.0, "facial": 50.0, "vocal": 50.0, "gaze": 50.0}  # Stores the exponentially smoothed scores; initialised to 50 (neutral) so the display starts centred
-        self.alpha = 0.2   # Smoothing factor: 0.2 means each new raw score contributes 20% and the previous smoothed value contributes 80%
+        self.smoothed = {"total": 50.0, "facial": 50.0, "vocal": 50.0, "gaze": 50.0, "hrv": 50.0}
+        self.alpha = 0.2
 
-    def update(self, face_data: dict | None, vocal_data: dict | None) -> dict:
-        facial = self._facial_score(face_data)      # Calculates a raw 0–100 facial trust score from the latest expression data
-        vocal  = self._vocal_score(vocal_data)      # Calculates a raw 0–100 vocal trust score from the latest audio data
-        gaze   = self._gaze_score(face_data)        # Calculates a raw 0–100 gaze trust score from the latest eye-tracking data
-        total  = facial * 0.4 + vocal * 0.3 + gaze * 0.3  # Combines the three channels: facial 40%, vocal 30%, gaze 30%
+    def update(self, face_data: dict | None, vocal_data: dict | None,
+               hrv_score: int = 65) -> dict:
+        facial = self._facial_score(face_data)
+        vocal  = self._vocal_score(vocal_data)
+        gaze   = self._gaze_score(face_data)
+        hrv    = float(hrv_score)
+        # Weights: facial 35%, vocal 25%, gaze 25%, HRV 15%
+        total  = facial * 0.35 + vocal * 0.25 + gaze * 0.25 + hrv * 0.15
 
-        for k, v in [("facial", facial), ("vocal", vocal), ("gaze", gaze), ("total", total)]:
-            self.smoothed[k] = self.alpha * v + (1 - self.alpha) * self.smoothed[k]  # Applies exponential moving average to prevent the score from jumping erratically
+        for k, v in [("facial", facial), ("vocal", vocal), ("gaze", gaze),
+                     ("hrv", hrv), ("total", total)]:
+            self.smoothed[k] = self.alpha * v + (1 - self.alpha) * self.smoothed[k]
 
-        return {k: round(v) for k, v in self.smoothed.items()}  # Rounds smoothed floats to integers before sending to the browser
+        return {k: round(v) for k, v in self.smoothed.items()}
 
     def _facial_score(self, fd: dict | None) -> float:
         if not fd or not fd.get("detected"):        # Returns neutral 50 when no face is visible so the score doesn't collapse to zero
