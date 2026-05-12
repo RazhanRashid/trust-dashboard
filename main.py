@@ -1,3 +1,13 @@
+# Compatibility shims for py-feat with newer library versions:
+# 1. torchvision 0.21+ removed read_video; py-feat imports it but only uses it for video files (unused here)
+import torchvision.io as _tvio
+if not hasattr(_tvio, "read_video"):
+    _tvio.read_video = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("read_video unavailable"))
+# 2. scipy 1.14+ renamed simps → simpson; py-feat still imports the old name
+import scipy.integrate as _sci
+if not hasattr(_sci, "simps"):
+    _sci.simps = _sci.simpson
+
 import tkinter as tk                    # Python's built-in GUI toolkit — creates the desktop window and all widgets
 import threading                        # Runs camera capture and audio capture in background threads so the UI stays responsive
 import time                             # Used in the camera loop to throttle analysis to ~15 fps

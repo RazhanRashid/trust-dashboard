@@ -17,15 +17,39 @@ class TrustEngine:
     def _facial_score(self, fd: dict | None) -> float:
         if not fd or not fd.get("detected"):        # Returns neutral 50 when no face is visible so the score doesn't collapse to zero
             return 50.0
-        e = fd["expressions"]                       # Retrieves the normalised emotion probability dict from the face analyser
+
+        e   = fd["expressions"]                     # Deep-learning emotion probabilities (resmasknet output)
+        aus = fd.get("aus", {})                     # Raw OpenFace-style AU intensities from py-feat
+
         s = 50.0                                    # Starts from a neutral baseline of 50
-        s += e.get("happy",     0) * 40             # Happy is the strongest positive trust signal (genuine smile = openness)
-        s += e.get("neutral",   0) * 12             # Neutral expression is mildly positive (calm composure)
-        s += e.get("surprised", 0) *  5             # Surprise is weakly positive (can indicate engagement)
-        s -= e.get("fearful",   0) * 35             # Fear is a strong negative signal (discomfort, anxiety)
-        s -= e.get("angry",     0) * 40             # Anger is the strongest negative signal (hostility, distrust)
-        s -= e.get("disgusted", 0) * 35             # Disgust is a strong negative signal (rejection, aversion)
-        s -= e.get("sad",       0) * 22             # Sadness is a moderate negative signal (low engagement, withdrawal)
+
+        # ── Deep-learning emotion component ───────────────────────────────────
+        s += e.get("happy",     0) * 30             # Happy is a strong positive trust signal
+        s += e.get("neutral",   0) * 10             # Calm neutral expression is mildly positive
+        s += e.get("surprised", 0) *  4             # Surprise is weakly positive (engagement)
+        s -= e.get("fearful",   0) * 30             # Fear signals discomfort or anxiety
+        s -= e.get("angry",     0) * 35             # Anger is the strongest negative signal
+        s -= e.get("disgusted", 0) * 30             # Disgust signals rejection or aversion
+        s -= e.get("sad",       0) * 18             # Sadness signals low engagement or withdrawal
+
+        # ── OpenFace Action Unit component (FACS-based) ───────────────────────
+        # Duchenne smile: AU06 (Cheek Raiser) + AU12 (Lip Corner Puller)
+        # The combination uniquely identifies a genuine (vs social/polite) smile
+        duchenne = fd.get("duchenne", 0)
+        s += duchenne * 20                          # Genuine smile is a strong positive trust indicator
+
+        # AU04 (Brow Lowerer) signals concentration, concern, or hostility
+        s -= aus.get("AU04", 0) * 12
+
+        # AU07 (Lid Tightener) combined with AU04 indicates anger or suspicion
+        s -= aus.get("AU07", 0) * aus.get("AU04", 0) * 15
+
+        # AU20 (Lip Stretcher — horizontal lip pull) is a fear/stress marker
+        s -= aus.get("AU20", 0) * 10
+
+        # AU14 (Dimpler — asymmetric mouth corner) can indicate contempt
+        s -= aus.get("AU14", 0) * 8
+
         return max(0.0, min(100.0, s))              # Clamps the result to the valid 0–100 range
 
     def _vocal_score(self, vd: dict | None) -> float:
