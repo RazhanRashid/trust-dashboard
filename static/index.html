@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Trust Level Dashboard</title>
-  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
 
@@ -60,8 +60,8 @@
       <div class="gauge-wrap">
         <svg class="gauge" viewBox="0 0 200 120">
           <!-- semicircle arc: center (100,100) radius 80, left→right -->
-          <path class="gauge-track" d="M 20 100 A 80 80 0 0 1 180 100"/>
-          <path id="gauge-arc" class="gauge-arc"  d="M 20 100 A 80 80 0 0 1 180 100"/>
+          <path class="gauge-track" d="M 20 100 A 80 80 0 0 1 180 100" fill="none" stroke="#2a2a4e" stroke-width="14" stroke-linecap="round"/>
+          <path id="gauge-arc" class="gauge-arc" d="M 20 100 A 80 80 0 0 1 180 100" fill="none" stroke="#4ade80" stroke-width="14" stroke-linecap="round" stroke-dasharray="251.2" stroke-dashoffset="125.6"/>
           <text id="gauge-num" class="gauge-num" x="100" y="92" text-anchor="middle">50</text>
           <text class="gauge-sub" x="100" y="110" text-anchor="middle">TRUST LEVEL</text>
         </svg>
@@ -141,8 +141,7 @@
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-<script type="module" src="app.js"></script>
+<script type="module" src="/static/client.js"></script>
 </body>
 </html>
