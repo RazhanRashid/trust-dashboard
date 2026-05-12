@@ -1,23 +1,6 @@
 import os
 import logging
-os.environ["TQDM_DISABLE"] = "1"   # Suppress py-feat's per-frame tqdm progress bars
-logging.getLogger("root").setLevel(logging.ERROR)  # Suppress py-feat's "NO FACE detected" warnings
-
-# Compatibility shims for py-feat with newer library versions:
-# 3. PyTorch 2.x forbids .numpy() on grad-tracked tensors; py-feat calls it without .detach()
-import torch as _torch
-_orig_np = _torch.Tensor.numpy
-def _safe_numpy(self, *a, **kw):
-    return self.detach().numpy(*a, **kw)
-_torch.Tensor.numpy = _safe_numpy
-# 1. torchvision 0.21+ removed read_video; py-feat imports it but only uses it for video files (unused here)
-import torchvision.io as _tvio
-if not hasattr(_tvio, "read_video"):
-    _tvio.read_video = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("read_video unavailable"))
-# 2. scipy 1.14+ renamed simps → simpson; py-feat still imports the old name
-import scipy.integrate as _sci
-if not hasattr(_sci, "simps"):
-    _sci.simps = _sci.simpson
+logging.getLogger("root").setLevel(logging.ERROR)
 
 import tkinter as tk                    # Python's built-in GUI toolkit — creates the desktop window and all widgets
 import threading                        # Runs camera capture and audio capture in background threads so the UI stays responsive

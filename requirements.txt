@@ -1,6 +1,6 @@
-py-feat>=0.5
-numpy>=1.24
-opencv-python>=4.8
+mediapipe>=0.10
+numpy>=1.23.5,<2.0
+opencv-python>=4.8,<4.12
 Pillow>=10.0
 sounddevice>=0.4
 matplotlib>=3.7
