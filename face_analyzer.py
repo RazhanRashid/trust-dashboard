@@ -1,6 +1,8 @@
 import time                             # Used to measure elapsed time for the blink-rate calculation window
+import os
+import tempfile                         # detect_image in py-feat 0.6 only works reliably with a file path, not arrays
 import numpy as np                      # Used for vector maths when computing Eye Aspect Ratio and landmark coordinates
-import cv2                              # Converts BGR frames to RGB before passing them to py-feat
+import cv2                              # Captures frames; writes temp JPEG for py-feat
 
 from feat import Detector               # py-feat: Python Facial Expression Analysis Toolbox — OpenFace-style AU detection in pure Python
 
@@ -32,7 +34,7 @@ class FaceAnalyzer:
         self.detector = Detector(
             face_model="retinaface",    # RetinaFace: accurate multi-scale face detector
             landmark_model="mobilenet", # MobileNet-based 68-point facial landmark detector
-            au_model="xgb",             # XGBoost AU intensity predictor (fast, accurate)
+            au_model="svm",             # SVM AU predictor — sklearn-based, loads eagerly at init (XGBoost hangs on first call from background thread)
             emotion_model="resmasknet", # ResNet + attention mask emotion classifier
             facepose_model="img2pose",  # Head pose estimation (pitch, roll, yaw)
         )
@@ -54,14 +56,19 @@ class FaceAnalyzer:
             return self.last_result
 
         h, w = frame_bgr.shape[:2]                      # Gets frame dimensions for normalising coordinates to [0,1]
-        rgb  = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)  # py-feat expects RGB; OpenCV gives BGR
 
+        # py-feat 0.6 detect_image only works reliably with a file path
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".jpg")
         try:
-            result = self.detector.detect_image(rgb)    # Runs the full OpenFace-style pipeline: detect → landmarks → AUs → emotions → pose
+            os.close(tmp_fd)
+            cv2.imwrite(tmp_path, frame_bgr)            # Write BGR JPEG; py-feat will load it as RGB internally
+            result = self.detector.detect_image(tmp_path, output_size=(640, 360))
         except Exception as e:
-            print(f"Detection error: {e}")
+            print(f"[face] detection error: {e}", flush=True)
             self.last_result = {"detected": False}
             return self.last_result
+        finally:
+            os.unlink(tmp_path)
 
         # Check whether py-feat found a face in this frame
         if result is None or len(result) == 0:
@@ -72,7 +79,8 @@ class FaceAnalyzer:
             if any(fb[c] != fb[c] for c in fb.index):  # NaN check — py-feat returns NaN columns when no face is found
                 self.last_result = {"detected": False}
                 return self.last_result
-        except Exception:
+        except Exception as e:
+            print(f"[face] facebox error: {e}", flush=True)
             self.last_result = {"detected": False}
             return self.last_result
 
@@ -155,7 +163,7 @@ class FaceAnalyzer:
             }
 
         except Exception as e:
-            print(f"Analysis error: {e}")
+            print(f"[face] analysis error: {e}", flush=True)
             self.last_result = {"detected": False}
 
         return self.last_result

@@ -1,4 +1,15 @@
+import os
+import logging
+os.environ["TQDM_DISABLE"] = "1"   # Suppress py-feat's per-frame tqdm progress bars
+logging.getLogger("root").setLevel(logging.ERROR)  # Suppress py-feat's "NO FACE detected" warnings
+
 # Compatibility shims for py-feat with newer library versions:
+# 3. PyTorch 2.x forbids .numpy() on grad-tracked tensors; py-feat calls it without .detach()
+import torch as _torch
+_orig_np = _torch.Tensor.numpy
+def _safe_numpy(self, *a, **kw):
+    return self.detach().numpy(*a, **kw)
+_torch.Tensor.numpy = _safe_numpy
 # 1. torchvision 0.21+ removed read_video; py-feat imports it but only uses it for video files (unused here)
 import torchvision.io as _tvio
 if not hasattr(_tvio, "read_video"):
@@ -237,12 +248,20 @@ class TrustDashboard:
     # ── Camera thread ──────────────────────────────────────────────────────────
 
     def _pick_camera(self) -> int:
+        import sys, io
         available = []
         for i in range(6):                                                 # Checks indices 0–5 for connected cameras
-            cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                available.append(i)
+            old_err = os.dup(2)                                            # Suppress OpenCV "out of bound" stderr spam while probing
+            os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
+            try:
+                cap = cv2.VideoCapture(i, cv2.CAP_AVFOUNDATION)
+                found = cap.isOpened()
                 cap.release()
+            finally:
+                os.dup2(old_err, 2)
+                os.close(old_err)
+            if found:
+                available.append(i)
 
         if len(available) <= 1:                                            # If only one camera found, use it automatically
             return available[0] if available else 0
@@ -282,18 +301,41 @@ class TrustDashboard:
 
     def _start_camera(self):
         idx = self._pick_camera()                                          # Shows picker if multiple cameras are detected
-        self.cap = cv2.VideoCapture(idx)                                   # Opens the selected camera
-        threading.Thread(target=self._camera_loop, daemon=True).start()   # Runs the loop in a daemon thread so it exits when the app closes
+        self.cap = cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION)            # AVFoundation backend required on macOS for reliable camera access
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        time.sleep(0.5)                                                    # Give AVFoundation time to initialise before reading
+        self._pending_frame = None                                         # Frame queued for face analysis
+        threading.Thread(target=self._camera_loop,  daemon=True).start()  # Reads frames at display rate
+        threading.Thread(target=self._analysis_loop, daemon=True).start() # Runs py-feat at its own (slower) pace
 
     def _camera_loop(self):
         while self._running:                                               # Keeps running until the window is closed
             ok, frame = self.cap.read()                                    # Reads one frame from the webcam
-            if ok:
+            if ok and frame is not None and frame.mean() > 1.0:           # Skip black/empty frames that AVFoundation emits during warm-up
                 frame = cv2.flip(frame, 1)                                 # Mirrors the frame horizontally so it behaves like a mirror
-                face_data = self.face.analyze(frame)                       # Runs MediaPipe face detection and emotion mapping on this frame
                 with self._lock:
-                    self._last_frame = (frame.copy(), face_data)           # Stores a copy so the UI thread can read it without data races
-            time.sleep(0.067)                                              # Throttles to ~15 fps to keep CPU usage reasonable
+                    self._pending_frame = frame                            # Always show the latest frame immediately
+                    if self._last_frame is None:
+                        self._last_frame = (frame, {"detected": False})
+                    else:
+                        self._last_frame = (frame, self._last_frame[1])   # Keep last known face_data until analysis updates it
+            time.sleep(0.033)                                              # ~30 fps display rate
+
+    def _analysis_loop(self):
+        print("[analysis] thread started", flush=True)
+        while self._running:                                               # Runs face analysis independently so it never blocks the display
+            with self._lock:
+                frame = self._pending_frame
+            if frame is not None:
+                print("[analysis] got frame, starting detect…", flush=True)
+                small = cv2.resize(frame, (640, 360))                      # Downscale to 640×360 — keeps 16:9 aspect ratio so face proportions stay correct
+                face_data = self.face.analyze(small)
+                print(f"[analysis] detected={face_data.get('detected')} dominant={face_data.get('dominant','—')}", flush=True)
+                with self._lock:
+                    if self._last_frame is not None:
+                        self._last_frame = (self._last_frame[0], face_data)
+            time.sleep(0.1)                                                # Analyse at ~10 fps max; py-feat typically takes longer than this anyway
 
     # ── Audio thread ────────────────────────────────────────────────────────────
 
