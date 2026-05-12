@@ -1,6 +1,6 @@
-fastapi>=0.104
-uvicorn[standard]>=0.24
 mediapipe>=0.10
 numpy>=1.24
-opencv-python-headless>=4.8
-python-multipart
+opencv-python>=4.8
+Pillow>=10.0
+sounddevice>=0.4
+matplotlib>=3.7

@@ -48,7 +48,15 @@ On first run, the MediaPipe face landmarker model (~3 MB) is downloaded automati
 python3 main.py
 ```
 
-The server starts on **http://localhost:8000** and your browser opens automatically.
+A desktop window opens immediately — no browser needed.
+
+---
+
+## Running in Thonny
+
+1. Open Thonny and go to **File → Open** → select `main.py`
+2. Press the green **Run** button (or F5)
+3. The dashboard window opens automatically
 
 ---
 
@@ -58,8 +66,6 @@ The server starts on **http://localhost:8000** and your browser opens automatica
 2. Install the **Python** extension if prompted
 3. Press `F5` or go to **Run → Start Debugging**
 4. Select **Run Trust Dashboard** from the dropdown
-
-The integrated terminal shows server logs and the browser opens automatically.
 
 ---
 
