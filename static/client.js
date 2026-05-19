@@ -497,6 +497,8 @@ function startNewSession() {
     histChart.update('none');
   }
   lastChartAt = 0;
+  // Reset server-side session state
+  fetch('/session/reset', { method: 'POST' }).catch(() => {});
 }
 
 function exportCSV() {

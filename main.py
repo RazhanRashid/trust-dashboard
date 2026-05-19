@@ -1143,6 +1143,10 @@ class TrustDashboard:
                                 "Wait at least a few seconds after calibration.")
             return
         self._session_ended = True
+        # Hide the main chart widget so its pending draw_idle() calls cannot
+        # paint over the summary window that is about to be created.
+        if hasattr(self, '_fig_canvas'):
+            self._fig_canvas.get_tk_widget().pack_forget()
         self._build_session_summary()
 
     def _compute_session_stats(self) -> dict:
@@ -1190,10 +1194,18 @@ class TrustDashboard:
         total = stats.get("trust_total", 50)
         tlabel = TrustEngine.trust_label(int(total))
 
-        # ── Outer overlay (covers entire window) ──────────────────────────
-        ov = tk.Frame(self.root, bg=BG)
-        ov.place(relx=0, rely=0, relwidth=1, relheight=1)
-        ov.lift()
+        # ── Toplevel window — a real OS window, so matplotlib can't overdraw it ──
+        ov = tk.Toplevel(self.root)
+        ov.title('Session Complete')
+        ov.configure(bg=BG)
+        # Match the main window's size and position
+        ov.geometry(
+            f"{self.root.winfo_width()}x{self.root.winfo_height()}"
+            f"+{self.root.winfo_x()}+{self.root.winfo_y()}"
+        )
+        ov.resizable(True, True)
+        ov.grab_set()          # make it modal — blocks interaction with main window
+        ov.focus_set()
         self._summary_overlay = ov
 
         # ── Top bar ───────────────────────────────────────────────────────
@@ -1352,13 +1364,14 @@ class TrustDashboard:
         exp_btn.bind('<Enter>', lambda e: exp_btn.configure(bg='#3a7bd5'))
         exp_btn.bind('<Leave>', lambda e: exp_btn.configure(bg=BRONZE))
 
-        # Force Tkinter to lay out and paint all overlay widgets immediately.
-        ov.update_idletasks()
-
     def _restart_session(self):
-        """Tear down the summary overlay and restart calibration."""
+        """Tear down the summary window and restart calibration."""
         if hasattr(self, '_summary_overlay') and self._summary_overlay.winfo_exists():
             self._summary_overlay.destroy()
+        # Restore the main chart canvas that was hidden when End Session was pressed
+        if hasattr(self, '_fig_canvas'):
+            self._fig_canvas.get_tk_widget().pack(
+                fill='both', expand=True, padx=12, pady=(0, 10))
         # Reset all session state
         self._session_rows       = []
         self._session_start      = 0.0
