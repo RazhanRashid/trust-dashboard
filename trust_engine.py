@@ -8,7 +8,7 @@ class TrustEngine:
         facial = self._facial_score(face_data)
         vocal  = self._vocal_score(vocal_data)
         gaze   = self._gaze_score(face_data)
-        hrv    = float(hrv_score)
+        hrv    = float(hrv_score) if hrv_score is not None else 65.0
         # Weights: facial 35%, vocal 25%, gaze 25%, HRV 15%
         total  = facial * 0.35 + vocal * 0.25 + gaze * 0.25 + hrv * 0.15
 

@@ -1,0 +1,132 @@
+[
+  {
+    "date": "2026-05-19 13:35",
+    "duration_str": "00:08",
+    "n_samples": 9,
+    "trust_total": 57.1,
+    "trust_facial": 52.3,
+    "trust_vocal": 58.2,
+    "trust_gaze": 59.7,
+    "trust_hrv": 63.7
+  },
+  {
+    "date": "2026-05-19 13:42",
+    "duration_str": "00:05",
+    "n_samples": 6,
+    "trust_total": 56.2,
+    "trust_facial": 56.0,
+    "trust_vocal": 55.3,
+    "trust_gaze": 53.0,
+    "trust_hrv": 63.0
+  },
+  {
+    "date": "2026-05-19 13:46",
+    "duration_str": "00:02",
+    "n_samples": 3,
+    "trust_total": 53.0,
+    "trust_facial": 50.0,
+    "trust_vocal": 51.3,
+    "trust_gaze": 53.7,
+    "trust_hrv": 61.0
+  },
+  {
+    "date": "2026-05-19 13:50",
+    "duration_str": "00:03",
+    "n_samples": 4,
+    "trust_total": 48.2,
+    "trust_facial": 51.2,
+    "trust_vocal": 42.0,
+    "trust_gaze": 43.0,
+    "trust_hrv": 62.0
+  },
+  {
+    "date": "2026-05-19 13:56",
+    "duration_str": "00:03",
+    "n_samples": 4,
+    "trust_total": 54.5,
+    "trust_facial": 52.2,
+    "trust_vocal": 53.0,
+    "trust_gaze": 54.2,
+    "trust_hrv": 62.0
+  },
+  {
+    "date": "2026-05-19 16:09",
+    "duration_str": "00:22",
+    "n_samples": 23,
+    "trust_total": 50.6,
+    "trust_facial": 53.0,
+    "trust_vocal": 46.0,
+    "trust_gaze": 43.9,
+    "trust_hrv": 64.5
+  },
+  {
+    "date": "2026-05-19 16:13",
+    "duration_str": "00:33",
+    "n_samples": 34,
+    "trust_total": 51.4,
+    "trust_facial": 51.8,
+    "trust_vocal": 46.5,
+    "trust_gaze": 48.0,
+    "trust_hrv": 64.6
+  },
+  {
+    "date": "2026-05-19 16:18",
+    "duration_str": "00:04",
+    "n_samples": 5,
+    "trust_total": 53.4,
+    "trust_facial": 58.0,
+    "trust_vocal": 50.0,
+    "trust_gaze": 44.8,
+    "trust_hrv": 62.6
+  },
+  {
+    "date": "2026-05-19 16:20",
+    "duration_str": "00:28",
+    "n_samples": 29,
+    "trust_total": 52.4,
+    "trust_facial": 55.9,
+    "trust_vocal": 50.4,
+    "trust_gaze": 42.1,
+    "trust_hrv": 64.6
+  },
+  {
+    "date": "2026-05-20 14:00",
+    "duration_str": "00:32",
+    "n_samples": 33,
+    "trust_total": 52.3,
+    "trust_facial": 57.8,
+    "trust_vocal": 47.2,
+    "trust_gaze": 42.5,
+    "trust_hrv": 64.6
+  },
+  {
+    "date": "2026-05-20 14:09",
+    "duration_str": "00:04",
+    "n_samples": 5,
+    "trust_total": 56.6,
+    "trust_facial": 58.4,
+    "trust_vocal": 50.0,
+    "trust_gaze": 56.6,
+    "trust_hrv": 62.6
+  },
+  {
+    "date": "2026-05-20 14:10",
+    "duration_str": "00:27",
+    "n_samples": 28,
+    "trust_total": 53.2,
+    "trust_facial": 54.5,
+    "trust_vocal": 45.9,
+    "trust_gaze": 51.5,
+    "trust_hrv": 64.6
+  },
+  {
+    "date": "2026-05-20 16:39",
+    "duration_str": "00:35",
+    "n_samples": 35,
+    "trust_total": 56,
+    "trust_facial": 57,
+    "trust_vocal": 45,
+    "trust_gaze": 58,
+    "trust_hrv": 65
+  }
+]
