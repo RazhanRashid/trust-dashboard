@@ -2,12 +2,13 @@ class TrustEngine:
     def __init__(self):
         self.smoothed = {"total": 50.0, "facial": 50.0, "vocal": 50.0, "gaze": 50.0, "hrv": 50.0}
         self.alpha = 0.2
+        self._prev_inputs: dict = {}   # stores raw signal values from the previous tick
 
     def update(self, face_data: dict | None, vocal_data: dict | None,
                hrv_score: int = 65) -> dict:
-        facial = self._facial_score(face_data)
-        vocal  = self._vocal_score(vocal_data)
-        gaze   = self._gaze_score(face_data)
+        facial, facial_contribs = self._facial_score(face_data)
+        vocal,  vocal_contribs  = self._vocal_score(vocal_data)
+        gaze,   gaze_contribs   = self._gaze_score(face_data)
         hrv    = float(hrv_score) if hrv_score is not None else 65.0
         # Weights: facial 35%, vocal 25%, gaze 25%, HRV 15%
         total  = facial * 0.35 + vocal * 0.25 + gaze * 0.25 + hrv * 0.15
@@ -16,79 +17,147 @@ class TrustEngine:
                      ("hrv", hrv), ("total", total)]:
             self.smoothed[k] = self.alpha * v + (1 - self.alpha) * self.smoothed[k]
 
-        return {k: round(v) for k, v in self.smoothed.items()}
+        scores = {k: round(v) for k, v in self.smoothed.items()}
+        scores["contributions"] = {
+            "facial": facial_contribs,
+            "vocal":  vocal_contribs,
+            "gaze":   gaze_contribs,
+        }
+        return scores
 
-    def _facial_score(self, fd: dict | None) -> float:
-        if not fd or not fd.get("detected"):        # Returns neutral 50 when no face is visible so the score doesn't collapse to zero
-            return 50.0
+    def _facial_score(self, fd: dict | None):
+        if not fd or not fd.get("detected"):
+            return 50.0, []
 
-        e   = fd["expressions"]                     # Deep-learning emotion probabilities (resmasknet output)
-        aus = fd.get("aus", {})                     # Raw OpenFace-style AU intensities from py-feat
+        e   = fd["expressions"]
+        aus = fd.get("aus", {})
+        s   = 50.0
+        prev = self._prev_inputs
 
-        s = 50.0                                    # Starts from a neutral baseline of 50
+        contribs = []
+        for key, weight, label in [
+            ("happy",     30,  "happy"),
+            ("neutral",   10,  "neutral"),
+            ("surprised",  4,  "surprised"),
+            ("fearful",  -30,  "fearful"),
+            ("angry",    -35,  "angry"),
+            ("disgusted",-30,  "disgusted"),
+            ("sad",      -18,  "sad"),
+        ]:
+            cur = e.get(key, 0)
+            prv = prev.get(f"face_{key}", cur)
+            delta_pts = (cur - prv) * abs(weight)
+            if abs(delta_pts) >= 1.0:
+                contribs.append((label, prv, cur, round(delta_pts, 1)))
+            s += cur * weight
+            prev[f"face_{key}"] = cur
 
-        # ── Deep-learning emotion component ───────────────────────────────────
-        s += e.get("happy",     0) * 30             # Happy is a strong positive trust signal
-        s += e.get("neutral",   0) * 10             # Calm neutral expression is mildly positive
-        s += e.get("surprised", 0) *  4             # Surprise is weakly positive (engagement)
-        s -= e.get("fearful",   0) * 30             # Fear signals discomfort or anxiety
-        s -= e.get("angry",     0) * 35             # Anger is the strongest negative signal
-        s -= e.get("disgusted", 0) * 30             # Disgust signals rejection or aversion
-        s -= e.get("sad",       0) * 18             # Sadness signals low engagement or withdrawal
-
-        # ── OpenFace Action Unit component (FACS-based) ───────────────────────
-        # Duchenne smile: AU06 (Cheek Raiser) + AU12 (Lip Corner Puller)
-        # The combination uniquely identifies a genuine (vs social/polite) smile
         duchenne = fd.get("duchenne", 0)
-        s += duchenne * 20                          # Genuine smile is a strong positive trust indicator
+        prv_d = prev.get("face_duchenne", duchenne)
+        delta_d = (duchenne - prv_d) * 20
+        if abs(delta_d) >= 1.0:
+            contribs.append(("duchenne smile", prv_d, duchenne, round(delta_d, 1)))
+        s += duchenne * 20
+        prev["face_duchenne"] = duchenne
 
-        # AU04 (Brow Lowerer) signals concentration, concern, or hostility
-        s -= aus.get("AU04", 0) * 12
+        for au, weight, label in [
+            ("AU04", -12, "AU04 brow"),
+            ("AU20", -10, "AU20 lip"),
+            ("AU14",  -8, "AU14 dimple"),
+        ]:
+            cur = aus.get(au, 0)
+            prv = prev.get(f"face_{au}", cur)
+            delta_pts = (cur - prv) * abs(weight)
+            if abs(delta_pts) >= 1.0:
+                contribs.append((label, prv, cur, round(delta_pts, 1)))
+            s += cur * weight
+            prev[f"face_{au}"] = cur
 
-        # AU07 (Lid Tightener) combined with AU04 indicates anger or suspicion
-        s -= aus.get("AU07", 0) * aus.get("AU04", 0) * 15
+        # AU07 × AU04 interaction
+        au07 = aus.get("AU07", 0)
+        au04 = aus.get("AU04", 0)
+        prev["face_AU07"] = au07
+        s -= au07 * au04 * 15
 
-        # AU20 (Lip Stretcher — horizontal lip pull) is a fear/stress marker
-        s -= aus.get("AU20", 0) * 10
+        contribs.sort(key=lambda x: abs(x[3]), reverse=True)
+        return max(0.0, min(100.0, s)), contribs[:2]
 
-        # AU14 (Dimpler — asymmetric mouth corner) can indicate contempt
-        s -= aus.get("AU14", 0) * 8
+    def _vocal_score(self, vd: dict | None):
+        prev = self._prev_inputs
+        if not vd:
+            return 50.0, []
+        if not vd.get("is_speaking"):
+            return self.smoothed["vocal"] * 0.98 + 50.0 * 0.02, []
 
-        return max(0.0, min(100.0, s))              # Clamps the result to the valid 0–100 range
+        s = 55.0
+        contribs = []
 
-    def _vocal_score(self, vd: dict | None) -> float:
-        if not vd:                                  # Returns neutral 50 when no audio data has arrived yet
-            return 50.0
-        if not vd.get("is_speaking"):               # When the user is silent, slowly drift the vocal score back toward neutral rather than holding or resetting it
-            return self.smoothed["vocal"] * 0.98 + 50.0 * 0.02
-        s = 55.0                                    # Speaking at all is a slight positive signal (engagement, willingness to communicate)
-        s += (vd.get("pitch_stability", 0.5) - 0.5) * 38  # Stable pitch → confident and calm; erratic pitch → nervous or deceptive
-        el = vd.get("energy_level", 0.0)            # Retrieves the normalised volume level
-        if   el < 0.12: s -= 18                     # Very quiet voice suggests uncertainty or evasiveness
-        elif el > 0.88: s -=  6                     # Shouting suggests aggression or defensiveness
-        else:           s +=  8                     # Normal conversational volume is a mild positive
-        s -= vd.get("tremor_index", 0.0) * 32       # Voice tremor is a strong indicator of stress or anxiety
-        return max(0.0, min(100.0, s))              # Clamps the result to the valid 0–100 range
+        ps = vd.get("pitch_stability", 0.5)
+        prv_ps = prev.get("vocal_pitch_stab", ps)
+        delta_ps = (ps - prv_ps) * 38
+        if abs(delta_ps) >= 1.0:
+            contribs.append(("pitch stability", prv_ps, ps, round(delta_ps, 1)))
+        s += (ps - 0.5) * 38
+        prev["vocal_pitch_stab"] = ps
 
-    def _gaze_score(self, fd: dict | None) -> float:
-        if not fd or not fd.get("detected"):        # Returns neutral 50 when no face is visible
-            return 50.0
-        s = 62.0                                    # Being present and detectable in frame is a mild positive baseline
-        ear = fd.get("eye_ar", 0.27)                # Eye Aspect Ratio: how open the eyes are
-        if   ear < 0.14: s -= 28                    # Nearly closed eyes suggest fatigue, drowsiness, or evasion
-        elif ear < 0.20: s -= 12                    # Squinted eyes suggest discomfort or suspicion
-        elif ear > 0.28: s += 10                    # Wide-open eyes indicate alertness and engagement
-        br = fd.get("blink_rate", 15.0)             # Blink rate in blinks per minute
-        if   br > 32: s -= 22                       # Excessive blinking is a well-known stress and anxiety indicator
-        elif br > 23: s -= 10                       # Slightly elevated blinking suggests mild discomfort
-        elif 10 <= br <= 20: s += 8                 # The normal blink rate (10–20/min) indicates a relaxed, comfortable state
-        s -= fd.get("gaze_deviation", 0.0) * 18     # Iris offset from the eye centre: large deviation suggests looking away (avoidance)
-        return max(0.0, min(100.0, s))              # Clamps the result to the valid 0–100 range
+        el = vd.get("energy_level", 0.0)
+        if   el < 0.12: s -= 18
+        elif el > 0.88: s -=  6
+        else:           s +=  8
+
+        tr = vd.get("tremor_index", 0.0)
+        prv_tr = prev.get("vocal_tremor", tr)
+        delta_tr = (tr - prv_tr) * -32
+        if abs(delta_tr) >= 1.0:
+            contribs.append(("tremor", prv_tr, tr, round(delta_tr, 1)))
+        s -= tr * 32
+        prev["vocal_tremor"] = tr
+
+        contribs.sort(key=lambda x: abs(x[3]), reverse=True)
+        return max(0.0, min(100.0, s)), contribs[:2]
+
+    def _gaze_score(self, fd: dict | None):
+        prev = self._prev_inputs
+        if not fd or not fd.get("detected"):
+            return 50.0, []
+
+        s = 62.0
+        contribs = []
+
+        ear = fd.get("eye_ar", 0.27)
+        prv_ear = prev.get("gaze_ear", ear)
+        if   ear < 0.14: s -= 28
+        elif ear < 0.20: s -= 12
+        elif ear > 0.28: s += 10
+        prev["gaze_ear"] = ear
+
+        br = fd.get("blink_rate", 15.0)
+        prv_br = prev.get("gaze_blink", br)
+        br_pts  = (-22 if br > 32 else -10 if br > 23 else 8 if 10 <= br <= 20 else 0)
+        prv_pts = (-22 if prv_br > 32 else -10 if prv_br > 23 else 8 if 10 <= prv_br <= 20 else 0)
+        delta_br = br_pts - prv_pts
+        if abs(delta_br) >= 1.0:
+            contribs.append(("blink rate", prv_br, br, round(delta_br, 1)))
+        if   br > 32: s -= 22
+        elif br > 23: s -= 10
+        elif 10 <= br <= 20: s += 8
+        prev["gaze_blink"] = br
+
+        gd = fd.get("gaze_deviation", 0.0)
+        prv_gd = prev.get("gaze_dev", gd)
+        delta_gd = (gd - prv_gd) * -18
+        if abs(delta_gd) >= 1.0:
+            contribs.append(("gaze deviation", prv_gd, gd, round(delta_gd, 1)))
+        s -= gd * 18
+        prev["gaze_dev"] = gd
+
+        contribs.sort(key=lambda x: abs(x[3]), reverse=True)
+        return max(0.0, min(100.0, s)), contribs[:2]
 
     @staticmethod
     def trust_label(score: int) -> dict:
-        if score >= 82: return {"text": "Very High Trust", "color": "#4ade80"}  # Bright green: strong positive trust indicators across all channels
-        if score >= 64: return {"text": "High Trust",      "color": "#34d399"}  # Teal green: generally positive signals
-        if score >= 46: return {"text": "Neutral",         "color": "#60a5fa"}  # Blue: mixed or insufficient signals
-        if score >= 28: return {"text": "Low Trust",       "color": "#fb923c"}  # Orange: notable negative signals present
-        return                 {"text": "Very Low Trust",  "color": "#f87171"}  # Red: strong negative indicators across multiple channels
+        if score >= 82: return {"text": "Calm + Engaged", "color": "#4ade80"}
+        if score >= 64: return {"text": "Relaxed",        "color": "#34d399"}
+        if score >= 46: return {"text": "Baseline",       "color": "#60a5fa"}
+        if score >= 28: return {"text": "Activated",      "color": "#fb923c"}
+        return                 {"text": "Heightened",     "color": "#f87171"}

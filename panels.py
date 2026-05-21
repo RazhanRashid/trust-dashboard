@@ -22,7 +22,8 @@ from theme import (BG, BG_DEEP, PANEL, PANEL_2, LINE, LINE_SOFT,
                     ACCENT, DANGER,
                     ui_font, mono_font, trust_band, panel_qss, head_qss)
 from widgets import (GaugeWidget, BarTrack, ChannelBar, TrustBadge, StatusDot,
-                      MetricBox, PanelHead, WaveformWidget, SpectrumWidget)
+                      MetricBox, PanelHead, WaveformWidget, SpectrumWidget,
+                      AttributionStrip)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -151,6 +152,26 @@ class TopStrip(QFrame):
         self.dot_gaze.setState(gaze)
         self.dot_voice.setState(voice)
 
+    def setWorkloadProgress(self, progress: float):
+        """Glow the bottom border from transparent → workload-green as progress → 1."""
+        if progress <= 0.05:
+            self.setStyleSheet(f"""
+                #topStrip {{
+                    background: {BG_DEEP};
+                    border-bottom: 1px solid {LINE};
+                }}
+            """)
+        else:
+            intensity = min(1.0, progress)
+            thickness = max(1, int(1 + intensity * 3))
+            alpha = int(80 + intensity * 175)
+            self.setStyleSheet(f"""
+                #topStrip {{
+                    background: {BG_DEEP};
+                    border-bottom: {thickness}px solid rgba(45, 164, 106, {alpha});
+                }}
+            """)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Camera panel
@@ -167,8 +188,39 @@ class CameraPanel(QFrame):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
 
-        self._head = PanelHead("Camera · reference", "CAM_00")
-        v.addWidget(self._head)
+        # Custom head with switch camera icon button
+        cam_head = QFrame()
+        cam_head.setObjectName("panelHead")
+        cam_head.setStyleSheet(head_qss())
+        cam_head.setFixedHeight(42)
+        cam_head_h = QHBoxLayout(cam_head)
+        cam_head_h.setContentsMargins(22, 0, 22, 0)
+        cam_title = QLabel("CAMERA · REFERENCE")
+        cam_title.setFont(ui_font(8, QFont.Weight.DemiBold))
+        cam_title.setStyleSheet(f"color: {TEXT_FAINT}; letter-spacing: 1.3px; background: transparent;")
+        self._cam_label = QLabel("CAM_00")
+        self._cam_label.setFont(mono_font(8))
+        self._cam_label.setStyleSheet(f"color: {TEXT_GHOST}; background: transparent;")
+        self._switch_btn = QPushButton("⇄")
+        self._switch_btn.setFixedSize(QSize(24, 24))
+        self._switch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._switch_btn.setToolTip("Switch camera")
+        self._switch_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {TEXT_FAINT};
+                border: 1px solid {LINE_SOFT}; border-radius: 4px;
+                font-size: 14px;
+            }}
+            QPushButton:hover {{ border-color: {TEXT_FAINT}; color: {TEXT}; }}
+            QPushButton:disabled {{ color: {TEXT_GHOST}; border-color: {LINE_SOFT}; }}
+        """)
+        self._switch_btn.clicked.connect(self.switch_camera_clicked.emit)
+        cam_head_h.addWidget(cam_title)
+        cam_head_h.addStretch()
+        cam_head_h.addWidget(self._switch_btn)
+        cam_head_h.addSpacing(8)
+        cam_head_h.addWidget(self._cam_label)
+        v.addWidget(cam_head)
 
         body = QWidget()
         body_l = QVBoxLayout(body)
@@ -177,7 +229,7 @@ class CameraPanel(QFrame):
 
         # Video feed
         self._video = QLabel()
-        self._video.setFixedHeight(240)
+        self._video.setFixedHeight(200)
         self._video.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._video.setStyleSheet(f"""
             QLabel {{
@@ -188,35 +240,6 @@ class CameraPanel(QFrame):
             }}
         """)
         self._video.setText("waiting for camera…")
-        body_l.addWidget(self._video)
-
-        # Switch camera row
-        sw_row = QHBoxLayout()
-        sw_row.setSpacing(10)
-        self._switch_btn = QPushButton("⇄  Switch camera")
-        self._switch_btn.setFont(ui_font(9))
-        self._switch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._switch_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {PANEL_2};
-                color: {TEXT_DIM};
-                border: 1px solid {LINE_SOFT};
-                border-radius: 6px;
-                padding: 6px 12px;
-            }}
-            QPushButton:hover {{ border-color: {TEXT_FAINT}; }}
-            QPushButton:disabled {{ color: {TEXT_GHOST}; }}
-        """)
-        self._switch_btn.clicked.connect(self.switch_camera_clicked.emit)
-
-        self._cam_label = QLabel("")
-        self._cam_label.setFont(mono_font(8))
-        self._cam_label.setStyleSheet(f"color: {TEXT_GHOST};")
-
-        sw_row.addWidget(self._switch_btn)
-        sw_row.addWidget(self._cam_label)
-        sw_row.addStretch()
-        body_l.addLayout(sw_row)
 
         # 2×2 metric grid (face metrics)
         grid = QGridLayout()
@@ -271,22 +294,43 @@ class CameraPanel(QFrame):
                 cv2.putText(frame_bgr, dom, (x1, max(14, y1 - 8)),
                             cv2.FONT_HERSHEY_DUPLEX, 0.42, color, 1, cv2.LINE_AA)
 
-    def update_metrics(self, fd: dict | None):
+    def update_metrics(self, fd: dict | None, baseline: dict | None = None):
         if fd and fd.get("detected"):
             self._metrics["expr"].setValue(str(fd.get("dominant", "—")))
-            self._metrics["ear"].setValue(f"{fd.get('eye_ar', 0) * 100:.0f}%")
-            self._metrics["blink"].setValue(f"{fd.get('blink_rate', 0):.0f}/min")
-            self._metrics["gaze_dev"].setValue(f"{fd.get('gaze_deviation', 0) * 100:.0f}%")
+            ear = fd.get("eye_ar", 0)
+            self._metrics["ear"].setValue(f"{ear * 100:.0f}%")
+            blink = fd.get("blink_rate", 0)
+            self._metrics["blink"].setValue(f"{blink:.0f}/min")
+            gd = fd.get("gaze_deviation", 0)
+            self._metrics["gaze_dev"].setValue(f"{gd * 100:.0f}%")
+
+            if baseline:
+                b_ear = baseline.get("face_eye_ar")
+                if b_ear is not None:
+                    d = (ear - b_ear) * 100
+                    # lower eye openness is stressful
+                    self._metrics["ear"].setDelta(f"{'▲' if d > 0 else '▼'} {abs(d):.0f}%",
+                                                   "good" if d > 0 else "bad")
+                b_blink = baseline.get("face_blink_rate")
+                if b_blink is not None:
+                    d = blink - b_blink
+                    # higher blink rate is stressful
+                    self._metrics["blink"].setDelta(f"{'▲' if d > 0 else '▼'} {abs(d):.0f}/min",
+                                                     "bad" if d > 0 else "good")
+                b_gd = baseline.get("face_gaze_deviation")
+                if b_gd is not None:
+                    d = (gd - b_gd) * 100
+                    # higher deviation is worse
+                    self._metrics["gaze_dev"].setDelta(f"{'▲' if d > 0 else '▼'} {abs(d):.0f}%",
+                                                        "bad" if d > 0 else "good")
         else:
             for k in self._metrics:
                 self._metrics[k].setValue("—")
+                self._metrics[k].clearDelta()
 
     def set_camera_info(self, index: int, total: int):
         self._switch_btn.setEnabled(total > 1)
-        if total > 1:
-            self._cam_label.setText(f"cam {index} ({index + 1}/{total})")
-        else:
-            self._cam_label.setText(f"cam {index}")
+        self._cam_label.setText(f"CAM_{index:02d}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -302,7 +346,7 @@ class ScorePanel(QFrame):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
 
-        v.addWidget(PanelHead("Trust score", "α 0.20 · ema"))
+        v.addWidget(PanelHead("Composure index", "α 0.20 · ema"))
 
         body_l = QVBoxLayout()
         body_l.setContentsMargins(22, 14, 22, 20)
@@ -323,6 +367,10 @@ class ScorePanel(QFrame):
         bw.addWidget(self.badge)
         bw.addStretch()
         body_l.addLayout(bw)
+
+        # Attribution strip
+        self._attribution = AttributionStrip()
+        body_l.addWidget(self._attribution)
 
         # Channel bars
         bars = QVBoxLayout()
@@ -383,6 +431,9 @@ class ScorePanel(QFrame):
         self.bar_gaze.setValue(gaze)
         self.bar_hrv.setValue(hrv)
 
+    def update_attribution(self, delta: float, contributions: dict):
+        self._attribution.update(delta, contributions)
+
     def update_workload(self, wl_state: dict | None):
         if not wl_state:
             return
@@ -410,7 +461,42 @@ class VoicePanel(QFrame):
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
-        v.addWidget(PanelHead("Voice analysis", "MIC_00 · 44.1k"))
+
+        # Head with spectrum toggle
+        head_frame = QFrame()
+        head_frame.setObjectName("panelHead")
+        head_frame.setStyleSheet(head_qss())
+        head_frame.setFixedHeight(42)
+        head_h = QHBoxLayout(head_frame)
+        head_h.setContentsMargins(22, 0, 22, 0)
+        title_lbl = QLabel("VOICE ANALYSIS")
+        title_lbl.setFont(ui_font(8, QFont.Weight.DemiBold))
+        title_lbl.setStyleSheet(f"color: {TEXT_FAINT}; letter-spacing: 1.3px; background: transparent;")
+        self._spec_btn = QPushButton("spectrum")
+        self._spec_btn.setCheckable(True)
+        self._spec_btn.setChecked(False)
+        self._spec_btn.setFont(mono_font(7))
+        self._spec_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._spec_btn.setStyleSheet(f"""
+            QPushButton {{
+                color: {TEXT_GHOST}; background: transparent;
+                border: 1px solid {LINE_SOFT}; border-radius: 3px;
+                padding: 2px 6px;
+            }}
+            QPushButton:checked {{
+                color: {TEXT_FAINT}; border-color: {TEXT_FAINT};
+            }}
+        """)
+        self._spec_btn.toggled.connect(self._toggle_spectrum)
+        id_lbl = QLabel("MIC_00 · 44.1k")
+        id_lbl.setFont(mono_font(8))
+        id_lbl.setStyleSheet(f"color: {TEXT_GHOST}; background: transparent;")
+        head_h.addWidget(title_lbl)
+        head_h.addStretch()
+        head_h.addWidget(self._spec_btn)
+        head_h.addSpacing(8)
+        head_h.addWidget(id_lbl)
+        v.addWidget(head_frame)
 
         body_l = QVBoxLayout()
         body_l.setContentsMargins(20, 16, 20, 18)
@@ -420,29 +506,31 @@ class VoicePanel(QFrame):
         self._wave = WaveformWidget()
         body_l.addWidget(self._wave)
 
-        # Spectrum
+        # Spectrum (hidden by default)
         self._spec = SpectrumWidget()
+        self._spec.hide()
         body_l.addWidget(self._spec)
 
-        # Metric grid (3×2 = 5 metrics, last spans 2)
+        # Metric grid (2×2)
         grid = QGridLayout()
         grid.setSpacing(8)
         self._metrics = {
-            "pitch":    MetricBox("Pitch Stability"),
-            "energy":   MetricBox("Voice Energy"),
-            "tremor":   MetricBox("Tremor Index"),
-            "hz":       MetricBox("Dominant Hz"),
-            "speaking": MetricBox("Speaking"),
+            "pitch":  MetricBox("Pitch Stability"),
+            "energy": MetricBox("Voice Energy"),
+            "tremor": MetricBox("Tremor Index"),
+            "hz":     MetricBox("Dominant Hz"),
         }
-        grid.addWidget(self._metrics["pitch"],    0, 0)
-        grid.addWidget(self._metrics["energy"],   0, 1)
-        grid.addWidget(self._metrics["tremor"],   1, 0)
-        grid.addWidget(self._metrics["hz"],       1, 1)
-        grid.addWidget(self._metrics["speaking"], 2, 0, 1, 2)
+        grid.addWidget(self._metrics["pitch"],  0, 0)
+        grid.addWidget(self._metrics["energy"], 0, 1)
+        grid.addWidget(self._metrics["tremor"], 1, 0)
+        grid.addWidget(self._metrics["hz"],     1, 1)
         body_l.addLayout(grid)
 
         body_l.addStretch()
         v.addLayout(body_l)
+
+    def _toggle_spectrum(self, checked: bool):
+        self._spec.setVisible(checked)
 
     def set_waveform(self, samples):
         self._wave.setSamples(samples)
@@ -450,17 +538,35 @@ class VoicePanel(QFrame):
     def set_spectrum(self, bins):
         self._spec.setBins(bins)
 
-    def update_metrics(self, vd: dict | None):
+    def update_metrics(self, vd: dict | None, baseline: dict | None = None):
+        speaking = bool(vd and vd.get("is_speaking"))
+        self._wave.setSpeaking(speaking)
         if not vd:
             for k in self._metrics:
                 self._metrics[k].setValue("—")
+                self._metrics[k].clearDelta()
             return
-        self._metrics["pitch"].setValue(f"{vd.get('pitch_stability', 0) * 100:.0f}%")
+        ps = vd.get("pitch_stability", 0)
+        tr = vd.get("tremor_index", 0)
+        self._metrics["pitch"].setValue(f"{ps * 100:.0f}%")
         self._metrics["energy"].setValue(f"{vd.get('energy_level', 0) * 100:.0f}%")
-        self._metrics["tremor"].setValue(f"{vd.get('tremor_index', 0) * 100:.0f}%")
+        self._metrics["tremor"].setValue(f"{tr * 100:.0f}%")
         hz = vd.get("dominant_hz", 0) or 0
         self._metrics["hz"].setValue(f"{hz:.0f} Hz" if hz > 0 else "—")
-        self._metrics["speaking"].setValue("Yes" if vd.get("is_speaking") else "No")
+
+        if baseline:
+            b_ps = baseline.get("voice_pitch_stability")
+            if b_ps is not None:
+                d = (ps - b_ps) * 100
+                # higher pitch stability is better
+                self._metrics["pitch"].setDelta(f"{'▲' if d > 0 else '▼'} {abs(d):.0f}%",
+                                                 "good" if d > 0 else "bad")
+            b_tr = baseline.get("voice_tremor_index")
+            if b_tr is not None:
+                d = (tr - b_tr) * 100
+                # higher tremor is worse
+                self._metrics["tremor"].setDelta(f"{'▲' if d > 0 else '▼'} {abs(d):.0f}%",
+                                                  "bad" if d > 0 else "good")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -477,7 +583,7 @@ class HistoryChart(QFrame):
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
-        v.addWidget(PanelHead("Trust history", "live"))
+        v.addWidget(PanelHead("Composure history", "live"))
 
         body_l = QVBoxLayout()
         body_l.setContentsMargins(20, 12, 20, 18)
@@ -486,7 +592,7 @@ class HistoryChart(QFrame):
         # Legend row (custom — pyqtgraph's built-in is ugly)
         legend = QHBoxLayout()
         legend.setSpacing(20)
-        for name, color in [("Total", ACCENT),
+        for name, color in [("Composure", ACCENT),
                              ("Facial", C_FACIAL),
                              ("Vocal", C_VOCAL),
                              ("Gaze", C_GAZE)]:
@@ -523,17 +629,17 @@ class HistoryChart(QFrame):
         self._plot.setMenuEnabled(False)
         self._plot.hideButtons()
 
-        # Curves — Total solid + filled, channels dashed
+        # Curves — Total solid + filled, channels with distinct dash patterns
         self._curve_total = self._plot.plot([], [],
             pen=pg.mkPen(ACCENT, width=2.4),
             fillLevel=0,
             brush=pg.mkBrush(self._rgba_with_alpha(ACCENT, 30)))
         self._curve_facial = self._plot.plot([], [],
-            pen=pg.mkPen(C_FACIAL, width=1.4, style=Qt.PenStyle.DashLine))
+            pen=pg.mkPen(C_FACIAL, width=1.4, dash=[5, 4]))
         self._curve_vocal = self._plot.plot([], [],
-            pen=pg.mkPen(C_VOCAL,  width=1.4, style=Qt.PenStyle.DashLine))
+            pen=pg.mkPen(C_VOCAL,  width=1.4, dash=[2, 3]))
         self._curve_gaze = self._plot.plot([], [],
-            pen=pg.mkPen(C_GAZE,   width=1.4, style=Qt.PenStyle.DashLine))
+            pen=pg.mkPen(C_GAZE,   width=1.4, dash=[8, 3]))
 
         # Remove the Qt frame pyqtgraph inherits (QFrame subclass)
         self._plot.setStyleSheet("border: none;")

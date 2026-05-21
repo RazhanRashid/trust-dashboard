@@ -381,7 +381,7 @@ class SessionSummary(QWidget):
         # Card 1 — Overall trust
         c1 = self._make_card()
         c1_l = c1.layout()
-        c1_l.addWidget(self._tile_title("OVERALL TRUST"))
+        c1_l.addWidget(self._tile_title("OVERALL COMPOSURE"))
         self._big_num = QLabel("—")
         self._big_num.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._big_num.setFont(mono_font(56, QFont.Weight.DemiBold))
@@ -512,7 +512,7 @@ class SessionSummary(QWidget):
         """)
         back_btn.clicked.connect(self.back_clicked.emit)
 
-        exp_btn = QPushButton("↓  Export CSV")
+        exp_btn = QPushButton("↓  Export Excel")
         exp_btn.setFont(ui_font(10, QFont.Weight.Medium))
         exp_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         exp_btn.setStyleSheet(f"""
@@ -634,6 +634,49 @@ class OverviewScreen(QWidget):
         start_btn.clicked.connect(self.start_clicked.emit)
         h.addWidget(start_btn)
         v.addWidget(header)
+
+        # Cross-session trend chart (last 7 sessions)
+        sessions_all = self._load_sessions()
+        recent = sessions_all[-7:] if len(sessions_all) >= 2 else []
+        if recent:
+            pg.setConfigOption("background", BG)
+            trend_plot = pg.PlotWidget()
+            trend_plot.setBackground(BG)
+            trend_plot.setFixedHeight(110)
+            trend_plot.setYRange(0, 100, padding=0.05)
+            trend_plot.showGrid(x=False, y=True, alpha=0.12)
+            for ax in ("bottom", "top", "right"):
+                trend_plot.getAxis(ax).hide()
+            trend_plot.getAxis("left").setPen(pg.mkPen(LINE_SOFT))
+            trend_plot.getAxis("left").setTextPen(pg.mkPen(TEXT_GHOST))
+            trend_plot.getAxis("left").setStyle(tickLength=-4, showValues=True)
+            trend_plot.getPlotItem().getViewBox().setBorder(None)
+            trend_plot.setMouseEnabled(x=False, y=False)
+            trend_plot.setMenuEnabled(False)
+            trend_plot.hideButtons()
+            trend_plot.setStyleSheet("border: none;")
+            ys = [s.get("trust_total", 50) for s in recent]
+            xs = list(range(len(ys)))
+            from PyQt6.QtGui import QColor as _QColor
+            _ac = _QColor(ACCENT)
+            trend_plot.plot(xs, ys,
+                pen=pg.mkPen(ACCENT, width=2.2),
+                symbol="o", symbolSize=6,
+                symbolBrush=pg.mkBrush(ACCENT),
+                symbolPen=pg.mkPen(PANEL, width=1.5),
+                fillLevel=0,
+                brush=pg.mkBrush(_ac.red(), _ac.green(), _ac.blue(), 25))
+            trend_wrap = QWidget()
+            trend_wrap.setStyleSheet(f"background: {BG};")
+            tw_l = QVBoxLayout(trend_wrap)
+            tw_l.setContentsMargins(28, 8, 28, 0)
+            tw_l.setSpacing(2)
+            trend_title = QLabel("7-SESSION TREND")
+            trend_title.setFont(ui_font(8, QFont.Weight.DemiBold))
+            trend_title.setStyleSheet(f"color: {TEXT_FAINT}; letter-spacing: 1.3px; background: transparent;")
+            tw_l.addWidget(trend_title)
+            tw_l.addWidget(trend_plot)
+            v.addWidget(trend_wrap)
 
         # Section label — QLabel ignores setContentsMargins for external spacing;
         # use padding in the stylesheet and a fixed height to guarantee the gap.

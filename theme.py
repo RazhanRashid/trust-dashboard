@@ -35,11 +35,11 @@ DANGER      = "#c93a3a"   # End Session, error states
 
 # ─── Trust bands ─ same hex values trust_engine.py emits ────────────────────
 TRUST_BANDS = [
-    (82, "Very High Trust", "#4ade80"),
-    (64, "High Trust",      "#34d399"),
-    (46, "Neutral",         "#60a5fa"),
-    (28, "Low Trust",       "#fb923c"),
-    (0,  "Very Low Trust",  "#f87171"),
+    (82, "Calm + Engaged", "#4ade80"),
+    (64, "Relaxed",        "#34d399"),
+    (46, "Baseline",       "#60a5fa"),
+    (28, "Activated",      "#fb923c"),
+    (0,  "Heightened",     "#f87171"),
 ]
 
 def trust_band(score: int):

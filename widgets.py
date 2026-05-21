@@ -22,13 +22,18 @@ class GaugeWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._score = 50
+        self._baseline = None
         self._color = QColor("#60a5fa")
-        self.setMinimumSize(280, 170)
+        self.setMinimumSize(360, 260)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def setScore(self, score: int, color_hex: str):
         self._score = max(0, min(100, int(score)))
         self._color = QColor(color_hex)
+        self.update()
+
+    def setBaseline(self, score: int):
+        self._baseline = max(0, min(100, int(score)))
         self.update()
 
     def paintEvent(self, event):
@@ -43,7 +48,7 @@ class GaugeWidget(QWidget):
         p.setBrush(QColor(PANEL))
         p.drawRect(0, 0, w, h)
 
-        thickness = 10
+        thickness = 14
         margin = 18
         diameter = min(w - margin * 2, (h - 20) * 2)
         radius = diameter / 2
@@ -63,7 +68,7 @@ class GaugeWidget(QWidget):
         p.drawArc(arc_rect, 180 * 16, int(active_span * 16))
 
         # Big number
-        num_font = mono_font(48, QFont.Weight.DemiBold)
+        num_font = mono_font(88, QFont.Weight.DemiBold)
         num_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 94)
         p.setFont(num_font)
         p.setPen(self._color)
@@ -77,6 +82,21 @@ class GaugeWidget(QWidget):
         p.setPen(QColor(TEXT_GHOST))
         sub_rect = QRectF(0, cy - 14, w, 18)
         p.drawText(sub_rect, Qt.AlignmentFlag.AlignCenter, "/ 100")
+
+        # Baseline tick — small notch on the arc at the calibrated score
+        if self._baseline is not None:
+            import math as _math
+            angle_deg = 180 - 180 * (self._baseline / 100)
+            angle_rad = _math.radians(angle_deg)
+            tick_r_out = radius - 2
+            tick_r_in  = radius - thickness - 6
+            tx_out = cx + tick_r_out * _math.cos(angle_rad)
+            ty_out = cy - tick_r_out * _math.sin(angle_rad)
+            tx_in  = cx + tick_r_in  * _math.cos(angle_rad)
+            ty_in  = cy - tick_r_in  * _math.sin(angle_rad)
+            p.setPen(QPen(QColor(TEXT_FAINT), 2, Qt.PenStyle.SolidLine,
+                          Qt.PenCapStyle.RoundCap))
+            p.drawLine(int(tx_in), int(ty_in), int(tx_out), int(ty_out))
 
 
 # ─── Bar track ──────────────────────────────────────────────────────────────
@@ -196,7 +216,7 @@ class StatusDot(QWidget):
     def __init__(self, state: str = "loading", parent=None):
         super().__init__(parent)
         self._state = state
-        self.setFixedSize(QSize(10, 10))
+        self.setFixedSize(QSize(14, 14))
 
     def setState(self, state: str):
         if state != self._state:
@@ -208,7 +228,7 @@ class StatusDot(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(self.STATES.get(self._state, TEXT_GHOST)))
-        p.drawEllipse(1, 1, 8, 8)
+        p.drawEllipse(1, 1, 12, 12)
 
 
 # ─── Metric box (the cream-tile pattern translated to cool slate) ───────────
@@ -238,11 +258,27 @@ class MetricBox(QFrame):
         self._value.setFont(mono_font(13, QFont.Weight.Medium))
         self._value.setStyleSheet(f"color: {TEXT};")
 
+        self._delta = QLabel("")
+        self._delta.setFont(mono_font(8))
+        self._delta.setStyleSheet(f"color: {TEXT_GHOST};")
+        self._delta.hide()
+
         v.addWidget(self._label)
         v.addWidget(self._value)
+        v.addWidget(self._delta)
 
     def setValue(self, text: str):
         self._value.setText(text)
+
+    def setDelta(self, text: str, direction: str):
+        """direction: 'good' | 'bad' | 'neutral'"""
+        color = {"good": "#2da46a", "bad": "#cd4734", "neutral": TEXT_FAINT}.get(direction, TEXT_FAINT)
+        self._delta.setText(text)
+        self._delta.setStyleSheet(f"color: {color};")
+        self._delta.setVisible(bool(text))
+
+    def clearDelta(self):
+        self._delta.hide()
 
 
 # ─── Panel header ───────────────────────────────────────────────────────────
@@ -281,12 +317,17 @@ class WaveformWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._samples = []
+        self._speaking = False
         self.setMinimumHeight(56)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def setSamples(self, samples):
         # Downsample to widget width for cheap drawing
         self._samples = list(samples)
+        self.update()
+
+    def setSpeaking(self, speaking: bool):
+        self._speaking = speaking
         self.update()
 
     def paintEvent(self, event):
@@ -299,6 +340,12 @@ class WaveformWidget(QWidget):
         p.setBrush(QColor(PANEL_2))
         p.drawRoundedRect(QRectF(0, 0, w, h), 6, 6)
 
+        # Speaking indicator — 4px bar on the left edge
+        bar_color = QColor(C_VOCAL) if self._speaking else QColor(LINE)
+        p.setBrush(bar_color)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(QRectF(0, 6, 4, h - 12), 2, 2)
+
         if len(self._samples) < 2:
             return
 
@@ -310,16 +357,76 @@ class WaveformWidget(QWidget):
         p.setPen(QPen(QColor(C_VOCAL), 1.4, Qt.PenStyle.SolidLine))
         cy = h / 2
         amp = h / 2 - 4
-        x_step = w / max(1, len(pts) - 1)
+        x_step = (w - 8) / max(1, len(pts) - 1)
 
-        prev_x = 0
+        prev_x = 8
         prev_y = cy
         for i, s in enumerate(pts):
-            x = i * x_step
+            x = 8 + i * x_step
             y = cy - max(-1.0, min(1.0, float(s))) * amp
             if i > 0:
                 p.drawLine(int(prev_x), int(prev_y), int(x), int(y))
             prev_x, prev_y = x, y
+
+
+# ─── Attribution strip ──────────────────────────────────────────────────────
+class AttributionStrip(QWidget):
+    """Shows what drove a composure score change over the last 6 seconds."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(54)  # fixed height avoids layout shift
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
+
+        self._headline = QLabel("")
+        self._headline.setFont(mono_font(10, QFont.Weight.Medium))
+        self._headline.setStyleSheet("background: transparent;")
+
+        self._row1 = QLabel("")
+        self._row1.setFont(mono_font(9))
+        self._row1.setStyleSheet(f"color: {TEXT_FAINT}; background: transparent;")
+
+        self._row2 = QLabel("")
+        self._row2.setFont(mono_font(9))
+        self._row2.setStyleSheet(f"color: {TEXT_FAINT}; background: transparent;")
+
+        v.addWidget(self._headline)
+        v.addWidget(self._row1)
+        v.addWidget(self._row2)
+        v.addStretch()
+
+    def update(self, delta: float, contributions: dict):
+        """delta = total score change over ~6s. contributions = dict from TrustEngine."""
+        if abs(delta) < 5:
+            self._headline.setText("")
+            self._row1.setText("")
+            self._row2.setText("")
+            return
+
+        sign   = "▲" if delta > 0 else "▼"
+        color  = "#4ade80" if delta > 0 else "#f87171"
+        self._headline.setText(f"{sign} {abs(delta):+.0f} pts in 6s")
+        self._headline.setStyleSheet(f"color: {color}; background: transparent;")
+
+        rows = [self._row1, self._row2]
+        entries = []
+        for channel, items in contributions.items():
+            for label, prv, cur, pts in items:
+                if abs(pts) >= 1.0:
+                    entries.append((channel, label, prv, cur, pts))
+        entries.sort(key=lambda x: abs(x[4]), reverse=True)
+
+        for i, lbl_widget in enumerate(rows):
+            if i < len(entries):
+                ch, label, prv, cur, pts = entries[i]
+                arrow = "▲" if pts > 0 else "▼"
+                lbl_widget.setText(
+                    f"  └─ {ch.capitalize()}: {label}  {prv:.2f}→{cur:.2f}  ({arrow}{abs(pts):.0f}pts)"
+                )
+            else:
+                lbl_widget.setText("")
 
 
 # ─── Spectrum bars (FFT) ────────────────────────────────────────────────────

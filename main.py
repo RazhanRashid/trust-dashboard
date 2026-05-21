@@ -12,7 +12,7 @@ Run:
 
 import os
 import sys
-import csv
+import openpyxl
 import json
 import math
 import time
@@ -164,16 +164,17 @@ class TrustDashboard(QMainWindow):
 
         self.cam_panel = CameraPanel()
         self.cam_panel.switch_camera_clicked.connect(self._switch_camera)
-        self.cam_panel.setFixedWidth(360)
+        self.cam_panel.setFixedWidth(310)
 
         self.score_panel = ScorePanel()
-        self.score_panel.setFixedWidth(380)
+        self.score_panel.setFixedWidth(560)
 
         self.voice_panel = VoicePanel()
+        self.voice_panel.setMaximumWidth(360)
 
         # Cap height so panels don't over-stretch on tall windows
         for _p in (self.cam_panel, self.score_panel, self.voice_panel):
-            _p.setMaximumHeight(540)
+            _p.setMaximumHeight(600)
 
         row1.addWidget(self.cam_panel)
         row1.addWidget(self.score_panel)
@@ -285,6 +286,34 @@ class TrustDashboard(QMainWindow):
         self._calibrating = False
         self._session_start = time.time()
         self._session_rows = []
+
+        # Compute a baseline composure score from calibration samples, then
+        # reset the engine so live scores start fresh from the neutral 50.
+        self._baseline_total: int | None = None
+        if self._calibration_face["eye_ar"]:
+            probe_engine = TrustEngine()
+            face_probe = {
+                "detected": True,
+                "expressions": {"happy": 0, "neutral": 1, "surprised": 0,
+                                 "fearful": 0, "angry": 0, "disgusted": 0, "sad": 0},
+                "aus": {},
+                "duchenne": 0,
+                "eye_ar":         self._calibration_baseline["face_eye_ar"],
+                "blink_rate":     self._calibration_baseline["face_blink_rate"],
+                "gaze_deviation": self._calibration_baseline["face_gaze_deviation"],
+            }
+            vocal_probe = {
+                "is_speaking": True,
+                "pitch_stability": self._calibration_baseline["voice_pitch_stability"],
+                "energy_level":    self._calibration_baseline["voice_energy_level"],
+                "tremor_index":    self._calibration_baseline["voice_tremor_index"],
+            }
+            for _ in range(20):
+                probe_engine.update(face_probe, vocal_probe)
+            result = probe_engine.update(face_probe, vocal_probe)
+            self._baseline_total = int(result["total"])
+            self.score_panel.gauge.setBaseline(self._baseline_total)
+
         self._show_live()
 
     def _end_session(self):
@@ -448,8 +477,10 @@ class TrustDashboard(QMainWindow):
         wl_state  = self.workload.update(pupil_now)
         self._workload_state = wl_state
 
-        # Roll histories
+        # Roll histories (skip the contributions metadata key)
         for k, v in scores.items():
+            if k not in self._history:
+                continue
             self._history[k].append(v)
             if len(self._history[k]) > 120:
                 self._history[k].pop(0)
@@ -463,7 +494,8 @@ class TrustDashboard(QMainWindow):
         # ── Push to widgets ──
         if frame_bgr is not None:
             self.cam_panel.update_frame(frame_bgr, face_data)
-        self.cam_panel.update_metrics(face_data)
+        baseline = self._calibration_baseline if self._calibration_baseline else None
+        self.cam_panel.update_metrics(face_data, baseline)
 
         self.score_panel.update_scores(
             scores["total"], scores["facial"], scores["vocal"],
@@ -471,7 +503,13 @@ class TrustDashboard(QMainWindow):
         )
         self.score_panel.update_workload(wl_state)
 
-        self.voice_panel.update_metrics(vocal_data)
+        # Attribution strip — 6s rolling delta (~100 ticks at 60ms)
+        hist_total = self._history["total"]
+        if len(hist_total) >= 6:
+            delta_6s = float(hist_total[-1]) - float(hist_total[-min(100, len(hist_total))])
+            self.score_panel.update_attribution(delta_6s, scores.get("contributions", {}))
+
+        self.voice_panel.update_metrics(vocal_data, baseline)
         # Waveform downsampled, spectrum from a small FFT
         self.voice_panel.set_waveform(audio_buf[::32])
         spec = self._compute_spectrum(audio_buf)
@@ -480,6 +518,10 @@ class TrustDashboard(QMainWindow):
         # History chart — keep last 60 samples for the rolling view
         h = {k: self._history[k][-60:] for k in ("total", "facial", "vocal", "gaze")}
         self.history_chart.update_traces(h)
+
+        # Workload glow on top strip
+        if wl_state:
+            self.top.setWorkloadProgress(float(wl_state.get("spike_progress", 0.0)))
 
         # Status dots
         self.top.set_status(
@@ -600,17 +642,21 @@ class TrustDashboard(QMainWindow):
     def _export_csv(self):
         if not self._session_rows:
             return
-        default_name = f"trust-session-{datetime.now():%Y-%m-%d_%H-%M-%S}.csv"
+        default_name = f"trust-session-{datetime.now():%Y-%m-%d_%H-%M-%S}.xlsx"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export session as CSV", default_name, "CSV (*.csv)",
+            self, "Export session as Excel", default_name, "Excel (*.xlsx)",
         )
         if not path:
             return
         try:
-            with open(path, "w", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=list(self._session_rows[0].keys()))
-                w.writeheader()
-                w.writerows(self._session_rows)
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Session"
+            headers = list(self._session_rows[0].keys())
+            ws.append(headers)
+            for row in self._session_rows:
+                ws.append([row[h] for h in headers])
+            wb.save(path)
         except Exception as e:
             QMessageBox.critical(self, "Export failed", str(e))
 
