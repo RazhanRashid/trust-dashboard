@@ -8,6 +8,7 @@ Three overlays:
 
 import json
 import math
+import os
 import time
 from pathlib import Path
 
@@ -15,10 +16,13 @@ import cv2
 import numpy as np
 import pyqtgraph as pg
 
-from PyQt6.QtCore import Qt, QRectF, QTimer, pyqtSignal, QSize
-from PyQt6.QtGui import QPainter, QPen, QColor, QFont, QImage, QPixmap
+from PyQt6.QtCore import Qt, QRectF, QTimer, pyqtSignal, QSize, QUrl
+from PyQt6.QtGui import (QPainter, QPen, QColor, QFont, QImage, QPixmap,
+                          QPainterPath)
 from PyQt6.QtWidgets import (QWidget, QFrame, QLabel, QPushButton, QVBoxLayout,
-                              QHBoxLayout, QGridLayout, QScrollArea, QSizePolicy)
+                              QHBoxLayout, QGridLayout, QScrollArea, QSizePolicy,
+                              QMessageBox)
+from PyQt6.QtGui import QDesktopServices
 
 from theme import (BG, BG_DEEP, PANEL, PANEL_2, LINE, LINE_SOFT,
                     TEXT, TEXT_DIM, TEXT_FAINT, TEXT_GHOST,
@@ -336,6 +340,21 @@ class CalibrationOverlay(QWidget):
             self._voice_lbl.setStyleSheet(f"color: {TEXT_FAINT};")
 
 
+# ─── Pixmap helper ──────────────────────────────────────────────────────────
+def _rounded_pixmap(pixmap: QPixmap, radius: int = 8) -> QPixmap:
+    """Return a copy of *pixmap* with rounded corners (anti-aliased clip)."""
+    out = QPixmap(pixmap.size())
+    out.fill(Qt.GlobalColor.transparent)
+    p = QPainter(out)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(out.rect()), radius, radius)
+    p.setClipPath(path)
+    p.drawPixmap(0, 0, pixmap)
+    p.end()
+    return out
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Session summary
 # ═══════════════════════════════════════════════════════════════════════════
@@ -378,13 +397,36 @@ class SessionSummary(QWidget):
         cards_row = QHBoxLayout()
         cards_row.setSpacing(16)
 
-        # Card 1 — Overall trust
+        # Card 1 — Overall composure + thumbnail
         c1 = self._make_card()
         c1_l = c1.layout()
         c1_l.addWidget(self._tile_title("OVERALL COMPOSURE"))
+
+        # Thumbnail (hidden until populate() loads a real image)
+        self._thumb_lbl = QLabel()
+        self._thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._thumb_lbl.setFixedSize(240, 135)
+        self._thumb_lbl.setStyleSheet(f"""
+            QLabel {{
+                background: {BG_DEEP};
+                border: 1px solid {LINE};
+                border-radius: 8px;
+                color: {TEXT_GHOST};
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 9pt;
+            }}
+        """)
+        self._thumb_lbl.setText("no face captured")
+        self._thumb_lbl.hide()
+        thumb_wrap = QHBoxLayout()
+        thumb_wrap.addStretch()
+        thumb_wrap.addWidget(self._thumb_lbl)
+        thumb_wrap.addStretch()
+        c1_l.addLayout(thumb_wrap)
+
         self._big_num = QLabel("—")
         self._big_num.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._big_num.setFont(mono_font(56, QFont.Weight.DemiBold))
+        self._big_num.setFont(mono_font(48, QFont.Weight.DemiBold))
         self._big_num.setStyleSheet(f"color: {TEXT}; background: transparent;")
         self._big_label = QLabel("—")
         self._big_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -392,12 +434,49 @@ class SessionSummary(QWidget):
         self._big_label.setStyleSheet(f"color: {TEXT_FAINT}; letter-spacing: 1px; background: transparent;")
         c1_l.addWidget(self._big_num)
         c1_l.addWidget(self._big_label)
-        c1_l.addSpacing(4)
+        c1_l.addSpacing(2)
         hint = QLabel("session average")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hint.setFont(ui_font(9))
         hint.setStyleSheet(f"color: {TEXT_GHOST}; background: transparent;")
         c1_l.addWidget(hint)
+        c1_l.addSpacing(8)
+
+        # Play + Delete buttons (hidden by default)
+        media_row = QHBoxLayout()
+        media_row.setSpacing(8)
+
+        self._play_btn = QPushButton("▶  Play recording")
+        self._play_btn.setFont(ui_font(9, QFont.Weight.Medium))
+        self._play_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._play_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {ACCENT}; color: white;
+                border: 0; border-radius: 6px;
+                padding: 7px 14px;
+            }}
+            QPushButton:hover {{ background: #1f5fa3; }}
+        """)
+        self._play_btn.hide()
+
+        self._del_btn = QPushButton("Delete recording")
+        self._del_btn.setFont(ui_font(9))
+        self._del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._del_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {TEXT_FAINT};
+                border: 1px solid {LINE}; border-radius: 6px;
+                padding: 7px 12px;
+            }}
+            QPushButton:hover {{ color: {DANGER}; border-color: {DANGER}; }}
+        """)
+        self._del_btn.hide()
+
+        media_row.addStretch()
+        media_row.addWidget(self._play_btn)
+        media_row.addWidget(self._del_btn)
+        media_row.addStretch()
+        c1_l.addLayout(media_row)
         c1_l.addStretch()
         cards_row.addWidget(c1, 1)
 
@@ -576,6 +655,87 @@ class SessionSummary(QWidget):
             self._chart_avg.setData(xs, [avg] * len(hist))
             self._chart.setXRange(0, len(hist) - 1, padding=0)
 
+        # ── Thumbnail ──────────────────────────────────────────────────────
+        thumb_path = stats.get("thumbnail_path")
+        if thumb_path and Path(thumb_path).exists():
+            pix = QPixmap(thumb_path)
+            if not pix.isNull():
+                pix = pix.scaled(
+                    240, 135,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                self._thumb_lbl.setPixmap(_rounded_pixmap(pix, 8))
+                self._thumb_lbl.setText("")
+            self._thumb_lbl.show()
+        else:
+            self._thumb_lbl.setText("no face captured")
+            self._thumb_lbl.setPixmap(QPixmap())
+            self._thumb_lbl.show()
+
+        # ── Play button ────────────────────────────────────────────────────
+        rec_path = stats.get("recording_path")
+        if rec_path and Path(rec_path).exists():
+            self._play_btn.show()
+            # Disconnect any previous connections before reconnecting
+            try:
+                self._play_btn.clicked.disconnect()
+            except Exception:
+                pass
+            self._play_btn.clicked.connect(
+                lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(rec_path))
+            )
+        else:
+            self._play_btn.hide()
+
+        # ── Delete button ──────────────────────────────────────────────────
+        if rec_path or thumb_path:
+            self._del_btn.show()
+            try:
+                self._del_btn.clicked.disconnect()
+            except Exception:
+                pass
+            self._del_btn.clicked.connect(
+                lambda: self._delete_recording(rec_path, thumb_path, stats)
+            )
+        else:
+            self._del_btn.hide()
+
+    def _delete_recording(self, rec_path, thumb_path, stats: dict):
+        """Ask for confirmation then delete both files."""
+        reply = QMessageBox.question(
+            self, "Delete recording",
+            "Permanently delete the recording and thumbnail for this session?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        for p in (rec_path, thumb_path):
+            if p:
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
+        # Update sessions.json to clear the paths
+        sessions_file = Path.home() / "Desktop" / "trust-dashboard" / "session-data" / "sessions.json"
+        try:
+            with open(sessions_file) as f:
+                sessions = json.load(f)
+            sid = stats.get("session_id", "")
+            for s in sessions:
+                if s.get("session_id") == sid:
+                    s["recording_path"] = None
+                    s["thumbnail_path"] = None
+            with open(sessions_file, "w") as f:
+                json.dump(sessions, f, indent=2)
+        except Exception as e:
+            print(f"[rec] Could not update sessions.json after delete: {e}")
+        # Hide UI elements
+        self._play_btn.hide()
+        self._del_btn.hide()
+        self._thumb_lbl.setPixmap(QPixmap())
+        self._thumb_lbl.setText("no face captured")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Overview / landing page
@@ -733,7 +893,28 @@ class OverviewScreen(QWidget):
         card.setStyleSheet(panel_qss("sessCard"))
         h = QHBoxLayout(card)
         h.setContentsMargins(20, 16, 20, 16)
-        h.setSpacing(20)
+        h.setSpacing(16)
+
+        # Thumbnail (64×64, shown only when file exists)
+        thumb_rel = sess.get("thumbnail_path")
+        if thumb_rel:
+            thumb_abs = Path.home() / "Desktop" / "trust-dashboard" / thumb_rel
+            if thumb_abs.exists():
+                pix = QPixmap(str(thumb_abs))
+                if not pix.isNull():
+                    pix = pix.scaled(64, 64,
+                        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                        Qt.TransformationMode.SmoothTransformation)
+                    # Centre-crop to exact 64×64
+                    if pix.width() > 64 or pix.height() > 64:
+                        x = (pix.width()  - 64) // 2
+                        y = (pix.height() - 64) // 2
+                        pix = pix.copy(x, y, 64, 64)
+                    thumb_lbl = QLabel()
+                    thumb_lbl.setFixedSize(64, 64)
+                    thumb_lbl.setPixmap(_rounded_pixmap(pix, 6))
+                    thumb_lbl.setStyleSheet("border: none;")
+                    h.addWidget(thumb_lbl)
 
         # Left: date + duration
         left = QVBoxLayout()

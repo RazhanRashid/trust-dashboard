@@ -109,8 +109,24 @@ class TrustDashboard(QMainWindow):
         self._cam_ok = False
         self._mic_ok = False
 
+        # ── Data directories ─────────────────────────────────────────────────
+        self._data_dir      = Path.home() / "Desktop" / "trust-dashboard"
+        self._session_dir   = self._data_dir / "session-data"   # JSON + Excel exports
+        self._recordings_dir = self._data_dir / "recordings"    # video + thumbnails
+        for d in (self._data_dir, self._session_dir, self._recordings_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+        # ── Recording pipeline ───────────────────────────────────────────────
+        self._writer: cv2.VideoWriter | None = None
+        self._writer_lock = threading.Lock()
+        self._recording_path: Path | None = None
+        self._session_id: str = ""
+        # Best-thumbnail tracking (highest eye_ar = clearest open-eye frame)
+        self._best_thumb_frame = None
+        self._best_thumb_conf: float = -1.0
+
         # ── Persistence ─────────────────────────────────────────────────────
-        self._sessions_file = Path(__file__).parent / "sessions.json"
+        self._sessions_file = self._session_dir / "sessions.json"
 
         # ── Build the UI ────────────────────────────────────────────────────
         self._build_ui()
@@ -284,8 +300,12 @@ class TrustDashboard(QMainWindow):
         if self._calibration_pupil:
             self.workload.set_baseline(sum(self._calibration_pupil) / len(self._calibration_pupil))
         self._calibrating = False
+        self._session_id = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+        self._best_thumb_frame = None
+        self._best_thumb_conf = -1.0
         self._session_start = time.time()
         self._session_rows = []
+        self._start_recording()
 
         # Compute a baseline composure score from calibration samples, then
         # reset the engine so live scores start fresh from the neutral 50.
@@ -324,15 +344,102 @@ class TrustDashboard(QMainWindow):
             )
             return
         self._session_ended = True
+        # Stop recording before computing stats so the writer is flushed
+        rec_path, thumb_path = self._stop_recording()
         stats = self._compute_session_stats()
+        def _rel(p):
+            """Store recording paths relative to data_dir for portability."""
+            if not p:
+                return None
+            try:
+                return str(Path(p).relative_to(self._data_dir))
+            except Exception:
+                return str(p)
+
+        stats["recording_path"] = _rel(rec_path)
+        stats["thumbnail_path"] = _rel(thumb_path)
+        stats["session_id"]     = self._session_id
         self._save_session(stats)
-        self._show_summary(stats)
+        # Give the summary absolute paths so it can open/display files directly
+        summary_stats = dict(stats)
+        summary_stats["recording_path"] = str(rec_path) if rec_path else None
+        summary_stats["thumbnail_path"] = str(thumb_path) if thumb_path else None
+        self._show_summary(summary_stats)
 
     def _back_to_overview(self):
         self._session_ended = False
         self._session_rows = []
         self._history = {k: [] for k in ("total", "facial", "vocal", "gaze", "hrv")}
         self._show_overview()
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Recording helpers
+    # ════════════════════════════════════════════════════════════════════════
+    def _start_recording(self):
+        """Open a VideoWriter for the current session. Called from the main
+        thread after calibration; must run while self._cap is already open."""
+        if self._cap is None or not self._cap.isOpened():
+            print("[rec] No camera — recording disabled")
+            return
+        self._recordings_dir.mkdir(exist_ok=True)
+        path = self._recordings_dir / f"{self._session_id}.mp4"
+        w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if w < 1 or h < 1:
+            w, h = 1280, 720
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(path), fourcc, 25.0, (w, h))
+        if writer.isOpened():
+            with self._writer_lock:
+                self._writer = writer
+            self._recording_path = path
+            print(f"[rec] Recording → {path}  ({w}×{h})")
+        else:
+            print("[rec] VideoWriter failed to open — no recording")
+
+    def _stop_recording(self) -> tuple["Path | None", "Path | None"]:
+        """Release the writer and save the best-thumbnail JPEG.
+        Returns (recording_path, thumbnail_path), both may be None."""
+        # ── 1. Grab and clear the writer atomically ──────────────────────────
+        with self._writer_lock:
+            writer = self._writer
+            self._writer = None
+        if writer is not None:
+            try:
+                writer.release()
+            except Exception as e:
+                print(f"[rec] writer.release() error: {e}")
+
+        rec_path = self._recording_path
+        self._recording_path = None
+
+        # ── 2. Grab the best thumbnail frame ────────────────────────────────
+        with self._lock:
+            thumb_frame = self._best_thumb_frame
+            self._best_thumb_frame = None
+        self._best_thumb_conf = -1.0
+
+        if thumb_frame is None or not self._session_id:
+            return rec_path, None
+
+        # ── 3. Letterbox to 640×360 and write JPEG ──────────────────────────
+        self._recordings_dir.mkdir(exist_ok=True)
+        thumb_path = self._recordings_dir / f"{self._session_id}.jpg"
+        try:
+            h, w = thumb_frame.shape[:2]
+            tgt_w, tgt_h = 640, 360
+            scale = min(tgt_w / w, tgt_h / h)
+            nw, nh = int(w * scale), int(h * scale)
+            resized = cv2.resize(thumb_frame, (nw, nh), interpolation=cv2.INTER_AREA)
+            canvas = np.zeros((tgt_h, tgt_w, 3), dtype=np.uint8)
+            yo, xo = (tgt_h - nh) // 2, (tgt_w - nw) // 2
+            canvas[yo:yo + nh, xo:xo + nw] = resized
+            cv2.imwrite(str(thumb_path), canvas, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            print(f"[rec] Thumbnail → {thumb_path}")
+            return rec_path, thumb_path
+        except Exception as e:
+            print(f"[rec] Thumbnail save failed: {e}")
+            return rec_path, None
 
     # ════════════════════════════════════════════════════════════════════════
     # Camera + analysis threads
@@ -469,6 +576,14 @@ class TrustDashboard(QMainWindow):
                         self._last_frame = (frame, {"detected": False})
                     else:
                         self._last_frame = (frame, self._last_frame[1])
+                # Write to video file if recording is active
+                with self._writer_lock:
+                    w = self._writer
+                if w is not None:
+                    try:
+                        w.write(frame)
+                    except Exception:
+                        pass
             time.sleep(0.033)
 
     def _analysis_loop(self):
@@ -480,6 +595,14 @@ class TrustDashboard(QMainWindow):
                 face_data = self.face.analyze(small)
                 with self._lock:
                     self._last_frame = (frame, face_data)
+                # Track best thumbnail: use eye_ar as quality proxy
+                # (more open eyes → higher value → clearer capture)
+                if face_data.get("detected"):
+                    quality = float(face_data.get("eye_ar", 0.0))
+                    if quality > self._best_thumb_conf:
+                        self._best_thumb_conf = quality
+                        with self._lock:
+                            self._best_thumb_frame = frame.copy()
             time.sleep(0.033)
 
     # ════════════════════════════════════════════════════════════════════════
@@ -638,20 +761,49 @@ class TrustDashboard(QMainWindow):
         return (bins / peak).tolist()
 
     def _record_row(self, scores, face_data, vocal_data, wl_state):
+        """Capture one second of data.  All %-based fields are stored
+        already multiplied by 100 so the export needs no conversion."""
+        now     = datetime.now()
+        elapsed = round(time.time() - self._session_start, 1)
+
+        fd = face_data or {}
+        vd = vocal_data or {}
+        wd = wl_state   or {}
+
         row = {
-            "t":          datetime.now().strftime("%H:%M:%S"),
-            "total":      int(scores.get("total", 50)),
-            "facial":     int(scores.get("facial", 50)),
-            "vocal":      int(scores.get("vocal", 50)),
-            "gaze":       int(scores.get("gaze", 50)),
-            "hrv":        int(scores.get("hrv", 65)),
-            "speaking":   bool(vocal_data and vocal_data.get("is_speaking")),
-            "pitch_stab": float(vocal_data.get("pitch_stability", 0.5)) if vocal_data else 0.5,
-            "tremor":     float(vocal_data.get("tremor_index", 0.0)) if vocal_data else 0.0,
-            "face_det":   bool(face_data and face_data.get("detected")),
-            "blink_rate": float(face_data.get("blink_rate", 0.0)) if face_data else 0.0,
-            "gaze_dev":   float(face_data.get("gaze_deviation", 0.0)) if face_data else 0.0,
-            "high_workload": bool(wl_state.get("is_high_workload", False)) if wl_state else False,
+            # ── Timestamps ─────────────────────────────────────────────────
+            "timestamp":      now.strftime("%Y-%m-%d %H:%M:%S"),
+            "elapsed_s":      elapsed,
+            # ── Composure scores ────────────────────────────────────────────
+            "total":          int(scores.get("total", 50)),
+            "facial":         int(scores.get("facial", 50)),
+            "vocal":          int(scores.get("vocal", 50)),
+            "gaze":           int(scores.get("gaze", 50)),
+            "hrv":            int(scores.get("hrv", 65)),
+            # ── Facial ──────────────────────────────────────────────────────
+            "face_det":       bool(fd.get("detected")),
+            "expression":     str(fd.get("dominant", "—")),
+            "eye_openness":   round(float(fd.get("eye_ar", 0)) * 100, 1),
+            "blink_rate":     round(float(fd.get("blink_rate", 0)), 1),
+            "gaze_dev":       round(float(fd.get("gaze_deviation", 0)) * 100, 1),
+            "pupil_norm":     round(float(fd.get("pupil_norm") or 0), 4),
+            "duchenne":       int(fd.get("duchenne", 0)),
+            # ── Vocal ───────────────────────────────────────────────────────
+            "speaking":       bool(vd.get("is_speaking")),
+            "pitch_stab":     round(float(vd.get("pitch_stability", 0.5)) * 100, 1),
+            "energy_level":   round(float(vd.get("energy_level",    0.0)) * 100, 1),
+            "tremor":         round(float(vd.get("tremor_index",     0.0)) * 100, 1),
+            "dominant_hz":    round(float(vd.get("dominant_hz",      0.0)), 1),
+            # ── Cognitive load ──────────────────────────────────────────────
+            "high_workload":  bool(wd.get("is_high_workload")),
+            "pcps":           round(float(wd.get("pcps",           1000.0)), 2),
+            "wiv":            round(float(wd.get("wiv",            1000.0)), 2),
+            "spike_progress": round(float(wd.get("spike_progress",    0.0)) * 100, 1),
+            # ── Action Units (OpenFace, normalized 0–1 from 0–5 scale) ─────
+            # aus dict keys: AU01 AU02 AU04 AU05 AU06 AU07 AU09 AU10
+            #                AU12 AU14 AU15 AU17 AU20 AU23 AU25 AU26 AU45
+            "aus":            {au: round(v, 3)
+                               for au, v in fd.get("aus", {}).items()},
         }
         self._session_rows.append(row)
 
@@ -663,30 +815,28 @@ class TrustDashboard(QMainWindow):
         avg = lambda k: sum(r[k] for r in rows) / n
         pct = lambda k: 100 * sum(1 for r in rows if r[k]) / n
 
-        durMs = (time.time() - self._session_start)
-        durSecs = int(durMs)
-        durStr = f"{durSecs // 60:02d}:{durSecs % 60:02d}"
-
-        history = [r["total"] for r in rows]
+        durSecs = int(time.time() - self._session_start)
+        durStr  = f"{durSecs // 60:02d}:{durSecs % 60:02d}"
 
         return {
-            "duration_str":          durStr,
-            "n_samples":             n,
-            "trust_total":           int(round(avg("total"))),
-            "trust_facial":          int(round(avg("facial"))),
-            "trust_vocal":           int(round(avg("vocal"))),
-            "trust_gaze":            int(round(avg("gaze"))),
-            "trust_hrv":             int(round(avg("hrv"))),
-            "peak_trust":            max(r["total"] for r in rows),
-            "low_trust":             min(r["total"] for r in rows),
-            "pct_face_detected":     pct("face_det"),
-            "pct_speaking":          pct("speaking"),
-            "pct_high_workload":     pct("high_workload"),
-            "avg_pitch_stability":   100 * avg("pitch_stab"),
-            "avg_tremor":            100 * avg("tremor"),
-            "avg_blink_rate":        avg("blink_rate"),
-            "avg_gaze_deviation":    100 * avg("gaze_dev"),
-            "trust_history":         history,
+            "duration_str":        durStr,
+            "n_samples":           n,
+            "trust_total":         int(round(avg("total"))),
+            "trust_facial":        int(round(avg("facial"))),
+            "trust_vocal":         int(round(avg("vocal"))),
+            "trust_gaze":          int(round(avg("gaze"))),
+            "trust_hrv":           int(round(avg("hrv"))),
+            "peak_trust":          max(r["total"] for r in rows),
+            "low_trust":           min(r["total"] for r in rows),
+            "pct_face_detected":   pct("face_det"),
+            "pct_speaking":        pct("speaking"),
+            "pct_high_workload":   pct("high_workload"),
+            # pitch_stab / tremor / gaze_dev already stored as %, no × 100
+            "avg_pitch_stability": avg("pitch_stab"),
+            "avg_tremor":          avg("tremor"),
+            "avg_blink_rate":      avg("blink_rate"),
+            "avg_gaze_deviation":  avg("gaze_dev"),
+            "trust_history":       [r["total"] for r in rows],
         }
 
     # ════════════════════════════════════════════════════════════════════════
@@ -702,14 +852,17 @@ class TrustDashboard(QMainWindow):
     def _save_session(self, stats: dict):
         sessions = self._load_sessions()
         sessions.append({
-            "date":         datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "duration_str": stats.get("duration_str", "00:00"),
-            "n_samples":    stats.get("n_samples", 0),
-            "trust_total":  stats.get("trust_total", 50),
-            "trust_facial": stats.get("trust_facial", 50),
-            "trust_vocal":  stats.get("trust_vocal", 50),
-            "trust_gaze":   stats.get("trust_gaze", 50),
-            "trust_hrv":    stats.get("trust_hrv", 65),
+            "date":             datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "session_id":       stats.get("session_id", ""),
+            "duration_str":     stats.get("duration_str", "00:00"),
+            "n_samples":        stats.get("n_samples", 0),
+            "trust_total":      stats.get("trust_total", 50),
+            "trust_facial":     stats.get("trust_facial", 50),
+            "trust_vocal":      stats.get("trust_vocal", 50),
+            "trust_gaze":       stats.get("trust_gaze", 50),
+            "trust_hrv":        stats.get("trust_hrv", 65),
+            "recording_path":   stats.get("recording_path"),   # relative or None
+            "thumbnail_path":   stats.get("thumbnail_path"),   # relative or None
         })
         try:
             with open(self._sessions_file, "w") as f:
@@ -720,23 +873,351 @@ class TrustDashboard(QMainWindow):
     def _export_csv(self):
         if not self._session_rows:
             return
-        default_name = f"trust-session-{datetime.now():%Y-%m-%d_%H-%M-%S}.xlsx"
+        default_name = str(
+            self._session_dir / f"trust-session-{datetime.now():%Y-%m-%d_%H-%M-%S}.xlsx"
+        )
         path, _ = QFileDialog.getSaveFileName(
             self, "Export session as Excel", default_name, "Excel (*.xlsx)",
         )
         if not path:
             return
         try:
-            wb = openpyxl.Workbook()
-            ws = wb.active
-            ws.title = "Session"
-            headers = list(self._session_rows[0].keys())
-            ws.append(headers)
-            for row in self._session_rows:
-                ws.append([row[h] for h in headers])
-            wb.save(path)
+            self._build_excel(path)
         except Exception as e:
             QMessageBox.critical(self, "Export failed", str(e))
+
+    # ── Excel builder ────────────────────────────────────────────────────────
+    def _build_excel(self, path: str):
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+
+        HDR_FILL   = PatternFill("solid", fgColor="2563EB")   # accent blue
+        HDR_FONT   = Font(bold=True, color="FFFFFF", name="Calibri", size=10)
+        BODY_FONT  = Font(name="Calibri", size=10)
+        ALT_FILL   = PatternFill("solid", fgColor="F1F5F9")   # very light slate
+        LEG_TITLE  = Font(bold=True, name="Calibri", size=10, color="1E3A5F")
+        LEG_KEY    = Font(bold=True, name="Calibri", size=9)
+        LEG_VAL    = Font(name="Calibri", size=9, color="475569")
+        LEG_FILL   = PatternFill("solid", fgColor="EFF6FF")
+        CENTER     = Alignment(horizontal="center", vertical="center")
+        LEFT       = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+        thin       = Side(style="thin", color="CBD5E1")
+        BORDER     = Border(bottom=thin)
+
+        rows = self._session_rows
+
+        def _yn(v):
+            return "Yes" if v else "No"
+
+        def _auto_width(ws, min_w=10, max_w=48):
+            for col in ws.columns:
+                best = min_w
+                for cell in col:
+                    if cell.value is not None:
+                        best = max(best, min(max_w, len(str(cell.value)) + 2))
+                ws.column_dimensions[get_column_letter(col[0].column)].width = best
+
+        def _write_sheet(ws, columns, legend):
+            """columns: list of (header_label, row_key, formatter_fn | None)
+               legend:  list of (field_name, description)"""
+            # ── header ──────────────────────────────────────────────────────
+            for c, (label, _, _) in enumerate(columns, 1):
+                cell = ws.cell(row=1, column=c, value=label)
+                cell.font      = HDR_FONT
+                cell.fill      = HDR_FILL
+                cell.alignment = CENTER
+                cell.border    = BORDER
+            ws.freeze_panes = "A2"
+            ws.row_dimensions[1].height = 20
+
+            # ── data rows ───────────────────────────────────────────────────
+            for r_idx, row in enumerate(rows, 2):
+                fill = ALT_FILL if r_idx % 2 == 0 else None
+                for c, (_, key, fmt) in enumerate(columns, 1):
+                    raw = row.get(key, "")
+                    val = fmt(raw) if fmt else raw
+                    cell = ws.cell(row=r_idx, column=c, value=val)
+                    cell.font      = BODY_FONT
+                    cell.alignment = CENTER
+                    if fill:
+                        cell.fill = fill
+
+            # ── legend ──────────────────────────────────────────────────────
+            leg_start = len(rows) + 3   # blank row gap
+            title_cell = ws.cell(row=leg_start, column=1, value="LEGEND")
+            title_cell.font      = LEG_TITLE
+            title_cell.fill      = LEG_FILL
+            title_cell.alignment = LEFT
+            ws.merge_cells(start_row=leg_start, start_column=1,
+                           end_row=leg_start,   end_column=len(columns))
+
+            for i, (field, desc) in enumerate(legend, leg_start + 1):
+                k = ws.cell(row=i, column=1, value=field)
+                k.font      = LEG_KEY
+                k.alignment = LEFT
+                d = ws.cell(row=i, column=2, value=desc)
+                d.font      = LEG_VAL
+                d.alignment = LEFT
+                if len(columns) > 2:
+                    ws.merge_cells(start_row=i, start_column=2,
+                                   end_row=i,   end_column=len(columns))
+
+            _auto_width(ws)
+
+        wb = openpyxl.Workbook()
+
+        # ════════════════════════════════════════════════════════════════════
+        # Sheet 1 — Trust Session  (matches reference format exactly)
+        # ════════════════════════════════════════════════════════════════════
+        ws1 = wb.active
+        ws1.title = "Trust Session"
+        _write_sheet(ws1, [
+            ("Timestamp",        "timestamp",      None),
+            ("Elapsed (s)",      "elapsed_s",      None),
+            ("Trust Total",      "total",          None),
+            ("Facial",           "facial",         None),
+            ("Vocal",            "vocal",          None),
+            ("Gaze",             "gaze",           None),
+            ("HRV",              "hrv",            None),
+            ("Face Detected",    "face_det",       _yn),
+            ("Expression",       "expression",     None),
+            ("Eye Openness %",   "eye_openness",   None),
+            ("Blink Rate /min",  "blink_rate",     None),
+            ("Gaze Deviation %", "gaze_dev",       None),
+            ("Pupil (norm.)",    "pupil_norm",     None),
+            ("Duchenne Smile",   "duchenne",       None),
+            ("Speaking",         "speaking",       _yn),
+            ("Pitch Stability %","pitch_stab",     None),
+            ("Voice Energy %",   "energy_level",   None),
+            ("Tremor Index %",   "tremor",         None),
+            ("Vocal Hz",         "dominant_hz",    None),
+            ("High Workload",    "high_workload",  _yn),
+            ("PCPS",             "pcps",           None),
+            ("WIV",              "wiv",            None),
+            ("Spike Progress %", "spike_progress", None),
+        ], legend=[
+            ("Trust Total",      "Weighted composure index (0–100). "
+                                 "35% Facial + 25% Vocal + 25% Gaze + 15% HRV, "
+                                 "smoothed with α=0.20 exponential moving average."),
+            ("Facial",           "Facial composure sub-score (0–100)."),
+            ("Vocal",            "Vocal composure sub-score (0–100)."),
+            ("Gaze",             "Gaze / head-pose composure sub-score (0–100)."),
+            ("HRV",              "Heart-rate variability composure sub-score (0–100)."),
+        ])
+
+        # ════════════════════════════════════════════════════════════════════
+        # Sheet 2 — Facial Analysis
+        # ════════════════════════════════════════════════════════════════════
+        ws2 = wb.create_sheet("Facial Analysis")
+        _write_sheet(ws2, [
+            ("Timestamp",        "timestamp",    None),
+            ("Elapsed (s)",      "elapsed_s",    None),
+            ("Facial Score",     "facial",       None),
+            ("Face Detected",    "face_det",     _yn),
+            ("Expression",       "expression",   None),
+            ("Eye Openness %",   "eye_openness", None),
+            ("Blink Rate /min",  "blink_rate",   None),
+            ("Gaze Deviation %", "gaze_dev",     None),
+            ("Pupil (norm.)",    "pupil_norm",   None),
+            ("Duchenne Smile",   "duchenne",     None),
+        ], legend=[
+            ("Facial Score",     "Composure sub-score derived from eye openness stability, "
+                                 "blink regularity, gaze deviation, and expression neutrality (0–100)."),
+            ("Face Detected",    "Whether MediaPipe detected and tracked a face in the frame."),
+            ("Expression",       "Dominant facial expression inferred from OpenFace Action Units "
+                                 "(neutral · happy · sad · angry · surprised · fearful · disgusted)."),
+            ("Eye Openness %",   "Eye Aspect Ratio × 100. Typical open-eye range: 25–45 %. "
+                                 "Values below ~15 % indicate a blink in progress."),
+            ("Blink Rate /min",  "Rolling blinks-per-minute count. "
+                                 "Normal rest: 15–20 /min. Elevated rates may indicate fatigue or stress."),
+            ("Gaze Deviation %", "Head-pose deviation from camera centre (yaw + 0.5 × pitch, normalised). "
+                                 "100 % = looking 40° away. Values above 20 % indicate the subject is looking away."),
+            ("Pupil (norm.)",    "Iris radius normalised to inter-ocular distance via MediaPipe iris landmarks. "
+                                 "Larger values indicate pupil dilation (higher cognitive arousal)."),
+            ("Duchenne Smile",   "Binary flag. 1 = genuine (Duchenne) smile detected: "
+                                 "AU06 (cheek raiser) active simultaneously with AU12 (lip corner puller)."),
+        ])
+
+        # ════════════════════════════════════════════════════════════════════
+        # Sheet 3 — Vocal Analysis
+        # ════════════════════════════════════════════════════════════════════
+        ws3 = wb.create_sheet("Vocal Analysis")
+        _write_sheet(ws3, [
+            ("Timestamp",          "timestamp",   None),
+            ("Elapsed (s)",        "elapsed_s",   None),
+            ("Vocal Score",        "vocal",       None),
+            ("Speaking",           "speaking",    _yn),
+            ("Pitch Stability %",  "pitch_stab",  None),
+            ("Voice Energy %",     "energy_level",None),
+            ("Tremor Index %",     "tremor",      None),
+            ("Vocal Hz",           "dominant_hz", None),
+        ], legend=[
+            ("Vocal Score",        "Composure sub-score derived from pitch stability, "
+                                   "energy consistency, and tremor index (0–100)."),
+            ("Speaking",           "Active speech detected: RMS energy above the silence threshold (0.018)."),
+            ("Pitch Stability %",  "Inverse coefficient of variation of fundamental frequency (F0). "
+                                   "100 % = perfectly stable pitch. Low values suggest vocal stress or emotion."),
+            ("Voice Energy %",     "Normalised RMS loudness (0–100 %). "
+                                   "100 % corresponds to ≈ 0.09 RMS (comfortable speaking volume)."),
+            ("Tremor Index %",     "High-frequency amplitude modulation of the voice (0–100 %). "
+                                   "Values above 30 % suggest significant vocal tremor."),
+            ("Vocal Hz",           "Fundamental frequency (F0) in Hz via autocorrelation. "
+                                   "Typical speech range: 80–450 Hz. 0 = not speaking."),
+        ])
+
+        # ════════════════════════════════════════════════════════════════════
+        # Sheet 4 — Gaze Analysis
+        # ════════════════════════════════════════════════════════════════════
+        ws4 = wb.create_sheet("Gaze Analysis")
+        _write_sheet(ws4, [
+            ("Timestamp",          "timestamp", None),
+            ("Elapsed (s)",        "elapsed_s", None),
+            ("Gaze Score",         "gaze",      None),
+            ("Gaze Deviation %",   "gaze_dev",  None),
+            ("Pupil (norm.)",      "pupil_norm",None),
+        ], legend=[
+            ("Gaze Score",         "Composure sub-score based on sustained head-pose stability (0–100). "
+                                   "Frequent or large deviations lower the score."),
+            ("Gaze Deviation %",   "Angular deviation computed from MediaPipe 3-D head-pose landmarks: "
+                                   "(|yaw| + 0.5 × |pitch|) ÷ 40°, clamped to 100 %. "
+                                   "Values above 20–25 % typically indicate deliberate look-away."),
+            ("Pupil (norm.)",      "Included here because iris size encodes arousal "
+                                   "and correlates with sustained attention."),
+        ])
+
+        # ════════════════════════════════════════════════════════════════════
+        # Sheet 5 — Cognitive Load
+        # ════════════════════════════════════════════════════════════════════
+        ws5 = wb.create_sheet("Cognitive Load")
+        _write_sheet(ws5, [
+            ("Timestamp",          "timestamp",      None),
+            ("Elapsed (s)",        "elapsed_s",      None),
+            ("High Workload",      "high_workload",  _yn),
+            ("PCPS",               "pcps",           None),
+            ("WIV",                "wiv",            None),
+            ("Spike Progress %",   "spike_progress", None),
+        ], legend=[
+            ("PCPS",               "Pupil Change Per Second — baseline-corrected real-time pupil dilation. "
+                                   "Baseline pupil = 1000. Values > 1000 indicate dilation above baseline."),
+            ("WIV",                "Within-session Inertia Value — 60-second rolling mean of PCPS. "
+                                   "Adapts to the subject's typical pupil level throughout the session."),
+            ("High Workload",      "'Yes' when PCPS > WIV × 1.015 "
+                                   "(pupil at least 1.5 % above the rolling average)."),
+            ("Spike Progress %",   "Progress (0–100 %) toward a confirmed high-workload spike. "
+                                   "A spike is declared when High Workload persists for 60 continuous seconds. "
+                                   "Resets to 0 % on any low-workload moment."),
+        ])
+
+        # ════════════════════════════════════════════════════════════════════
+        # Sheet 6 — HRV
+        # ════════════════════════════════════════════════════════════════════
+        ws6 = wb.create_sheet("HRV")
+        _write_sheet(ws6, [
+            ("Timestamp",          "timestamp", None),
+            ("Elapsed (s)",        "elapsed_s", None),
+            ("HRV Score",          "hrv",       None),
+        ], legend=[
+            ("HRV Score",          "Heart-rate variability composure sub-score (0–100). "
+                                   "Currently supplied by a stub analyzer returning a stable baseline (65). "
+                                   "Future integration with a wearable HRV sensor will populate "
+                                   "this column with real beat-to-beat interval data."),
+        ])
+
+        # ════════════════════════════════════════════════════════════════════
+        # Sheet 7 — Action Units
+        # ════════════════════════════════════════════════════════════════════
+        # AU descriptions (FACS label + what elevated intensity means)
+        AU_META = {
+            "AU01": ("Inner Brow Raise",       "Raises the inner corners of the eyebrows. Active in sadness, fear, and worry."),
+            "AU02": ("Outer Brow Raise",       "Raises the outer corners of the eyebrows. Seen in surprise and fear."),
+            "AU04": ("Brow Lowerer",           "Pulls the brows together and down. Key marker of anger, concentration, and confusion."),
+            "AU05": ("Upper Lid Raiser",       "Widens the eye aperture. Strongly associated with surprise and fear."),
+            "AU06": ("Cheek Raiser",           "Raises the cheeks, forming crow's feet. Required component of a genuine (Duchenne) smile."),
+            "AU07": ("Lid Tightener",          "Tightens the lower eyelid. Present in anger, disgust, and focus."),
+            "AU09": ("Nose Wrinkler",          "Wrinkles the nose. Primary marker of disgust."),
+            "AU10": ("Upper Lip Raiser",       "Raises the upper lip. Present in disgust and mild contempt."),
+            "AU12": ("Lip Corner Puller",      "Pulls lip corners outward and upward. Core component of smiling."),
+            "AU14": ("Dimpler",                "Creates dimples by pulling lip corners. Seen in suppressed smiles and smirks."),
+            "AU15": ("Lip Corner Depressor",   "Pulls lip corners downward. Associated with sadness and disappointment."),
+            "AU17": ("Chin Raiser",            "Raises the chin boss. Seen in sadness, doubt, and pouting."),
+            "AU20": ("Lip Stretcher",          "Stretches lips horizontally. Common in fear and nervous tension."),
+            "AU23": ("Lip Tightener",          "Tightens the lips. Present in anger and determination."),
+            "AU25": ("Lips Part",              "Parts the lips. Accompanies many expressions; elevated in surprise, disgust, speech."),
+            "AU26": ("Jaw Drop",               "Opens the jaw. Strong indicator of surprise, shock, or open-mouth speech."),
+            "AU45": ("Blink / Eye Closure",    "Eye closure intensity. High sustained values indicate fatigue or discomfort."),
+        }
+        AU_ORDER = ["AU01","AU02","AU04","AU05","AU06","AU07","AU09","AU10",
+                    "AU12","AU14","AU15","AU17","AU20","AU23","AU25","AU26","AU45"]
+
+        ws7 = wb.create_sheet("Action Units")
+        # ── header ─────────────────────────────────────────────────────────
+        fixed_cols = [("Timestamp", "timestamp"), ("Elapsed (s)", "elapsed_s"),
+                      ("Face Detected", "face_det"), ("Expression", "expression")]
+        all_headers = ([h for h, _ in fixed_cols] +
+                       [f"{au} – {AU_META[au][0]}" for au in AU_ORDER if au in AU_META])
+
+        for c, h in enumerate(all_headers, 1):
+            cell = ws7.cell(row=1, column=c, value=h)
+            cell.font      = HDR_FONT
+            cell.fill      = HDR_FILL
+            cell.alignment = CENTER
+            cell.border    = BORDER
+        ws7.freeze_panes = "A2"
+        ws7.row_dimensions[1].height = 28
+
+        # ── data rows ──────────────────────────────────────────────────────
+        for r_idx, row in enumerate(rows, 2):
+            fill = ALT_FILL if r_idx % 2 == 0 else None
+            aus  = row.get("aus", {})
+            vals = (
+                [row.get("timestamp", ""), row.get("elapsed_s", ""),
+                 _yn(row.get("face_det", False)), row.get("expression", "—")] +
+                [aus.get(au, "") for au in AU_ORDER]
+            )
+            for c, v in enumerate(vals, 1):
+                cell = ws7.cell(row=r_idx, column=c, value=v)
+                cell.font      = BODY_FONT
+                cell.alignment = CENTER
+                if fill:
+                    cell.fill = fill
+
+        # ── legend ─────────────────────────────────────────────────────────
+        leg_start = len(rows) + 3
+        title_cell = ws7.cell(row=leg_start, column=1, value="LEGEND")
+        title_cell.font      = LEG_TITLE
+        title_cell.fill      = LEG_FILL
+        title_cell.alignment = LEFT
+        ws7.merge_cells(start_row=leg_start, start_column=1,
+                        end_row=leg_start, end_column=4)
+
+        ws7.cell(row=leg_start, column=1).value = (
+            "LEGEND  —  All AU values are OpenFace regression intensities "
+            "normalised to 0–1 (0 = absent, 1 = maximum intensity). "
+            "Original OpenFace scale is 0–5; divide by 5 to recover it."
+        )
+
+        for i, au in enumerate(AU_ORDER, leg_start + 1):
+            if au not in AU_META:
+                continue
+            facs_name, desc = AU_META[au]
+            k = ws7.cell(row=i, column=1, value=f"{au}  {facs_name}")
+            k.font      = LEG_KEY
+            k.alignment = LEFT
+            d = ws7.cell(row=i, column=2, value=desc)
+            d.font      = LEG_VAL
+            d.alignment = LEFT
+            ws7.merge_cells(start_row=i, start_column=2, end_row=i, end_column=4)
+
+        # auto-width: fixed cols narrow, AU cols fixed ~14
+        from openpyxl.utils import get_column_letter as gcl
+        ws7.column_dimensions[gcl(1)].width = 22   # Timestamp
+        ws7.column_dimensions[gcl(2)].width = 12   # Elapsed
+        ws7.column_dimensions[gcl(3)].width = 14   # Face Detected
+        ws7.column_dimensions[gcl(4)].width = 14   # Expression
+        for c in range(5, 5 + len(AU_ORDER)):
+            ws7.column_dimensions[gcl(c)].width = 28
+
+        wb.save(path)
 
     # ════════════════════════════════════════════════════════════════════════
     # Workload spike → NASA TLX dialog
@@ -765,6 +1246,15 @@ class TrustDashboard(QMainWindow):
     # ════════════════════════════════════════════════════════════════════════
     def closeEvent(self, event):
         self._running = False
+        # Flush and release writer before anything else
+        with self._writer_lock:
+            writer = self._writer
+            self._writer = None
+        if writer is not None:
+            try:
+                writer.release()
+            except Exception:
+                pass
         try:
             if self._cap is not None:
                 self._cap.release()
