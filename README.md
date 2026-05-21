@@ -1,16 +1,19 @@
 # Trust Level Dashboard
 
-A real-time dashboard that measures behavioural trust indicators using your webcam and microphone. All analysis runs locally in Python — no data leaves your machine.
+A real-time desktop application that measures behavioural trust indicators using your webcam and microphone. All analysis runs locally in Python — no data leaves your machine.
+
+---
 
 ## What it measures
 
-| Channel | Signal | Library |
+| Channel | What is detected | Tools used |
 |---|---|---|
-| **Facial** | Expression probabilities (happy, neutral, angry, fearful, sad, disgusted, surprised) derived from 52 MediaPipe face blendshapes | MediaPipe |
-| **Gaze** | Eye Aspect Ratio (blink detection), blink rate, iris deviation from eye centre | MediaPipe |
-| **Vocal** | Pitch stability, voice energy, tremor index via autocorrelation | NumPy |
+| **Facial** | Emotion scores (happy, sad, angry, fearful, disgusted, surprised, neutral), individual facial muscle activity (Action Units), genuine vs forced smile | MediaPipe + OpenFace |
+| **Gaze** | Eye openness (Eye Aspect Ratio), blink rate, iris deviation, head rotation | MediaPipe |
+| **Vocal** | Pitch stability, voice energy level, tremor index | NumPy |
+| **HRV** | Heart rate variability (placeholder — see [Adding a real HRV sensor](#adding-a-real-hrv-sensor)) | — |
 
-The three channels are combined (40% facial / 30% vocal / 30% gaze) into a single **Trust Score** (0–100) with exponential smoothing applied so the display doesn't jump erratically.
+The four channels are combined into a single **Trust Score** (0–100) using weighted averaging (facial 35%, vocal 25%, gaze 25%, HRV 15%) with exponential smoothing so the display updates fluidly without jumping erratically.
 
 ---
 
@@ -19,6 +22,8 @@ The three channels are combined (40% facial / 30% vocal / 30% gaze) into a singl
 - Python 3.10 or later
 - A webcam
 - A microphone (optional — vocal analysis is skipped if unavailable)
+- OpenFace compiled and placed at `~/OpenFace/build/bin/FeatureExtraction`
+  - Build instructions: https://github.com/TadasBaltrusaitis/OpenFace
 
 ---
 
@@ -73,18 +78,25 @@ A desktop window opens immediately — no browser needed.
 
 ```
 trust-dashboard/
-├── main.py              # FastAPI server + WebSocket handler
-├── face_analyzer.py     # MediaPipe face landmark detection, emotion mapping, EAR, iris gaze
-├── vocal_analyzer.py    # Autocorrelation pitch detection, energy, tremor (NumPy)
-├── trust_engine.py      # Weighted score combination with exponential smoothing
-├── requirements.txt     # Python dependencies
-├── face_landmarker.task # MediaPipe model (downloaded automatically on first run)
-├── static/
-│   ├── index.html       # Dashboard UI
-│   ├── styles.css       # Dark-theme styles
-│   └── client.js        # Browser capture layer (sends frames + audio to Python via WebSocket)
+├── main.py                    # App entry point and main window
+├── overlays.py                # On-screen face and eye overlay rendering
+├── panels.py                  # Dashboard panel components
+├── widgets.py                 # Custom UI widgets (gauges, bars, charts)
+├── theme.py                   # Colours and visual styling
+├── requirements.txt           # Python dependencies
+├── sessions.json              # Session history log
+├── recordings/                # Session recordings (.mp4 + .jpg thumbnail per session)
+├── static/                    # Static assets (icons, fonts)
+├── Physio_analysis/
+│   ├── face_analyzer.py       # MediaPipe + OpenFace face analysis (see below)
+│   ├── vocal_analyzer.py      # Voice pitch, energy, and tremor analysis
+│   ├── trust_engine.py        # Combines all channels into a single trust score
+│   ├── hrv_analyzer.py        # Heart rate variability (stub — see below)
+│   ├── workload_engine.py     # Pupil-dilation workload detection (PCPS / WIV)
+│   ├── nasa_tlx.py            # NASA Task Load Index questionnaire dialog
+│   └── FACE_ANALYSIS_ARCHITECTURE.md  # Detailed explanation of the dual-tool face analysis
 └── .vscode/
-    └── launch.json      # VS Code debug configuration
+    └── launch.json            # VS Code debug configuration
 ```
 
 ---
@@ -92,38 +104,75 @@ trust-dashboard/
 ## How it works
 
 ```
-Browser                          Python (FastAPI)
-───────                          ────────────────
-Camera frame (JPEG, base64) ──►  face_analyzer.py
-                                   └─ MediaPipe FaceLandmarker
-                                      • 478 landmarks
-                                      • 52 blendshapes → emotions
-                                      • EAR → blink rate
-                                      • Iris offset → gaze deviation
+Webcam frame
+    │
+    ▼
+face_analyzer.py
+    ├─ MediaPipe (~10 ms, runs every frame)
+    │    • Locates 478 landmark points on the face
+    │    • Computes Eye Aspect Ratio → blink detection + blink rate
+    │    • Measures iris position → gaze deviation
+    │    • Extracts head rotation matrix → pose deviation
+    │    • Estimates iris radius / inter-ocular distance → pupil size proxy
+    │
+    └─ OpenFace (~600 ms, runs in background thread)
+         • Detects Action Unit intensities and presence flags
+         • Scores emotions from muscle combinations
+         • Detects genuine (Duchenne) vs forced smile
 
-Audio chunk (Float32 PCM)   ──►  vocal_analyzer.py
-                                   └─ NumPy autocorrelation
-                                      • Dominant pitch (Hz)
-                                      • Pitch stability (CV)
-                                      • Energy level (RMS)
-                                      • Tremor index
+Microphone audio
+    │
+    ▼
+vocal_analyzer.py
+    • Autocorrelation pitch detection (80–450 Hz range)
+    • Pitch stability (coefficient of variation)
+    • Energy level (RMS normalised)
+    • Tremor index (frame-to-frame energy variation)
 
-                                 trust_engine.py
-                                   └─ Weighted combination
-                                      • 40% facial
-                                      • 30% vocal
-                                      • 30% gaze
-                                      • Exponential smoothing (α=0.2)
+Pupil size (from face_analyzer)
+    │
+    ▼
+workload_engine.py
+    • Computes PCPS: (pupil − baseline) / baseline + 1000
+    • Maintains 60-second rolling average as the WIV threshold
+    • Declares a workload spike after 60 s of continuous high PCPS
+    • Triggers NASA TLX questionnaire when the spike ends
 
-JSON scores + metrics       ◄──  WebSocket response
-
-Renders gauge, bars, chart
+All channels
+    │
+    ▼
+trust_engine.py
+    • facial  35%  (expressions + Action Units + Duchenne smile)
+    • vocal   25%  (pitch stability + energy + tremor)
+    • gaze    25%  (eye openness + blink rate + gaze deviation)
+    • hrv     15%  (heart rate variability — placeholder until sensor is connected)
+    • Exponential smoothing (α = 0.2) applied to all channels
+    • Outputs 0–100 trust score + per-channel breakdown
 ```
+
+For a detailed explanation of why MediaPipe and OpenFace are used together, see [`Physio_analysis/FACE_ANALYSIS_ARCHITECTURE.md`](Physio_analysis/FACE_ANALYSIS_ARCHITECTURE.md).
+
+---
+
+## Session recording and export
+
+Each recorded session is saved to `~/Desktop/trust-dashboard/` and includes:
+- An `.mp4` video of the session
+- A `.jpg` thumbnail
+- An Excel workbook (`.xlsx`) with six sheets covering raw scores, emotion timelines, Action Units, vocal metrics, workload, and session summary
+
+---
+
+## Adding a real HRV sensor
+
+`hrv_analyzer.py` currently returns a fixed placeholder score of 65. Two upgrade paths are documented inside the file:
+
+- **Option A — Bluetooth heart-rate monitor** (Polar H10, Garmin, etc.) using the `bleak` library
+- **Option B — Webcam rPPG** (no extra hardware) by extracting the pulse signal from the green channel of a forehead region of interest
 
 ---
 
 ## Notes
 
-- The dashboard shows a **demo mode** with simulated signals when the Python server is not running (e.g. in a static preview environment).
-- Trust scores reflect behavioural indicators correlated with comfort and openness — they are not a lie detector.
-- All processing happens in your browser and on your local machine. No video, audio, or scores are sent to any external server.
+- Trust scores reflect behavioural indicators correlated with comfort and openness — they are not a lie detector and should not be used as one.
+- All processing happens on your local machine. No video, audio, or scores are sent to any external server.
