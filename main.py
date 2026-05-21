@@ -337,22 +337,100 @@ class TrustDashboard(QMainWindow):
     # ════════════════════════════════════════════════════════════════════════
     # Camera + analysis threads
     # ════════════════════════════════════════════════════════════════════════
+    @staticmethod
+    def _avf_camera_names() -> tuple[dict[int, str], set[int]]:
+        """Return (names, phone_indices) via direct PyObjC import in the main process.
+
+        names        — {avf_index: display_name}
+        phone_indices — set of indices that are Continuity / iPhone cameras,
+                        detected via AVCaptureDevice.deviceType and
+                        isContinuityCamera (macOS 13 / 14 APIs) rather than
+                        relying solely on the display name.
+
+        Must run in the main app process — macOS only grants camera permission
+        to the application, not to subprocesses.
+        """
+        try:
+            from AVFoundation import AVCaptureDevice, AVMediaTypeVideo
+            devices = AVCaptureDevice.devicesWithMediaType_(AVMediaTypeVideo)
+            names: dict[int, str] = {}
+            phone_indices: set[int] = set()
+            for i, d in enumerate(devices):
+                name = str(d.localizedName())
+                names[i] = name
+                is_phone = False
+                # ① deviceType string contains "Continuity" on macOS 13+
+                try:
+                    dt = str(d.deviceType()).lower()
+                    if "continuity" in dt:
+                        is_phone = True
+                except Exception:
+                    pass
+                # ② isContinuityCamera property, macOS 14+
+                try:
+                    if d.isContinuityCamera():
+                        is_phone = True
+                except Exception:
+                    pass
+                # ③ name-based fallback
+                name_lc = name.lower()
+                if any(kw in name_lc for kw in ("iphone", "ipad", "continuity", "desk view")):
+                    is_phone = True
+                if is_phone:
+                    phone_indices.add(i)
+            print(f"[camera] AVFoundation devices : {names}")
+            print(f"[camera] Phone/continuity indices: {phone_indices}")
+            return names, phone_indices
+        except Exception as e:
+            print(f"[camera] AVFoundation query failed: {e}")
+            return {}, set()
+
     def _pick_camera(self) -> int:
-        available = []
-        for i in range(6):
+        # ── Step 0: warm-up open to trigger macOS camera-permission grant ────
+        _old = os.dup(2); os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
+        try:
+            _w = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION); _w.release()
+        except Exception:
+            pass
+        finally:
+            os.dup2(_old, 2); os.close(_old)
+
+        # ── Step 1: authoritative device list from AVFoundation ─────────────
+        camera_names, phone_indices = self._avf_camera_names()
+
+        # ── Step 2: scan all indices; validate with a frame ─────────────────
+        available: list[int] = []
+        for i in range(10):
             old_err = os.dup(2)
             os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
             try:
                 cap = cv2.VideoCapture(i, cv2.CAP_AVFOUNDATION)
                 if cap.isOpened():
-                    available.append(i)
+                    ret, _ = cap.read()
+                    if ret:
+                        available.append(i)
+                        print(f"[camera] Index {i} ({camera_names.get(i, '?')}) → OK")
                 cap.release()
+            except Exception:
+                pass
             finally:
                 os.dup2(old_err, 2)
                 os.close(old_err)
 
         self._available_cameras = available if available else [0]
-        return self._available_cameras[0]
+        print(f"[camera] Available cameras: {self._available_cameras}")
+
+        # ── Step 3: prefer Continuity Camera (iPhone) when present ──────────
+        # Check by AVFoundation device-type flags first (most reliable),
+        # then fall back to name keywords.
+        for i in self._available_cameras:
+            if i in phone_indices:
+                print(f"[camera] Selected index {i} ({camera_names.get(i, '?')}) — Continuity Camera")
+                return i
+
+        chosen = self._available_cameras[0]
+        print(f"[camera] Selected index {chosen} ({camera_names.get(chosen, '?')}) — first available")
+        return chosen
 
     def _start_camera(self):
         if self._cap is not None:
