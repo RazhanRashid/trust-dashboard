@@ -24,12 +24,19 @@ class GaugeWidget(QWidget):
         self._score = 50
         self._baseline = None
         self._color = QColor("#60a5fa")
+        self._band_label = ""
+        self._band_color = "#94a3b8"
         self.setMinimumSize(360, 260)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def setScore(self, score: int, color_hex: str):
         self._score = max(0, min(100, int(score)))
         self._color = QColor(color_hex)
+        self.update()
+
+    def setBandLabel(self, label: str, color_hex: str):
+        self._band_label = label.upper()
+        self._band_color = color_hex
         self.update()
 
     def setBaseline(self, score: int):
@@ -67,20 +74,30 @@ class GaugeWidget(QWidget):
                       Qt.PenCapStyle.RoundCap))
         p.drawArc(arc_rect, 180 * 16, int(active_span * 16))
 
-        # Big number
+        # Big number — sits in the upper ~72 % of the radius so the band
+        # label can breathe underneath it without collision.
         num_font = mono_font(88, QFont.Weight.DemiBold)
         num_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 94)
         p.setFont(num_font)
         p.setPen(self._color)
-        num_rect = QRectF(0, cy - radius * 0.78, w, radius * 0.78)
+        num_rect = QRectF(0, cy - radius * 0.90, w, radius * 0.68)
         p.drawText(num_rect, Qt.AlignmentFlag.AlignCenter, str(self._score))
+
+        # Band label (e.g. "BASELINE") — drawn between number and "/ 100"
+        if self._band_label:
+            band_font = mono_font(9, QFont.Weight.DemiBold)
+            band_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 130)
+            p.setFont(band_font)
+            p.setPen(QColor(self._band_color))
+            band_rect = QRectF(0, cy - 44, w, 22)
+            p.drawText(band_rect, Qt.AlignmentFlag.AlignCenter, self._band_label)
 
         # "/ 100" subtitle
         sub_font = mono_font(8, QFont.Weight.Medium)
         sub_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 130)
         p.setFont(sub_font)
         p.setPen(QColor(TEXT_GHOST))
-        sub_rect = QRectF(0, cy - 14, w, 18)
+        sub_rect = QRectF(0, cy - 20, w, 18)
         p.drawText(sub_rect, Qt.AlignmentFlag.AlignCenter, "/ 100")
 
         # Baseline tick — small notch on the arc at the calibrated score

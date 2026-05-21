@@ -21,7 +21,7 @@ from theme import (BG, BG_DEEP, PANEL, PANEL_2, LINE, LINE_SOFT,
                     C_FACIAL, C_VOCAL, C_GAZE, C_HRV, C_WORKLOAD,
                     ACCENT, DANGER,
                     ui_font, mono_font, trust_band, panel_qss, head_qss)
-from widgets import (GaugeWidget, BarTrack, ChannelBar, TrustBadge, StatusDot,
+from widgets import (GaugeWidget, BarTrack, ChannelBar, StatusDot,
                       MetricBox, PanelHead, WaveformWidget, SpectrumWidget,
                       AttributionStrip)
 
@@ -360,14 +360,6 @@ class ScorePanel(QFrame):
         gw.addStretch()
         body_l.addLayout(gw)
 
-        # Badge
-        self.badge = TrustBadge()
-        bw = QHBoxLayout()
-        bw.addStretch()
-        bw.addWidget(self.badge)
-        bw.addStretch()
-        body_l.addLayout(bw)
-
         # Attribution strip
         self._attribution = AttributionStrip()
         body_l.addWidget(self._attribution)
@@ -425,7 +417,7 @@ class ScorePanel(QFrame):
     def update_scores(self, total: int, facial: int, vocal: int, gaze: int, hrv: int):
         label, color = trust_band(int(total))
         self.gauge.setScore(int(total), color)
-        self.badge.setBand(label, color)
+        self.gauge.setBandLabel(label, color)
         self.bar_facial.setValue(facial)
         self.bar_vocal.setValue(vocal)
         self.bar_gaze.setValue(gaze)

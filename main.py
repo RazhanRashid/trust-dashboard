@@ -35,13 +35,13 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QStackedWidget,
                               QFileDialog)
 
 # ── Analyzer modules (unchanged) ─────────────────────────────────────────────
-from Physio_analysis.face_analyzer import FaceAnalyzer
-from Physio_analysis.vocal_analyzer import VocalAnalyzer
-from trust_engine    import TrustEngine
-from workload_engine import WorkloadEngine
-from hrv_analyzer    import HRVAnalyzer
+from Physio_analysis.face_analyzer    import FaceAnalyzer
+from Physio_analysis.vocal_analyzer   import VocalAnalyzer
+from Physio_analysis.trust_engine     import TrustEngine
+from Physio_analysis.workload_engine  import WorkloadEngine
+from Physio_analysis.hrv_analyzer     import HRVAnalyzer
 try:
-    from nasa_tlx import NasaTLX  # noqa: F401
+    from Physio_analysis.nasa_tlx import NasaTLX  # noqa: F401
     HAS_TLX = True
 except Exception:
     HAS_TLX = False
