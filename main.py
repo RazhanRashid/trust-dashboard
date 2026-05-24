@@ -125,6 +125,9 @@ class TrustDashboard(QMainWindow):
         self._best_thumb_frame = None
         self._best_thumb_conf: float = -1.0
 
+        # ── Latest scores (read by camera loop for recording overlay) ────────
+        self._last_scores: dict = {}   # Written by _update_body; read by _camera_loop
+
         # ── Post-hoc OpenFace analysis ───────────────────────────────────────
         # After a session ends, OpenFace is run on the .mp4 recording in a
         # background thread. Results are stored here and written into the Excel.
@@ -510,6 +513,131 @@ class TrustDashboard(QMainWindow):
             return rec_path, None
 
     # ════════════════════════════════════════════════════════════════════════
+    # Recording overlay
+    # ════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _draw_recording_overlay(frame: np.ndarray, face_data: dict | None,
+                                 scores: dict | None) -> np.ndarray:
+        """
+        Draw a blendshape emotion panel onto a copy of the recording frame.
+        Called once per camera frame (~30 fps) before writing to the video file.
+        The live display is unaffected — this only annotates the saved recording.
+        """
+        h, w = frame.shape[:2]
+
+        # ── Emotion definitions: label, BGR colour ────────────────────────────
+        EMOTIONS = [
+            ("happy",     (86,  211,  86)),   # Green
+            ("neutral",   (180, 180, 180)),   # Grey
+            ("surprised", ( 50, 210, 210)),   # Yellow
+            ("sad",       (180, 130,  80)),   # Steel blue
+            ("angry",     ( 60,  60, 220)),   # Red
+            ("fearful",   ( 60, 150, 220)),   # Orange
+            ("disgusted", (160,  60, 160)),   # Purple
+            ("contempt",  ( 50,  50, 170)),   # Dark red
+        ]
+
+        # ── Panel geometry ────────────────────────────────────────────────────
+        PAD        = 10    # Inner padding
+        ROW_H      = 26    # Height of each emotion row
+        BAR_MAX_W  = 110   # Maximum bar width in pixels
+        LABEL_W    = 72    # Width reserved for the emotion label
+        VAL_W      = 34    # Width reserved for the numeric value
+        PANEL_W    = PAD + LABEL_W + 6 + BAR_MAX_W + 6 + VAL_W + PAD   # ~248 px
+        HEADER_H   = 38    # Title row height
+        FOOTER_H   = 34    # Trust score row height
+        PANEL_H    = PAD + HEADER_H + len(EMOTIONS) * ROW_H + FOOTER_H + PAD
+
+        px = w - PANEL_W - 16   # Right-align with a small margin
+        py = 16                  # Top margin
+
+        # ── Semi-transparent dark background ──────────────────────────────────
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (px, py), (px + PANEL_W, py + PANEL_H),
+                      (20, 20, 20), cv2.FILLED)
+        cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
+
+        # ── Thin border ───────────────────────────────────────────────────────
+        cv2.rectangle(frame, (px, py), (px + PANEL_W, py + PANEL_H),
+                      (80, 80, 80), 1)
+
+        # ── Header: "BLENDSHAPE EMOTIONS" ─────────────────────────────────────
+        cv2.putText(frame, "BLENDSHAPE EMOTIONS",
+                    (px + PAD, py + PAD + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
+        # Thin separator line under header
+        sep_y = py + PAD + HEADER_H - 4
+        cv2.line(frame, (px + PAD, sep_y), (px + PANEL_W - PAD, sep_y), (70, 70, 70), 1)
+
+        # ── Emotion bars ──────────────────────────────────────────────────────
+        expressions = (face_data or {}).get("expressions", {})
+        dominant    = (face_data or {}).get("dominant", "")
+
+        bar_x  = px + PAD + LABEL_W + 6   # Left edge of the bar area
+        val_x  = bar_x + BAR_MAX_W + 4    # Left edge of the value column
+
+        for i, (emotion, colour) in enumerate(EMOTIONS):
+            row_y = py + PAD + HEADER_H + i * ROW_H
+            score = float(expressions.get(emotion, 0.0))
+
+            # Label — bold-ish by drawing twice for weight
+            label_colour = colour if emotion == dominant else (160, 160, 160)
+            cv2.putText(frame, emotion,
+                        (px + PAD, row_y + 17),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, label_colour, 1, cv2.LINE_AA)
+
+            # Grey track
+            cv2.rectangle(frame,
+                          (bar_x, row_y + 6),
+                          (bar_x + BAR_MAX_W, row_y + 19),
+                          (55, 55, 55), cv2.FILLED)
+
+            # Coloured fill — width proportional to score
+            fill_w = int(BAR_MAX_W * score)
+            if fill_w > 0:
+                cv2.rectangle(frame,
+                              (bar_x, row_y + 6),
+                              (bar_x + fill_w, row_y + 19),
+                              colour, cv2.FILLED)
+
+            # Highlight bar for dominant emotion
+            if emotion == dominant:
+                cv2.rectangle(frame,
+                              (bar_x, row_y + 6),
+                              (bar_x + BAR_MAX_W, row_y + 19),
+                              colour, 1)
+
+            # Numeric value
+            cv2.putText(frame, f"{score:.2f}",
+                        (val_x, row_y + 17),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, (180, 180, 180), 1, cv2.LINE_AA)
+
+        # ── Footer: trust score ───────────────────────────────────────────────
+        foot_y = py + PAD + HEADER_H + len(EMOTIONS) * ROW_H + 6
+        cv2.line(frame, (px + PAD, foot_y), (px + PANEL_W - PAD, foot_y), (70, 70, 70), 1)
+
+        total = int((scores or {}).get("total", 0))
+        # Pick a colour that matches the trust_label bands
+        if   total >= 82: tc = ( 80, 222, 74)    # Green
+        elif total >= 64: tc = ( 57, 211, 52)     # Teal
+        elif total >= 46: tc = (250, 165, 96)     # Blue
+        elif total >= 28: tc = ( 50, 147, 251)    # Orange
+        else:             tc = (113, 129, 248)    # Red
+
+        cv2.putText(frame, f"TRUST  {total}",
+                    (px + PAD, foot_y + 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, tc, 1, cv2.LINE_AA)
+
+        # Dominant emotion label next to trust score
+        if dominant:
+            cv2.putText(frame, dominant.upper(),
+                        (px + PAD + 100, foot_y + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, (140, 140, 140), 1, cv2.LINE_AA)
+
+        return frame
+
+    # ════════════════════════════════════════════════════════════════════════
     # Camera + analysis threads
     # ════════════════════════════════════════════════════════════════════════
     @staticmethod
@@ -644,12 +772,18 @@ class TrustDashboard(QMainWindow):
                         self._last_frame = (frame, {"detected": False})
                     else:
                         self._last_frame = (frame, self._last_frame[1])
-                # Write to video file if recording is active
+                # Write to video file if recording is active.
+                # Annotate a copy so the live display stays clean.
                 with self._writer_lock:
                     w = self._writer
                 if w is not None:
                     try:
-                        w.write(frame)
+                        with self._lock:
+                            fd = self._last_frame[1] if self._last_frame else None
+                        rec_frame = self._draw_recording_overlay(
+                            frame.copy(), fd, self._last_scores
+                        )
+                        w.write(rec_frame)
                     except Exception:
                         pass
             time.sleep(0.033)
@@ -742,6 +876,7 @@ class TrustDashboard(QMainWindow):
         # Compute scores via the trust engine
         hrv_score = self.hrv.get_score()
         scores    = self.trust.update(face_data, vocal_data, hrv_score)
+        self._last_scores = scores   # Make latest scores available to the recording overlay
         pupil_now = face_data.get("pupil_norm") if face_data else None
         wl_state  = self.workload.update(pupil_now)
         self._workload_state = wl_state

@@ -95,15 +95,12 @@ BLENDSHAPE_EMOTION_WEIGHTS = {
         # AU16 (lower lip depressor) not available; mouthLowerDown is the closest proxy
         ("mouthLowerDownLeft", 0.025), ("mouthLowerDownRight", 0.025),
     ],
-    # Contempt: typically a unilateral (one-sided) expression — raised lip corner and dimple
-    # on one side only. Blendshapes don't expose asymmetry scores directly, so we use the
-    # right-side blendshapes as the primary signal (contempt is more common on the right).
-    "contempt": [
-        ("mouthDimpleRight", 0.40),  # Mirrors R14A (right dimpler — unilateral lip press)
-        ("mouthSmileRight",  0.40),  # Mirrors R12A (right lip corner puller — unilateral)
-        ("mouthDimpleLeft",  0.10),  # Small left contribution (contempt is rarely perfectly symmetric)
-        ("mouthSmileLeft",   0.10),
-    ],
+    # Contempt is computed via asymmetry in _blendshapes_to_emotions(), not from this table.
+    # The table is kept here for documentation only — it is not used in the weighted sum.
+    # Formula: max(0, mouthSmileRight − mouthSmileLeft − threshold) + mouthDimpleRight bonus.
+    # A bilateral smile gives ~equal left/right → difference ≈ 0 → contempt ≈ 0.
+    # A unilateral smirk gives high right, low left → large difference → contempt rises.
+    "contempt": [],
 }
 
 # ── Blendshape → approximate Action Unit mapping ───────────────────────────────
@@ -384,14 +381,34 @@ class FaceAnalyzer:
     def _blendshapes_to_emotions(self, bs: dict) -> dict:
         """
         Convert a blendshape name→score dictionary into a 0–1 score for each emotion.
-        Uses the BLENDSHAPE_EMOTION_WEIGHTS table defined at the top of this file.
+        Uses the BLENDSHAPE_EMOTION_WEIGHTS table for all emotions except contempt,
+        which is handled separately via asymmetry detection.
         """
         expressions = {}
+
         for emotion, components in BLENDSHAPE_EMOTION_WEIGHTS.items():
-            # Weighted sum of the relevant blendshapes, capped at 1.0.
-            score = sum(bs.get(name, 0.0) * wt for name, wt in components)
-            expressions[emotion] = min(1.0, score)
-        # Neutral is whatever portion of expression is unaccounted for by the other emotions.
+            if emotion == "contempt":
+                # Contempt cannot be detected by summing absolute blendshape values because
+                # the same blendshapes (mouthSmileRight, mouthDimpleRight) also activate
+                # during a genuine bilateral smile, causing false positives.
+                #
+                # Instead we measure LEFT-RIGHT ASYMMETRY of the lip corner:
+                #   r − l > 0.15 means the right side is meaningfully higher than the left.
+                #   A genuine smile raises both sides equally → difference ≈ 0 → contempt ≈ 0.
+                #   A unilateral smirk raises only the right → large difference → contempt rises.
+                #
+                # A 0.15 dead-zone filters out minor natural asymmetry in a normal smile.
+                r_smile  = bs.get("mouthSmileRight",  0.0)
+                l_smile  = bs.get("mouthSmileLeft",   0.0)
+                r_dimple = bs.get("mouthDimpleRight", 0.0)
+                asymmetry = max(0.0, r_smile - l_smile - 0.15)   # positive only when right >> left
+                expressions["contempt"] = min(1.0, asymmetry * 0.70 + r_dimple * 0.30)
+            else:
+                # All other emotions: weighted sum of their blendshapes, capped at 1.0.
+                score = sum(bs.get(name, 0.0) * wt for name, wt in components)
+                expressions[emotion] = min(1.0, score)
+
+        # Neutral is whatever is left after all other emotions are accounted for.
         expressions["neutral"] = max(0.0, 1.0 - sum(expressions.values()))
         return expressions
 
