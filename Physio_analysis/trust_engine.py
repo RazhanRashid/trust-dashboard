@@ -72,14 +72,19 @@ class TrustEngine:
         # Positive weight = that emotion raises trust. Negative = it lowers trust.
         # For example: a fully happy face (intensity 1.0) adds 30 points.
         # A fully fearful face subtracts 30 points.
+        # Emotion definitions follow the Ekman AU classification table.
         for key, weight, label in [
-            ("happy",     30,  "happy"),       # Smiling / cheery expression raises trust
+            ("happy",     30,  "happy"),       # AU6+12: genuine smiling raises trust
             ("neutral",   10,  "neutral"),     # Calm neutral face is a mild positive signal
-            ("surprised",  4,  "surprised"),   # Mild surprise is roughly neutral (small positive)
-            ("fearful",  -30,  "fearful"),     # Visible fear strongly lowers trust
-            ("angry",    -35,  "angry"),       # Anger is the strongest trust reducer
-            ("disgusted",-30,  "disgusted"),   # Disgust strongly lowers trust
-            ("sad",      -18,  "sad"),         # Sadness moderately lowers trust
+            ("surprised",  4,  "surprised"),   # AU1+2+5+26: surprise is roughly neutral (small positive)
+            ("fearful",  -30,  "fearful"),     # AU1+2+4+5+7+20+26: visible fear strongly lowers trust
+            ("angry",    -35,  "angry"),       # AU4+5+7+23: anger is a strong trust reducer
+            ("disgusted",-30,  "disgusted"),   # AU9+15+16: disgust strongly lowers trust
+            ("sad",      -18,  "sad"),         # AU1+4+15: sadness moderately lowers trust
+            # Contempt is the single most trust-destructive expression — it signals
+            # active disrespect or disdain toward the other person. Weighted higher
+            # than anger because it is more targeted and less likely to be transient.
+            ("contempt", -40,  "contempt"),    # R12A+R14A: unilateral sneer, strongest negative signal
         ]:
             cur = e.get(key, 0)                       # This frame's emotion intensity (0.0–1.0)
             prv = prev.get(f"face_{key}", cur)        # Previous frame's intensity (defaults to current on the very first frame)

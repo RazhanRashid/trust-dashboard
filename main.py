@@ -125,6 +125,13 @@ class TrustDashboard(QMainWindow):
         self._best_thumb_frame = None
         self._best_thumb_conf: float = -1.0
 
+        # ── Post-hoc OpenFace analysis ───────────────────────────────────────
+        # After a session ends, OpenFace is run on the .mp4 recording in a
+        # background thread. Results are stored here and written into the Excel.
+        self._postprocess_rows: list | None = None   # Per-frame AU dicts from OpenFace; None = not yet done
+        self._postprocess_thread: threading.Thread | None = None
+        self._auto_excel_path: Path | None = None    # Auto-saved Excel path for the current session
+
         # ── Persistence ─────────────────────────────────────────────────────
         self._sessions_file = self._session_dir / "sessions.json"
 
@@ -360,6 +367,24 @@ class TrustDashboard(QMainWindow):
         stats["thumbnail_path"] = _rel(thumb_path)
         stats["session_id"]     = self._session_id
         self._save_session(stats)
+
+        # Auto-save a base Excel to the session directory immediately.
+        # This file is updated automatically with accurate AU data once
+        # post-hoc OpenFace analysis completes.
+        self._postprocess_rows = None   # Clear any result from a previous session
+        auto_excel = self._session_dir / f"trust-session-{self._session_id}.xlsx"
+        try:
+            self._build_excel(str(auto_excel))
+            self._auto_excel_path = auto_excel
+            print(f"[export] Auto-saved base Excel → {auto_excel}", flush=True)
+        except Exception as e:
+            print(f"[export] Auto-save failed: {e}", flush=True)
+            self._auto_excel_path = None
+
+        # Launch OpenFace post-hoc analysis in a background thread if a recording exists.
+        if rec_path and rec_path.exists():
+            self._launch_postprocess(rec_path)
+
         # Give the summary absolute paths so it can open/display files directly
         summary_stats = dict(stats)
         summary_stats["recording_path"] = str(rec_path) if rec_path else None
@@ -371,6 +396,49 @@ class TrustDashboard(QMainWindow):
         self._session_rows = []
         self._history = {k: [] for k in ("total", "facial", "vocal", "gaze", "hrv")}
         self._show_overview()
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Post-hoc OpenFace analysis
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _launch_postprocess(self, video_path: Path):
+        """
+        Start OpenFace post-hoc analysis on the session recording in a daemon
+        background thread. The main UI thread is never blocked.
+
+        When analysis completes, _on_postprocess_done() is called which:
+          1. Stores the per-frame AU rows in self._postprocess_rows
+          2. Re-saves the auto Excel with the accurate AU sheet included
+        """
+        # If a previous post-hoc thread is still running, leave it — it will finish
+        # harmlessly in the background. self._postprocess_rows will be overwritten
+        # only when this new session's thread completes.
+        def _worker(path: Path):
+            rows = FaceAnalyzer.analyze_video(str(path))
+            self._on_postprocess_done(rows)
+
+        self._postprocess_thread = threading.Thread(
+            target=_worker, args=(video_path,), daemon=True
+        )
+        self._postprocess_thread.start()
+        print("[post-hoc] Background OpenFace thread started.", flush=True)
+
+    def _on_postprocess_done(self, au_rows: list):
+        """
+        Called from the background thread when OpenFace finishes.
+        Stores the AU rows and rewrites the auto-saved Excel with the accurate AU sheet.
+        This runs on the background thread so no Qt UI calls are made here.
+        """
+        self._postprocess_rows = au_rows if au_rows else []
+        print(f"[post-hoc] Analysis complete — {len(self._postprocess_rows)} frames.", flush=True)
+
+        # Re-save the Excel now that accurate AU data is available.
+        if self._auto_excel_path:
+            try:
+                self._build_excel(str(self._auto_excel_path))
+                print(f"[post-hoc] Excel updated with AU data → {self._auto_excel_path}", flush=True)
+            except Exception as e:
+                print(f"[post-hoc] Excel update failed: {e}", flush=True)
 
     # ════════════════════════════════════════════════════════════════════════
     # Recording helpers
@@ -1149,6 +1217,22 @@ class TrustDashboard(QMainWindow):
         AU_ORDER = ["AU01","AU02","AU04","AU05","AU06","AU07","AU09","AU10",
                     "AU12","AU14","AU15","AU17","AU20","AU23","AU25","AU26","AU45"]
 
+        # Decide AU data source.
+        # Post-hoc OpenFace rows (accurate) are preferred over the blendshape-derived
+        # approximate AUs stored in session_rows during the live session.
+        postproc = self._postprocess_rows   # None = still running; [] = ran but no face; list = success
+        au_source_label = "OpenFace post-hoc (accurate)" if postproc else "MediaPipe blendshapes (approximate)"
+
+        # Build a timestamp_s → postproc_row lookup for fast nearest-frame matching.
+        # Each session row records at 1 fps (elapsed_s = 0, 1, 2 …).
+        # Each postproc row records at video frame rate (~30 fps, timestamp_s = 0.00, 0.033 …).
+        # For each 1-fps session row we find the closest postproc frame by timestamp.
+        def _nearest_postproc_aus(elapsed_s: float) -> dict:
+            if not postproc:
+                return {}
+            best = min(postproc, key=lambda r: abs(r["timestamp_s"] - elapsed_s))
+            return best["aus"] if best.get("success") else {}
+
         ws7 = wb.create_sheet("Action Units")
         # ── header ─────────────────────────────────────────────────────────
         fixed_cols = [("Timestamp", "timestamp"), ("Elapsed (s)", "elapsed_s"),
@@ -1168,7 +1252,13 @@ class TrustDashboard(QMainWindow):
         # ── data rows ──────────────────────────────────────────────────────
         for r_idx, row in enumerate(rows, 2):
             fill = ALT_FILL if r_idx % 2 == 0 else None
-            aus  = row.get("aus", {})
+
+            # Use accurate post-hoc AUs if available, otherwise blendshape approximations.
+            if postproc is not None:
+                aus = _nearest_postproc_aus(row.get("elapsed_s", 0))
+            else:
+                aus = row.get("aus", {})
+
             vals = (
                 [row.get("timestamp", ""), row.get("elapsed_s", ""),
                  _yn(row.get("face_det", False)), row.get("expression", "—")] +
@@ -1181,6 +1271,29 @@ class TrustDashboard(QMainWindow):
                 if fill:
                     cell.fill = fill
 
+        # ── AU Detail sheet (full per-frame post-hoc data) ──────────────────
+        # Only added when post-hoc analysis has completed successfully.
+        if postproc:
+            ws_detail = wb.create_sheet("AU Detail (post-hoc)")
+            detail_headers = (["Frame", "Time (s)", "Face Found"] +
+                              [f"{au} – {AU_META[au][0]}" for au in AU_ORDER if au in AU_META])
+            for c, h in enumerate(detail_headers, 1):
+                cell = ws_detail.cell(row=1, column=c, value=h)
+                cell.font = HDR_FONT; cell.fill = HDR_FILL
+                cell.alignment = CENTER; cell.border = BORDER
+            ws_detail.freeze_panes = "A2"
+            ws_detail.row_dimensions[1].height = 28
+            for r_idx, prow in enumerate(postproc, 2):
+                fill = ALT_FILL if r_idx % 2 == 0 else None
+                aus_p = prow.get("aus", {})
+                vals = ([prow.get("frame_idx", ""), round(prow.get("timestamp_s", 0), 3),
+                         _yn(bool(prow.get("success")))] +
+                        [round(aus_p.get(au, 0), 4) for au in AU_ORDER])
+                for c, v in enumerate(vals, 1):
+                    cell = ws_detail.cell(row=r_idx, column=c, value=v)
+                    cell.font = BODY_FONT; cell.alignment = CENTER
+                    if fill: cell.fill = fill
+
         # ── legend ─────────────────────────────────────────────────────────
         leg_start = len(rows) + 3
         title_cell = ws7.cell(row=leg_start, column=1, value="LEGEND")
@@ -1191,9 +1304,11 @@ class TrustDashboard(QMainWindow):
                         end_row=leg_start, end_column=4)
 
         ws7.cell(row=leg_start, column=1).value = (
-            "LEGEND  —  All AU values are OpenFace regression intensities "
-            "normalised to 0–1 (0 = absent, 1 = maximum intensity). "
-            "Original OpenFace scale is 0–5; divide by 5 to recover it."
+            f"LEGEND  —  AU source: {au_source_label}.  "
+            "All AU values are normalised to 0–1 (0 = absent, 1 = maximum intensity).  "
+            "Post-hoc values come from OpenFace regression intensities (AU_r ÷ 5); "
+            "blendshape-derived values are approximate anatomical equivalents from MediaPipe.  "
+            "See 'AU Detail (post-hoc)' sheet for full per-frame OpenFace output when available."
         )
 
         for i, au in enumerate(AU_ORDER, leg_start + 1):
