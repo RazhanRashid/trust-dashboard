@@ -11,6 +11,7 @@ Run:
 """
 
 import os
+import subprocess
 import sys
 import openpyxl
 import json
@@ -445,6 +446,24 @@ class TrustDashboard(QMainWindow):
         # only when this new session's thread completes.
         def _worker(path: Path):
             rows = FaceAnalyzer.analyze_video(str(path))
+            # Transcode to H.264 for QuickTime after OpenFace has finished reading.
+            tmp = path.with_suffix(".h264_tmp.mp4")
+            try:
+                r = subprocess.run(
+                    ["ffmpeg", "-y", "-i", str(path),
+                     "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                     "-movflags", "+faststart", "-an", str(tmp)],
+                    capture_output=True, timeout=600,
+                )
+                if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+                    tmp.replace(path)
+                    print("[rec] Transcoded to H.264 for QuickTime compatibility.", flush=True)
+                else:
+                    tmp.unlink(missing_ok=True)
+                    print("[rec] H.264 transcode failed — keeping original.", flush=True)
+            except Exception as e:
+                tmp.unlink(missing_ok=True)
+                print(f"[rec] H.264 transcode error: {e}", flush=True)
             self._on_postprocess_done(rows)
 
         self._postprocess_thread = threading.Thread(
@@ -504,8 +523,11 @@ class TrustDashboard(QMainWindow):
         h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         if w < 1 or h < 1:
             w, h = 1280, 720
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(path), fourcc, 25.0, (w, h))
+        fps = self._cap.get(cv2.CAP_PROP_FPS)
+        if fps < 10 or fps > 120:
+            fps = 30.0
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")   # reliable write; transcoded to H.264 post-session
+        writer = cv2.VideoWriter(str(path), fourcc, fps, (w, h))
         if writer.isOpened():
             with self._writer_lock:
                 self._writer = writer
@@ -612,48 +634,33 @@ class TrustDashboard(QMainWindow):
             if a < len(pts) and b < len(pts):
                 cv2.line(frame, pts[a], pts[b], colour, thickness, cv2.LINE_AA)
 
+    def _draw_face_mesh(self, frame: np.ndarray, face_data: dict | None) -> None:
+        """Draw the face mesh landmarks and feature outlines onto *frame* in-place."""
+        lms_norm = (face_data or {}).get("landmarks_norm")
+        if not lms_norm:
+            return
+        h, w = frame.shape[:2]
+        pts = [(int(x * w), int(y * h)) for x, y in lms_norm]
+
+        dot_overlay = frame.copy()
+        for px_, py_ in pts[:468]:
+            cv2.circle(dot_overlay, (px_, py_), 1, (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.addWeighted(dot_overlay, 0.45, frame, 0.55, 0, frame)
+
+        self._draw_connections(frame, pts, self._FACE_OVAL,   (255, 255,   0), thickness=1)
+        self._draw_connections(frame, pts, self._LIPS_OUTER,  ( 60, 100, 255), thickness=1)
+        self._draw_connections(frame, pts, self._MESH_L_EYE,  (255,  80,   0), thickness=2)
+        self._draw_connections(frame, pts, self._MESH_R_EYE,  (255,   0, 230), thickness=2)
+        self._draw_connections(frame, pts, self._MESH_L_IRIS, (255,  80,   0), thickness=2)
+        self._draw_connections(frame, pts, self._MESH_R_IRIS, (255,   0, 230), thickness=2)
+
     def _draw_recording_overlay(self, frame: np.ndarray, face_data: dict | None,
                                  scores: dict | None) -> np.ndarray:
-        """
-        Draw the MediaPipe face mesh and a blendshape emotion panel onto a copy
-        of the recording frame.  Called once per camera frame (~30 fps) before
-        writing to the video file.  The live display is unaffected.
-        """
+        """Draw the face mesh and blendshape emotion panel onto a recording frame."""
         h, w = frame.shape[:2]
 
         # ── Face mesh ─────────────────────────────────────────────────────────
-        lms_norm = (face_data or {}).get("landmarks_norm")
-        if lms_norm:
-            # Convert normalised (0–1) landmark coordinates to pixel coords once.
-            pts = [(int(x * w), int(y * h)) for x, y in lms_norm]
-
-            # Tessellation — draw a faint dot at each of the 468 face landmarks
-            # (full edge tessellation requires 462 hardcoded pairs; dots give the
-            # same wireframe feel at a fraction of the drawing cost).
-            dot_overlay = frame.copy()
-            for px_, py_ in pts[:468]:
-                cv2.circle(dot_overlay, (px_, py_), 1, (255, 255, 255), -1, cv2.LINE_AA)
-            cv2.addWeighted(dot_overlay, 0.45, frame, 0.55, 0, frame)
-
-            # Face oval contour — bright cyan
-            self._draw_connections(frame, pts, self._FACE_OVAL,
-                                   (255, 255, 0), thickness=1)
-
-            # Lip outline — bright coral/red
-            self._draw_connections(frame, pts, self._LIPS_OUTER,
-                                   (60, 100, 255), thickness=1)
-
-            # Eye outlines — bright blue (left) / bright magenta (right)
-            self._draw_connections(frame, pts, self._MESH_L_EYE,
-                                   (255, 80, 0), thickness=2)
-            self._draw_connections(frame, pts, self._MESH_R_EYE,
-                                   (255, 0, 230), thickness=2)
-
-            # Iris circles — same colours as the eye outlines
-            self._draw_connections(frame, pts, self._MESH_L_IRIS,
-                                   (255, 80, 0), thickness=2)
-            self._draw_connections(frame, pts, self._MESH_R_IRIS,
-                                   (255, 0, 230), thickness=2)
+        self._draw_face_mesh(frame, face_data)
 
         # ── Emotion definitions: label, BGR colour ────────────────────────────
         EMOTIONS = [
@@ -982,19 +989,20 @@ class TrustDashboard(QMainWindow):
                     else:
                         self._last_frame = (frame, self._last_frame[1])
                 # Write to video file if recording is active.
-                # Annotate a copy so the live display stays clean.
+                # Annotate before acquiring the writer lock (drawing is slow);
+                # then check + write under the lock so release() can never
+                # interleave with a write and corrupt the moov atom.
+                with self._lock:
+                    fd = self._last_frame[1] if self._last_frame else None
+                rec_frame = self._draw_recording_overlay(
+                    frame.copy(), fd, self._last_scores
+                )
                 with self._writer_lock:
-                    w = self._writer
-                if w is not None:
-                    try:
-                        with self._lock:
-                            fd = self._last_frame[1] if self._last_frame else None
-                        rec_frame = self._draw_recording_overlay(
-                            frame.copy(), fd, self._last_scores
-                        )
-                        w.write(rec_frame)
-                    except Exception:
-                        pass
+                    if self._writer is not None:
+                        try:
+                            self._writer.write(rec_frame)
+                        except Exception:
+                            pass
             time.sleep(0.033)
 
     def _analysis_loop(self):
@@ -1067,7 +1075,9 @@ class TrustDashboard(QMainWindow):
         if self._cal is not None and self._stack.currentWidget() is self._cal:
             # Push preview frame + indicators
             if frame_bgr is not None:
-                self._cal.update_preview(frame_bgr, face_data)
+                cal_frame = frame_bgr.copy()
+                self._draw_face_mesh(cal_frame, face_data)
+                self._cal.update_preview(cal_frame, face_data)
             self._cal.update_indicators(
                 face_detected=bool(face_data and face_data.get("detected")),
                 voice_samples=len(self._calibration_vocal["pitch_stability"]),

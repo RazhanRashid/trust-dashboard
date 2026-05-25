@@ -448,19 +448,38 @@ class FaceAnalyzer:
             print("[post-hoc] OpenFace binary not found — skipping AU analysis.")
             return []
 
-        out_dir = tempfile.mkdtemp(prefix="of_video_")
+        out_dir  = tempfile.mkdtemp(prefix="of_out_")
+        frm_dir  = tempfile.mkdtemp(prefix="of_frm_")
         try:
+            # OpenFace's bundled OpenCV often lacks video-decoding support.
+            # Extract frames as JPEG images with system ffmpeg, then pass the
+            # image directory to OpenFace via -fdir (image reading always works).
+            print(f"[post-hoc] Extracting frames from {video_path} …", flush=True)
+            extract = subprocess.run(
+                ["ffmpeg", "-y", "-i", video_path,
+                 "-q:v", "2",                       # high-quality JPEG
+                 os.path.join(frm_dir, "frame_%06d.jpg")],
+                capture_output=True, timeout=600,
+            )
+            n_frames = len([f for f in os.listdir(frm_dir) if f.endswith(".jpg")])
+            if extract.returncode != 0 or n_frames == 0:
+                err = extract.stderr.decode(errors="replace").strip()
+                print(f"[post-hoc] ffmpeg frame extraction failed: {err[-300:]}", flush=True)
+                return []
+            print(f"[post-hoc] Extracted {n_frames} frames — running OpenFace …", flush=True)
+
             cmd = [
                 OPENFACE_BIN,
-                "-f",       video_path,   # Process the full video in one pass
+                "-fdir",    frm_dir,    # image directory — bypasses video decoding
                 "-out_dir", out_dir,
-                "-q",                     # Suppress progress output
-                "-aus",                   # Output AU intensities and presence flags
+                "-q",
+                "-aus",
             ]
-            print(f"[post-hoc] Running OpenFace on {video_path} …", flush=True)
             try:
-                # Allow up to 30 minutes for a long session recording.
-                subprocess.run(cmd, capture_output=True, timeout=1800)
+                result = subprocess.run(cmd, capture_output=True, timeout=1800)
+                if result.returncode != 0:
+                    err = result.stderr.decode(errors="replace").strip()
+                    print(f"[post-hoc] OpenFace stderr: {err[-400:]}", flush=True)
             except subprocess.TimeoutExpired:
                 print("[post-hoc] OpenFace timed out.", flush=True)
                 return []
@@ -530,7 +549,8 @@ class FaceAnalyzer:
             print(f"[post-hoc] Error during OpenFace video analysis: {e}", flush=True)
             return []
         finally:
-            shutil.rmtree(out_dir, ignore_errors=True)   # Always clean up the temp directory
+            shutil.rmtree(out_dir,  ignore_errors=True)
+            shutil.rmtree(frm_dir,  ignore_errors=True)
 
     # ── OpenFace utilities (used by analyze_video) ─────────────────────────────
 
