@@ -364,13 +364,35 @@ class ScorePanel(QFrame):
         self._attribution = AttributionStrip()
         body_l.addWidget(self._attribution)
 
+        # Column header row for the channel bars
+        hdr = QHBoxLayout()
+        hdr.setContentsMargins(0, 0, 0, 0)
+        hdr.setSpacing(12)
+        hdr_spacer = QLabel()
+        hdr_spacer.setFixedWidth(58)
+        hdr_score = QLabel("SCORE")
+        hdr_score.setFixedWidth(32)
+        hdr_score.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        hdr_score.setFont(ui_font(7, QFont.Weight.DemiBold))
+        hdr_score.setStyleSheet(f"color: {TEXT_GHOST}; letter-spacing: 1px;")
+        hdr_wt = QLabel("WT")
+        hdr_wt.setFixedWidth(36)
+        hdr_wt.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        hdr_wt.setFont(ui_font(7, QFont.Weight.DemiBold))
+        hdr_wt.setStyleSheet(f"color: {TEXT_GHOST}; letter-spacing: 1px;")
+        hdr.addWidget(hdr_spacer)
+        hdr.addStretch(1)
+        hdr.addWidget(hdr_score)
+        hdr.addWidget(hdr_wt)
+        body_l.addLayout(hdr)
+
         # Channel bars
         bars = QVBoxLayout()
         bars.setSpacing(10)
-        self.bar_facial = ChannelBar("Facial", C_FACIAL, 35)
+        self.bar_facial = ChannelBar("Facial", C_FACIAL, 25)
         self.bar_vocal  = ChannelBar("Vocal",  C_VOCAL,  25)
         self.bar_gaze   = ChannelBar("Gaze",   C_GAZE,   25)
-        self.bar_hrv    = ChannelBar("HRV",    C_HRV,    15, is_stub=True)
+        self.bar_hrv    = ChannelBar("HRV",    C_HRV,    25, is_stub=True)
         for b in (self.bar_facial, self.bar_vocal, self.bar_gaze, self.bar_hrv):
             bars.addWidget(b)
         body_l.addLayout(bars)
@@ -503,19 +525,24 @@ class VoicePanel(QFrame):
         self._spec.hide()
         body_l.addWidget(self._spec)
 
-        # Metric grid (2×2)
+        # Metric grid expanded from 2×2 to 3×2 to surface the two most interpretable
+        # eGeMAPS voice-quality features alongside the original four.
         grid = QGridLayout()
         grid.setSpacing(8)
         self._metrics = {
-            "pitch":  MetricBox("Pitch Stability"),
-            "energy": MetricBox("Voice Energy"),
-            "tremor": MetricBox("Tremor Index"),
-            "hz":     MetricBox("Dominant Hz"),
+            "pitch":  MetricBox("Pitch Stability"),   # Inverse CV of F0 history; 100 % = rock-steady pitch
+            "energy": MetricBox("Voice Energy"),       # Perceptual loudness normalised to conversational volume
+            "tremor": MetricBox("Tremor Index"),       # jitter + shimmer + inverted HNR composite; 0 % = steady
+            "hz":     MetricBox("Dominant Hz"),        # Median F0 in Hz for the current chunk; 0 when silent
+            "hnr":    MetricBox("HNR"),                # Harmonics-to-Noise Ratio in dB; > 20 dB is a clean voice
+            "jitter": MetricBox("Jitter"),             # Cycle-to-cycle F0 perturbation %; < 1 % is normal speech
         }
         grid.addWidget(self._metrics["pitch"],  0, 0)
         grid.addWidget(self._metrics["energy"], 0, 1)
         grid.addWidget(self._metrics["tremor"], 1, 0)
         grid.addWidget(self._metrics["hz"],     1, 1)
+        grid.addWidget(self._metrics["hnr"],    2, 0)   # Row 2 added: eGeMAPS HNR
+        grid.addWidget(self._metrics["jitter"], 2, 1)   # Row 2 added: eGeMAPS local jitter
         body_l.addLayout(grid)
 
         body_l.addStretch()
@@ -538,26 +565,43 @@ class VoicePanel(QFrame):
                 self._metrics[k].setValue("—")
                 self._metrics[k].clearDelta()
             return
-        ps = vd.get("pitch_stability", 0)
-        tr = vd.get("tremor_index", 0)
+        ps  = vd.get("pitch_stability", 0)
+        tr  = vd.get("tremor_index", 0)
+        hnr = vd.get("hnr_db", 0.0)
+        jit = vd.get("jitter", 0.0)
+
         self._metrics["pitch"].setValue(f"{ps * 100:.0f}%")
         self._metrics["energy"].setValue(f"{vd.get('energy_level', 0) * 100:.0f}%")
         self._metrics["tremor"].setValue(f"{tr * 100:.0f}%")
         hz = vd.get("dominant_hz", 0) or 0
         self._metrics["hz"].setValue(f"{hz:.0f} Hz" if hz > 0 else "—")
+        # Show "—" when the value is 0.0, which is the sentinel for "opensmile not available"
+        # so the box reads as missing data rather than an implausible exact zero.
+        self._metrics["hnr"].setValue(f"{hnr:.1f} dB" if hnr != 0.0 else "—")
+        self._metrics["jitter"].setValue(f"{jit * 100:.2f}%" if jit != 0.0 else "—")
 
         if baseline:
             b_ps = baseline.get("voice_pitch_stability")
             if b_ps is not None:
                 d = (ps - b_ps) * 100
-                # higher pitch stability is better
                 self._metrics["pitch"].setDelta(f"{'▲' if d > 0 else '▼'} {abs(d):.0f}%",
                                                  "good" if d > 0 else "bad")
             b_tr = baseline.get("voice_tremor_index")
             if b_tr is not None:
                 d = (tr - b_tr) * 100
-                # higher tremor is worse
                 self._metrics["tremor"].setDelta(f"{'▲' if d > 0 else '▼'} {abs(d):.0f}%",
+                                                  "bad" if d > 0 else "good")
+            # HNR delta: higher is better — a rising HNR means the voice became cleaner/less stressed
+            b_hnr = baseline.get("voice_hnr_db")
+            if b_hnr is not None and hnr != 0.0:
+                d = hnr - b_hnr                             # Positive = voice got cleaner than at calibration
+                self._metrics["hnr"].setDelta(f"{'▲' if d > 0 else '▼'} {abs(d):.1f} dB",
+                                               "good" if d > 0 else "bad")
+            # Jitter delta: lower is better — a falling jitter means less vocal perturbation
+            b_jit = baseline.get("voice_jitter")
+            if b_jit is not None and jit != 0.0:
+                d = (jit - b_jit) * 100                     # Positive = more perturbation than at calibration
+                self._metrics["jitter"].setDelta(f"{'▲' if d > 0 else '▼'} {abs(d):.2f}%",
                                                   "bad" if d > 0 else "good")
 
 
@@ -609,12 +653,19 @@ class HistoryChart(QFrame):
         self._plot.setBackground(PANEL)
         self._plot.setYRange(0, 100, padding=0)
         self._plot.showGrid(x=False, y=True, alpha=0.18)
-        # Hide every axis frame that pyqtgraph renders by default
-        for ax in ("bottom", "top", "right"):
+        # Hide axes that shouldn't show; style the ones that do
+        for ax in ("top", "right"):
             self._plot.getAxis(ax).hide()
         self._plot.getAxis("left").setPen(pg.mkPen(LINE_SOFT))
         self._plot.getAxis("left").setTextPen(pg.mkPen(TEXT_GHOST))
         self._plot.getAxis("left").setStyle(tickLength=-4, showValues=True)
+        self._plot.getAxis("left").setLabel("Score", color=TEXT_GHOST,
+                                            **{"font-size": "9px"})
+        self._plot.getAxis("bottom").setPen(pg.mkPen(LINE_SOFT))
+        self._plot.getAxis("bottom").setTextPen(pg.mkPen(TEXT_GHOST))
+        self._plot.getAxis("bottom").setStyle(tickLength=-4, showValues=True)
+        self._plot.getAxis("bottom").setLabel("Time (s)", color=TEXT_GHOST,
+                                              **{"font-size": "9px"})
         # Remove the rectangle pyqtgraph draws around the ViewBox
         self._plot.getPlotItem().getViewBox().setBorder(None)
         self._plot.setMouseEnabled(x=False, y=False)
@@ -643,17 +694,19 @@ class HistoryChart(QFrame):
         c = QColor(hex_color)
         return (c.red(), c.green(), c.blue(), alpha)
 
+    _TICK_S = 0.06  # timer fires every 60 ms
+
     def update_traces(self, history: dict):
         """history = {'total': [...], 'facial': [...], 'vocal': [...], 'gaze': [...]}"""
         if not history.get("total"):
             return
         n = len(history["total"])
-        xs = list(range(n))
+        xs = [i * self._TICK_S for i in range(n)]
         self._curve_total.setData(xs, history.get("total", []))
         self._curve_facial.setData(xs, history.get("facial", []))
         self._curve_vocal.setData(xs, history.get("vocal", []))
         self._curve_gaze.setData(xs, history.get("gaze", []))
-        self._plot.setXRange(0, max(60, n - 1), padding=0)
+        self._plot.setXRange(0, max(60 * self._TICK_S, (n - 1) * self._TICK_S), padding=0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

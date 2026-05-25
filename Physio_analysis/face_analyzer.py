@@ -63,22 +63,28 @@ BLENDSHAPE_EMOTION_WEIGHTS = {
         ("cheekSquintLeft",  0.25), ("cheekSquintRight", 0.25),  # Mirrors AU06 (cheek raiser)
     ],
     "sad": [
-        ("browInnerUp",      0.35),                              # Mirrors AU01 (inner brow raise)
+        ("browInnerUp",      0.30),                              # Mirrors AU01 (inner brow raise)
         ("browDownLeft",     0.15), ("browDownRight",    0.15),  # Mirrors AU04 (brow lowerer)
-        ("mouthFrownLeft",   0.175), ("mouthFrownRight", 0.175), # Mirrors AU15 (lip corner depressor)
+        ("mouthFrownLeft",   0.15), ("mouthFrownRight",  0.15),  # Mirrors AU15 (lip corner depressor)
+        ("mouthRollLower",   0.075),                             # Lower lip quiver — pre-cry indicator
+        ("mouthShrugLower",  0.025),                             # Chin area retraction in sadness
     ],
     "angry": [
-        ("browDownLeft",     0.25), ("browDownRight",    0.25),  # Mirrors AU04 (brow lowerer)
+        ("browDownLeft",     0.22), ("browDownRight",    0.22),  # Mirrors AU04 (brow lowerer)
         ("eyeWideLeft",      0.10), ("eyeWideRight",     0.10),  # Mirrors AU05 (upper lid raiser)
         ("eyeSquintLeft",    0.10), ("eyeSquintRight",   0.10),  # Mirrors AU07 (lid tightener)
-        # AU23 (lip tightener) has no direct blendshape — mouthPressLeft/Right is the closest
-        ("mouthPressLeft",   0.05), ("mouthPressRight",  0.05),
+        # AU23 (lip tightener) — mouthPressLeft/Right is the closest blendshape
+        ("mouthPressLeft",   0.04), ("mouthPressRight",  0.04),
+        # Upper lip rolled inward = controlled tension / suppressed anger
+        ("mouthRollUpper",   0.08),
     ],
     "surprised": [
-        ("browOuterUpLeft",  0.125), ("browOuterUpRight", 0.125), # Mirrors AU02 (outer brow raise)
-        ("browInnerUp",      0.25),                               # Mirrors AU01 (inner brow raise)
-        ("eyeWideLeft",      0.125), ("eyeWideRight",    0.125),  # Mirrors AU05B (upper lid raiser)
-        ("jawOpen",          0.25),                               # Mirrors AU26 (jaw drop)
+        ("browOuterUpLeft",  0.10), ("browOuterUpRight",  0.10),  # Mirrors AU02 (outer brow raise)
+        ("browInnerUp",      0.20),                               # Mirrors AU01 (inner brow raise)
+        ("eyeWideLeft",      0.10), ("eyeWideRight",      0.10),  # Mirrors AU05B (upper lid raiser)
+        ("jawOpen",          0.225),                              # Mirrors AU26 (jaw drop)
+        ("mouthFunnel",      0.125),                              # Rounded "O" mouth shape in surprise
+        ("mouthPucker",      0.05),                               # Slight lip pursing on strong surprise
     ],
     "fearful": [
         ("browInnerUp",      0.12),                              # Mirrors AU01
@@ -90,10 +96,11 @@ BLENDSHAPE_EMOTION_WEIGHTS = {
         ("jawOpen",          0.16),                              # Mirrors AU26
     ],
     "disgusted": [
-        ("noseSneerLeft",    0.30), ("noseSneerRight",   0.30),  # Mirrors AU09 (nose wrinkler)
-        ("mouthFrownLeft",   0.175), ("mouthFrownRight", 0.175), # Mirrors AU15 (lip corner depressor)
-        # AU16 (lower lip depressor) not available; mouthLowerDown is the closest proxy
-        ("mouthLowerDownLeft", 0.025), ("mouthLowerDownRight", 0.025),
+        ("noseSneerLeft",     0.25), ("noseSneerRight",    0.25),  # Mirrors AU09 (nose wrinkler)
+        ("mouthFrownLeft",    0.15), ("mouthFrownRight",   0.15),  # Mirrors AU15 (lip corner depressor)
+        # AU10 (upper lip raiser) — curl of the upper lip co-occurs with disgust
+        ("mouthShrugUpper",   0.10),                               # Upper lip raised / curled
+        ("mouthUpperUpLeft",  0.05), ("mouthUpperUpRight", 0.05),  # Bilateral upper lip raise
     ],
     # Contempt is computed via asymmetry in _blendshapes_to_emotions(), not from this table.
     # The table is kept here for documentation only — it is not used in the weighted sum.
@@ -120,7 +127,7 @@ BLENDSHAPE_AU_MAP = {
     "AU14": [("mouthDimpleLeft",  0.50), ("mouthDimpleRight",  0.50)],  # Dimpler
     "AU15": [("mouthFrownLeft",   0.50), ("mouthFrownRight",   0.50)],  # Lip corner depressor
     "AU20": [("mouthStretchLeft", 0.50), ("mouthStretchRight", 0.50)],  # Lip stretcher
-    "AU25": [("mouthClose",       1.00)],                               # Lips part (inverted)
+    # AU25 (Lips Part) omitted — mouthClose is inverted and no direct blendshape exists
     "AU26": [("jawOpen",          1.00)],                               # Jaw drop
     "AU45": [("eyeBlinkLeft",     0.50), ("eyeBlinkRight",     0.50)],  # Blink / eye closure
 }
@@ -365,10 +372,13 @@ class FaceAnalyzer:
                 # Full 478-point landmark list (normalised 0–1) used to draw the
                 # face mesh overlay on recorded video frames.
                 "landmarks_norm": [[lm.x, lm.y] for lm in lms],
+                # All 52 raw blendshape scores (name → 0–1 float).
+                # Available for downstream use: Excel export, AU timeline, debugging.
+                "blendshapes":    bs_dict,
                 # Emotions from blendshapes (updates every frame at ~30 fps)
                 "expressions":    expressions,
                 "au_emotions":    expressions,   # Alias kept for trust_engine compatibility
-                "aus":            aus_approx,    # Approximate AUs; replaced by accurate values in post-hoc Excel
+                "aus":            aus_approx,    # All mapped AUs (30 codes); replaced by accurate values in post-hoc Excel
                 "duchenne":       duchenne,
                 "dominant":       dominant,
             }
@@ -466,7 +476,25 @@ class FaceAnalyzer:
                 err = extract.stderr.decode(errors="replace").strip()
                 print(f"[post-hoc] ffmpeg frame extraction failed: {err[-300:]}", flush=True)
                 return []
-            print(f"[post-hoc] Extracted {n_frames} frames — running OpenFace …", flush=True)
+
+            # OpenFace sets timestamp=0 for every row in -fdir mode because it
+            # doesn't know the frame rate.  Get fps from the source file so we
+            # can reconstruct timestamps as (frame_idx - 1) / fps.
+            video_fps = 30.0
+            try:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                     "-show_entries", "stream=r_frame_rate",
+                     "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if probe.returncode == 0 and probe.stdout.strip():
+                    num, den = probe.stdout.strip().split("/")
+                    video_fps = float(num) / float(den)
+            except Exception:
+                pass
+
+            print(f"[post-hoc] Extracted {n_frames} frames at {video_fps:.2f} fps — running OpenFace …", flush=True)
 
             cmd = [
                 OPENFACE_BIN,
@@ -534,7 +562,7 @@ class FaceAnalyzer:
 
                     rows.append({
                         "frame_idx":   int(f("frame")),
-                        "timestamp_s": round(f("timestamp"), 3),   # Seconds from video start
+                        "timestamp_s": round((int(f("frame")) - 1) / video_fps, 3),
                         "success":     success,
                         "aus":         aus_r,                       # Intensity 0–1 per AU
                         "aus_c":       aus_c,                       # Presence flag per AU

@@ -32,10 +32,8 @@ class TrustEngine:
         gaze,   gaze_contribs   = self._gaze_score(face_data)     # Score from eye movement and blinking
         hrv    = float(hrv_score) if hrv_score is not None else 65.0  # Heart-rate variability score (fixed placeholder for now)
 
-        # Combine the four channel scores using fixed percentage weights.
-        # Facial expressions contribute the most (35%) because they are the richest signal.
-        # Voice and gaze each contribute 25%, and heart rate 15% (it is a stub for now).
-        total  = facial * 0.35 + vocal * 0.25 + gaze * 0.25 + hrv * 0.15
+        # Combine the four channel scores using equal 25% weights across all channels.
+        total  = facial * 0.25 + vocal * 0.25 + gaze * 0.25 + hrv * 0.25
 
         # Apply exponential smoothing to every channel so scores drift gradually
         # rather than snapping to a new value instantly.
@@ -179,6 +177,9 @@ class TrustEngine:
 
         # Tremor index: does the voice have rapid shaking or wavering?
         # 0.0 = perfectly steady voice, 1.0 = extreme tremor (like a very nervous or fearful person).
+        # Previously derived from frame-to-frame energy variance; now driven by eGeMAPS
+        # jitter + shimmer + HNR composite (see VocalAnalyzer._tremor_from_features) when
+        # opensmile is available — more clinically grounded and less sensitive to microphone gain.
         # High tremor is a classic anxiety indicator and subtracts up to 32 points.
         tr = vd.get("tremor_index", 0.0)
         prv_tr = prev.get("vocal_tremor", tr)
@@ -187,6 +188,32 @@ class TrustEngine:
             contribs.append(("tremor", prv_tr, tr, round(delta_tr, 1)))
         s -= tr * 32   # Subtract up to 32 at maximum tremor
         prev["vocal_tremor"] = tr
+
+        # Alpha ratio: log(energy 1–5 kHz / 50 Hz–1 kHz) — added from eGeMAPS feature set.
+        # More negative = energy concentrated in low frequencies = normal relaxed voice.
+        # Less negative (toward 0) = elevated high-frequency energy = strained or breathy voice.
+        # Typical conversational speech: –15 to –5. Contribution is intentionally small (±4 pts)
+        # so it only tips the score when the other signals (pitch, tremor) are already borderline.
+        # Skipped entirely when opensmile is unavailable (ar == 0.0 is the legacy fallback sentinel).
+        ar = vd.get("alpha_ratio", 0.0)
+        if ar != 0.0:   # 0.0 is the sentinel returned by the legacy path — do not score it
+            ar_contrib = float(max(-4.0, min(3.0, -(ar + 10.0) * 0.2)))  # Centred at –10 dB; each unit above –10 subtracts 0.2 pts
+            if abs(ar_contrib) >= 0.5:
+                contribs.append(("alpha ratio", None, round(ar, 2), round(ar_contrib, 1)))
+            s += ar_contrib
+            prev["vocal_alpha_ratio"] = ar
+
+        # Spectral flux: mean frame-to-frame spectral change — added from eGeMAPS feature set.
+        # A stable, calm voice has low flux (≈ 0.002–0.005). Agitation, rapid pitch changes, or
+        # vocal instability raise it toward 0.02+.  The formula subtracts up to 5 pts above the
+        # 0.005 baseline; below it contributes a small positive nudge (capped at +1 pt).
+        # Like alpha ratio, skipped when sf == 0.0 (legacy fallback sentinel).
+        sf = vd.get("spectral_flux", 0.0)
+        if sf > 0.0:
+            sf_contrib = float(max(-5.0, min(1.0, -(sf - 0.005) * 200.0)))  # Linear ramp: each 0.005 above baseline costs 1 pt
+            if abs(sf_contrib) >= 0.5:
+                contribs.append(("spectral flux", None, round(sf, 4), round(sf_contrib, 1)))
+            s += sf_contrib
 
         # Return top-2 contributors and clamp to 0–100.
         contribs.sort(key=lambda x: abs(x[3]), reverse=True)

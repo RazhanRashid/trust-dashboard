@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QStackedWidget,
                               QFileDialog)
 
 # ── Analyzer modules (unchanged) ─────────────────────────────────────────────
-from Physio_analysis.face_analyzer    import FaceAnalyzer
+from Physio_analysis.face_analyzer    import FaceAnalyzer, BLENDSHAPE_AU_MAP
 from Physio_analysis.vocal_analyzer   import VocalAnalyzer
 from Physio_analysis.trust_engine     import TrustEngine
 from Physio_analysis.workload_engine  import WorkloadEngine
@@ -105,7 +105,11 @@ class TrustDashboard(QMainWindow):
         self._calibration_seconds = 30
         self._calibration_pupil:  list[float] = []
         self._calibration_face = {"eye_ar": [], "blink_rate": [], "gaze_deviation": []}
-        self._calibration_vocal = {"pitch_stability": [], "energy_level": [], "tremor_index": []}
+        # pitch_stability / energy_level / tremor_index are the original three vocal calibration buffers.
+        # hnr_db, alpha_ratio, and jitter were added when eGeMAPS support was introduced so that
+        # the VoicePanel can show "vs calibration" deltas for the two new metric boxes (HNR and Jitter).
+        self._calibration_vocal = {"pitch_stability": [], "energy_level": [], "tremor_index": [],
+                                   "hnr_db": [], "alpha_ratio": [], "jitter": []}
         self._calibration_baseline: dict = {}
 
         # ── Camera bookkeeping ──────────────────────────────────────────────
@@ -126,9 +130,6 @@ class TrustDashboard(QMainWindow):
         self._writer_lock = threading.Lock()
         self._recording_path: Path | None = None
         self._session_id: str = ""
-        # Best-thumbnail tracking (highest eye_ar = clearest open-eye frame)
-        self._best_thumb_frame = None
-        self._best_thumb_conf: float = -1.0
 
         # ── Latest scores (read by camera loop for recording overlay) ────────
         self._last_scores: dict = {}   # Written by _update_body; read by _camera_loop
@@ -312,6 +313,15 @@ class TrustDashboard(QMainWindow):
             self._calibration_vocal["pitch_stability"].append(float(vocal_data.get("pitch_stability", 0.5)))
             self._calibration_vocal["energy_level"].append(float(vocal_data.get("energy_level", 0.0)))
             self._calibration_vocal["tremor_index"].append(float(vocal_data.get("tremor_index", 0.0)))
+            # Only append the eGeMAPS features when they are non-zero; 0.0 is the sentinel
+            # returned by the legacy fallback path (opensmile not installed) and must not
+            # pollute the calibration baseline with fake zeros.
+            if vocal_data.get("hnr_db", 0.0) != 0.0:
+                self._calibration_vocal["hnr_db"].append(float(vocal_data["hnr_db"]))
+            if vocal_data.get("alpha_ratio", 0.0) != 0.0:
+                self._calibration_vocal["alpha_ratio"].append(float(vocal_data["alpha_ratio"]))
+            if vocal_data.get("jitter", 0.0) != 0.0:
+                self._calibration_vocal["jitter"].append(float(vocal_data["jitter"]))
 
     @staticmethod
     def _mean_or(values, fallback):
@@ -326,6 +336,11 @@ class TrustDashboard(QMainWindow):
             "voice_pitch_stability":  self._mean_or(self._calibration_vocal["pitch_stability"], 0.5),
             "voice_energy_level":     self._mean_or(self._calibration_vocal["energy_level"], 0.0),
             "voice_tremor_index":     self._mean_or(self._calibration_vocal["tremor_index"], 0.0),
+            # None as the fallback means "no eGeMAPS data collected" (opensmile not installed);
+            # VoicePanel.update_metrics checks for None before showing deltas on the new HNR/Jitter boxes.
+            "voice_hnr_db":           self._mean_or(self._calibration_vocal["hnr_db"], None),
+            "voice_alpha_ratio":      self._mean_or(self._calibration_vocal["alpha_ratio"], None),
+            "voice_jitter":           self._mean_or(self._calibration_vocal["jitter"], None),
         }
         self.trust = TrustEngine()
         self._history = {k: [] for k in ("total", "facial", "vocal", "gaze", "hrv")}
@@ -355,10 +370,14 @@ class TrustDashboard(QMainWindow):
                 "gaze_deviation": self._calibration_baseline["face_gaze_deviation"],
             }
             vocal_probe = {
-                "is_speaking": True,
+                "is_speaking":     True,
                 "pitch_stability": self._calibration_baseline["voice_pitch_stability"],
                 "energy_level":    self._calibration_baseline["voice_energy_level"],
                 "tremor_index":    self._calibration_baseline["voice_tremor_index"],
+                "alpha_ratio":     self._calibration_baseline.get("voice_alpha_ratio") or 0.0,
+                "spectral_flux":   0.0,
+                "hnr_db":          self._calibration_baseline.get("voice_hnr_db") or 0.0,
+                "jitter":          self._calibration_baseline.get("voice_jitter") or 0.0,
             }
             for _ in range(20):
                 probe_engine.update(face_probe, vocal_probe)
@@ -552,28 +571,22 @@ class TrustDashboard(QMainWindow):
         rec_path = self._recording_path
         self._recording_path = None
 
-        # ── 2. Grab the best thumbnail frame ────────────────────────────────
-        with self._lock:
-            thumb_frame = self._best_thumb_frame
-            self._best_thumb_frame = None
-        self._best_thumb_conf = -1.0
-
-        if thumb_frame is None or not self._session_id:
+        # ── 2. Extract first frame as thumbnail using ffmpeg ────────────────
+        if not rec_path or not self._session_id:
             return rec_path, None
 
-        # ── 3. Letterbox to 640×360 and write JPEG ──────────────────────────
         self._recordings_dir.mkdir(exist_ok=True)
         thumb_path = self._recordings_dir / f"{self._session_id}.jpg"
         try:
-            h, w = thumb_frame.shape[:2]
-            tgt_w, tgt_h = 640, 360
-            scale = min(tgt_w / w, tgt_h / h)
-            nw, nh = int(w * scale), int(h * scale)
-            resized = cv2.resize(thumb_frame, (nw, nh), interpolation=cv2.INTER_AREA)
-            canvas = np.zeros((tgt_h, tgt_w, 3), dtype=np.uint8)
-            yo, xo = (tgt_h - nh) // 2, (tgt_w - nw) // 2
-            canvas[yo:yo + nh, xo:xo + nw] = resized
-            cv2.imwrite(str(thumb_path), canvas, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(rec_path),
+                 "-vframes", "1",
+                 "-vf", "scale=640:360:force_original_aspect_ratio=decrease,"
+                        "pad=640:360:(ow-iw)/2:(oh-ih)/2",
+                 "-q:v", "2",
+                 str(thumb_path)],
+                capture_output=True, timeout=30,
+            )
             print(f"[rec] Thumbnail → {thumb_path}")
             return rec_path, thumb_path
         except Exception as e:
@@ -1014,14 +1027,6 @@ class TrustDashboard(QMainWindow):
                 face_data = self.face.analyze(small)
                 with self._lock:
                     self._last_frame = (frame, face_data)
-                # Track best thumbnail: use eye_ar as quality proxy
-                # (more open eyes → higher value → clearer capture)
-                if face_data.get("detected"):
-                    quality = float(face_data.get("eye_ar", 0.0))
-                    if quality > self._best_thumb_conf:
-                        self._best_thumb_conf = quality
-                        with self._lock:
-                            self._best_thumb_frame = frame.copy()
             time.sleep(0.033)
 
     # ════════════════════════════════════════════════════════════════════════
@@ -1211,11 +1216,27 @@ class TrustDashboard(QMainWindow):
             "pupil_norm":     round(float(fd.get("pupil_norm") or 0), 4),
             "duchenne":       int(fd.get("duchenne", 0)),
             # ── Vocal ───────────────────────────────────────────────────────
-            "speaking":       bool(vd.get("is_speaking")),
-            "pitch_stab":     round(float(vd.get("pitch_stability", 0.5)) * 100, 1),
-            "energy_level":   round(float(vd.get("energy_level",    0.0)) * 100, 1),
-            "tremor":         round(float(vd.get("tremor_index",     0.0)) * 100, 1),
-            "dominant_hz":    round(float(vd.get("dominant_hz",      0.0)), 1),
+            "speaking":        bool(vd.get("is_speaking")),
+            "pitch_stab":      round(float(vd.get("pitch_stability", 0.5)) * 100, 1),
+            "energy_level":    round(float(vd.get("energy_level",    0.0)) * 100, 1),
+            "tremor":          round(float(vd.get("tremor_index",     0.0)) * 100, 1),
+            "dominant_hz":     round(float(vd.get("dominant_hz",      0.0)), 1),
+            # ── eGeMAPS voice-quality columns added to Excel "Vocal Analysis" sheet ──────────────
+            "jitter":          round(float(vd.get("jitter",           0.0)) * 100, 4),  # stored as % (× 100) to match the panel display
+            "shimmer_db":      round(float(vd.get("shimmer_db",       0.0)), 3),        # raw dB value from eGeMAPS shimmerLocaldB
+            "hnr_db":          round(float(vd.get("hnr_db",           0.0)), 2),        # raw dB value from eGeMAPS HNRdBACF
+            # ── eGeMAPS spectral columns added to Excel "Vocal Analysis" sheet ─────────────────
+            "spectral_flux":   round(float(vd.get("spectral_flux",    0.0)), 5),        # kept at 5 dp because typical values are ~0.004–0.02
+            "alpha_ratio":     round(float(vd.get("alpha_ratio",      0.0)), 3),        # negative dB value; more negative = more low-freq energy
+            "hammarberg_idx":  round(float(vd.get("hammarberg_idx",   0.0)), 3),        # positive value; higher = greater vocal effort
+            # ── eGeMAPS formant columns added to Excel "Vocal Analysis" sheet ──────────────────
+            "f1_hz":           round(float(vd.get("f1_hz",            0.0)), 1),        # 1st formant in Hz; 0 when unvoiced
+            "f2_hz":           round(float(vd.get("f2_hz",            0.0)), 1),        # 2nd formant in Hz; 0 when unvoiced
+            # ── eGeMAPS MFCC columns added to Excel "Vocal Analysis" sheet ────────────────────
+            "mfcc1":           round(float(vd.get("mfcc1",            0.0)), 3),
+            "mfcc2":           round(float(vd.get("mfcc2",            0.0)), 3),
+            "mfcc3":           round(float(vd.get("mfcc3",            0.0)), 3),
+            "mfcc4":           round(float(vd.get("mfcc4",            0.0)), 3),
             # ── Cognitive load ──────────────────────────────────────────────
             "high_workload":  bool(wd.get("is_high_workload")),
             "pcps":           round(float(wd.get("pcps",           1000.0)), 2),
@@ -1226,6 +1247,9 @@ class TrustDashboard(QMainWindow):
             #                AU12 AU14 AU15 AU17 AU20 AU23 AU25 AU26 AU45
             "aus":            {au: round(v, 3)
                                for au, v in fd.get("aus", {}).items()},
+            # ── All 52 raw MediaPipe blendshape scores (0–1) ────────────────
+            "blendshapes":    {name: round(float(v), 4)
+                               for name, v in fd.get("blendshapes", {}).items()},
         }
         self._session_rows.append(row)
 
@@ -1256,6 +1280,11 @@ class TrustDashboard(QMainWindow):
             # pitch_stab / tremor / gaze_dev already stored as %, no × 100
             "avg_pitch_stability": avg("pitch_stab"),
             "avg_tremor":          avg("tremor"),
+            # eGeMAPS session averages — added alongside avg_pitch_stability and avg_tremor
+            # so the session summary card can surface vocal quality trends across the whole meeting.
+            "avg_hnr_db":          avg("hnr_db"),       # Mean HNR over the session; < 10 dB average suggests persistent vocal strain
+            "avg_jitter":          avg("jitter"),        # Mean jitter % over the session; elevated values indicate chronic perturbation
+            "avg_alpha_ratio":     avg("alpha_ratio"),   # Mean alpha ratio; trend toward 0 over a session signals increasing vocal strain
             "avg_blink_rate":      avg("blink_rate"),
             "avg_gaze_deviation":  avg("gaze_dev"),
             "trust_history":       [r["total"] for r in rows],
@@ -1486,26 +1515,51 @@ class TrustDashboard(QMainWindow):
             ("Duchenne Smile",   "Binary flag. 1 = genuine (Duchenne) smile detected: "
                                  "AU06 (cheek raiser) active simultaneously with AU12 (lip corner puller)."),
         ]
-        # Add one legend entry per AU
-        for _au in AU_ORDER:
-            if _au in AU_META:
-                _name, _desc = AU_META[_au]
-                FACIAL_LEGEND.append((f"{_au} – {_name}", _desc))
+
+        # Canonical MediaPipe blendshape order (ARKit topology, index 0 = _neutral)
+        BS_ORDER = [
+            "_neutral",
+            "browDownLeft",    "browDownRight",    "browInnerUp",
+            "browOuterUpLeft", "browOuterUpRight",
+            "cheekPuff",       "cheekSquintLeft",  "cheekSquintRight",
+            "eyeBlinkLeft",    "eyeBlinkRight",
+            "eyeLookDownLeft", "eyeLookDownRight",
+            "eyeLookInLeft",   "eyeLookInRight",
+            "eyeLookOutLeft",  "eyeLookOutRight",
+            "eyeLookUpLeft",   "eyeLookUpRight",
+            "eyeSquintLeft",   "eyeSquintRight",
+            "eyeWideLeft",     "eyeWideRight",
+            "jawForward",      "jawLeft",          "jawOpen",         "jawRight",
+            "mouthClose",
+            "mouthDimpleLeft", "mouthDimpleRight",
+            "mouthFrownLeft",  "mouthFrownRight",
+            "mouthFunnel",     "mouthLeft",
+            "mouthLowerDownLeft", "mouthLowerDownRight",
+            "mouthPressLeft",  "mouthPressRight",
+            "mouthPucker",     "mouthRight",
+            "mouthRollLower",  "mouthRollUpper",
+            "mouthShrugLower", "mouthShrugUpper",
+            "mouthSmileLeft",  "mouthSmileRight",
+            "mouthStretchLeft","mouthStretchRight",
+            "mouthUpperUpLeft","mouthUpperUpRight",
+            "noseSneerLeft",   "noseSneerRight",
+        ]
 
         ws2 = wb.create_sheet("Facial Analysis")
-        n_fixed = len(FACIAL_FIXED)
-        n_au    = sum(1 for au in AU_ORDER if au in AU_META)
-        total_cols = n_fixed + n_au
+        n_fixed    = len(FACIAL_FIXED)
+        n_bs       = len(BS_ORDER)
+        total_cols = n_fixed + n_bs
 
-        # ── header ─────────────────────────────────────────────────────────
+        # ── header — fixed metrics (blue) ───────────────────────────────────
         for c, (hdr, _, _f) in enumerate(FACIAL_FIXED, 1):
             cell = ws2.cell(row=1, column=c, value=hdr)
             cell.font = HDR_FONT; cell.fill = HDR_FILL
             cell.alignment = CENTER; cell.border = BORDER
 
-        for i, _au in enumerate((au for au in AU_ORDER if au in AU_META), n_fixed + 1):
-            hdr = f"{_au} – {AU_META[_au][0]} (Blendshape)"
-            cell = ws2.cell(row=1, column=i, value=hdr)
+        # ── header — blendshapes (teal) ─────────────────────────────────────
+        for i, bs_name in enumerate(BS_ORDER):
+            c    = n_fixed + 1 + i
+            cell = ws2.cell(row=1, column=c, value=bs_name)
             cell.font = HDR_FONT; cell.fill = HDR_FILL_BS
             cell.alignment = CENTER; cell.border = BORDER
 
@@ -1522,11 +1576,12 @@ class TrustDashboard(QMainWindow):
                 cell = ws2.cell(row=r_idx, column=c, value=val)
                 cell.font = BODY_FONT; cell.alignment = CENTER
                 if fill: cell.fill = fill
-            # Blendshape AU columns
-            bs_aus = row.get("aus", {})
-            for i, _au in enumerate((au for au in AU_ORDER if au in AU_META), n_fixed + 1):
-                cell = ws2.cell(row=r_idx, column=i,
-                                value=round(bs_aus.get(_au, 0), 4))
+            # Blendshape columns
+            bs_data = row.get("blendshapes", {})
+            for i, bs_name in enumerate(BS_ORDER):
+                c    = n_fixed + 1 + i
+                val  = bs_data.get(bs_name, "")
+                cell = ws2.cell(row=r_idx, column=c, value=val)
                 cell.font = BODY_FONT; cell.alignment = CENTER
                 if fill: cell.fill = fill
 
@@ -1551,33 +1606,64 @@ class TrustDashboard(QMainWindow):
         for c in range(3, n_fixed + 1):
             ws2.column_dimensions[gcl(c)].width = 16
         for c in range(n_fixed + 1, total_cols + 1):
-            ws2.column_dimensions[gcl(c)].width = 22
+            ws2.column_dimensions[gcl(c)].width = 18  # blendshape names are longer
 
         # ════════════════════════════════════════════════════════════════════
         # Sheet 3 — Vocal Analysis
         # ════════════════════════════════════════════════════════════════════
         ws3 = wb.create_sheet("Vocal Analysis")
         _write_sheet(ws3, [
-            ("Timestamp",          "timestamp",   None),
-            ("Elapsed (s)",        "elapsed_s",   None),
-            ("Vocal Score",        "vocal",       None),
-            ("Speaking",           "speaking",    _yn),
-            ("Pitch Stability %",  "pitch_stab",  None),
-            ("Voice Energy %",     "energy_level",None),
-            ("Tremor Index %",     "tremor",      None),
-            ("Vocal Hz",           "dominant_hz", None),
+            ("Timestamp",          "timestamp",      None),
+            ("Elapsed (s)",        "elapsed_s",      None),
+            ("Vocal Score",        "vocal",          None),
+            ("Speaking",           "speaking",       _yn),
+            ("Pitch Stability %",  "pitch_stab",     None),
+            ("Voice Energy %",     "energy_level",   None),
+            ("Tremor Index %",     "tremor",         None),
+            ("Vocal Hz",           "dominant_hz",    None),
+            ("Jitter %",           "jitter",         None),
+            ("Shimmer (dB)",       "shimmer_db",     None),
+            ("HNR (dB)",           "hnr_db",         None),
+            ("Spectral Flux",      "spectral_flux",  None),
+            ("Alpha Ratio",        "alpha_ratio",    None),
+            ("Hammarberg Index",   "hammarberg_idx", None),
+            ("F1 (Hz)",            "f1_hz",          None),
+            ("F2 (Hz)",            "f2_hz",          None),
+            ("MFCC 1",             "mfcc1",          None),
+            ("MFCC 2",             "mfcc2",          None),
+            ("MFCC 3",             "mfcc3",          None),
+            ("MFCC 4",             "mfcc4",          None),
         ], legend=[
-            ("Vocal Score",        "Composure sub-score derived from pitch stability, "
-                                   "energy consistency, and tremor index (0–100)."),
-            ("Speaking",           "Active speech detected: RMS energy above the silence threshold (0.018)."),
-            ("Pitch Stability %",  "Inverse coefficient of variation of fundamental frequency (F0). "
+            ("Vocal Score",        "Composure sub-score derived from pitch stability, energy, "
+                                   "tremor, alpha ratio, and spectral flux (0–100). "
+                                   "Features extracted via eGeMAPSv02 (OpenSMILE) when available."),
+            ("Speaking",           "Active speech detected: perceptual loudness above the silence threshold."),
+            ("Pitch Stability %",  "Inverse coefficient of variation of eGeMAPS F0 over a 60-frame history. "
                                    "100 % = perfectly stable pitch. Low values suggest vocal stress or emotion."),
-            ("Voice Energy %",     "Normalised RMS loudness (0–100 %). "
-                                   "100 % corresponds to ≈ 0.09 RMS (comfortable speaking volume)."),
-            ("Tremor Index %",     "High-frequency amplitude modulation of the voice (0–100 %). "
-                                   "Values above 30 % suggest significant vocal tremor."),
-            ("Vocal Hz",           "Fundamental frequency (F0) in Hz via autocorrelation. "
-                                   "Typical speech range: 80–450 Hz. 0 = not speaking."),
+            ("Voice Energy %",     "Perceptual loudness (eGeMAPS Loudness_sma3) normalised to 0–100 %."),
+            ("Tremor Index %",     "Composite vocal instability: 40 % jitter + 40 % shimmer + 20 % inverted HNR. "
+                                   "Values above 30 % suggest significant vocal tremor or strain."),
+            ("Vocal Hz",           "Fundamental frequency (F0) in Hz converted from eGeMAPS semitones. "
+                                   "Typical speech: 80–450 Hz. 0 = not speaking or unvoiced frame."),
+            ("Jitter %",           "Local jitter × 100: cycle-to-cycle F0 perturbation in voiced frames. "
+                                   "Normal speech < 1 %. Values above 2 % indicate vocal instability."),
+            ("Shimmer (dB)",       "Local shimmer in dB: cycle-to-cycle amplitude perturbation. "
+                                   "Normal speech < 1 dB. Values above 2 dB indicate vocal strain."),
+            ("HNR (dB)",           "Harmonics-to-Noise Ratio. Normal speech > 20 dB. "
+                                   "< 10 dB indicates a noisy, tense, or fatigued voice."),
+            ("Spectral Flux",      "Mean frame-to-frame spectral change. Higher values indicate "
+                                   "rapid vocal instability or agitation."),
+            ("Alpha Ratio",        "Log ratio of energy in 1–5 kHz vs 50 Hz–1 kHz bands. "
+                                   "More negative = energy in low frequencies (normal). "
+                                   "Less negative = high-frequency dominant (strained or breathy voice)."),
+            ("Hammarberg Index",   "Strongest energy peak in 2–5 kHz relative to energy below 2 kHz. "
+                                   "Higher values indicate greater vocal effort and brightness."),
+            ("F1 (Hz)",            "First formant frequency. Reflects vowel openness and jaw position. "
+                                   "Typical range: 300–900 Hz in conversational speech."),
+            ("F2 (Hz)",            "Second formant frequency. Reflects front/back vowel articulation. "
+                                   "Typical range: 800–2500 Hz."),
+            ("MFCC 1–4",           "Mel-Frequency Cepstral Coefficients 1–4. Encode vocal tract shape "
+                                   "and timbre. Used in ML-based emotion and stress classification."),
         ])
 
         # ════════════════════════════════════════════════════════════════════
@@ -1700,6 +1786,144 @@ class TrustDashboard(QMainWindow):
             ws_raw.column_dimensions[gcl(3)].width = 12   # Face Found
             for c in range(4, n_raw_cols + 1):
                 ws_raw.column_dimensions[gcl(c)].width = 22
+
+        # ════════════════════════════════════════════════════════════════════
+        # Sheet — AU Timeline  (only when post-hoc ran)
+        # Per-AU line charts showing MediaPipe blendshape vs OpenFace over
+        # the session, so you can see whether the two systems spike together.
+        # MediaPipe is sampled at 1 fps; OpenFace values are snapped to the
+        # nearest successfully-tracked frame at each MediaPipe timestamp.
+        # ════════════════════════════════════════════════════════════════════
+        if postproc:
+            from openpyxl.chart import LineChart, Reference, Series
+            from openpyxl.utils import get_column_letter as gcl
+
+            aus_in_order = [au for au in AU_ORDER if au in AU_META]
+            good_of      = [p for p in postproc if p.get("success")]
+            of_times     = [p.get("timestamp_s", 0.0) for p in good_of]
+
+            def _nearest_of_aus(elapsed):
+                if not of_times:
+                    return {}
+                idx = min(range(len(of_times)),
+                          key=lambda i: abs(of_times[i] - elapsed))
+                return good_of[idx].get("aus", {})
+
+            aligned = [
+                {
+                    "elapsed": row.get("elapsed_s", 0.0),
+                    "mp":      row.get("aus", {}),
+                    "of":      _nearest_of_aus(row.get("elapsed_s", 0.0)),
+                }
+                for row in rows
+            ]
+
+            ws_tl = wb.create_sheet("AU Timeline")
+
+            TEAL = PatternFill("solid", fgColor="1A9E8F")
+            BLUE = PatternFill("solid", fgColor="2563EB")
+
+            mp_mapped = set(BLENDSHAPE_AU_MAP.keys())
+
+            # ── data table ──────────────────────────────────────────────────
+            # Col 1: Elapsed (s)
+            # For each AU: col 2+2i = MP blendshape (omitted for unmapped AUs),
+            #              col 3+2i = OF nearest frame
+            cell = ws_tl.cell(row=1, column=1, value="Elapsed (s)")
+            cell.font = HDR_FONT; cell.fill = HDR_FILL
+            cell.alignment = CENTER; cell.border = BORDER
+
+            GRAY = PatternFill("solid", fgColor="94A3B8")
+
+            def _bs_label(au):
+                """Return the base blendshape name for an AU (bilateral suffix stripped).
+                e.g. AU07 → eyeSquintLeft/Right → 'eyeSquint'
+                     AU01 → browInnerUp         → 'browInnerUp'"""
+                components = BLENDSHAPE_AU_MAP.get(au, [])
+                if not components:
+                    return None
+                name = components[0][0]
+                return name.replace("Left", "").replace("Right", "")
+
+            for i, au in enumerate(aus_in_order):
+                mp_col = 2 + i * 2
+                of_col = 3 + i * 2
+                bs_name = _bs_label(au)
+                if bs_name:
+                    c = ws_tl.cell(row=1, column=mp_col, value=f"{bs_name} (MP)")
+                    c.font = HDR_FONT; c.fill = TEAL; c.alignment = CENTER; c.border = BORDER
+                else:
+                    c = ws_tl.cell(row=1, column=mp_col, value=f"{au} (MP – n/a)")
+                    c.font = HDR_FONT; c.fill = GRAY; c.alignment = CENTER; c.border = BORDER
+                c = ws_tl.cell(row=1, column=of_col, value=f"{au} – {AU_META[au][0]} (OF)")
+                c.font = HDR_FONT; c.fill = BLUE; c.alignment = CENTER; c.border = BORDER
+
+            for r_idx, a in enumerate(aligned, 2):
+                ws_tl.cell(row=r_idx, column=1,
+                           value=round(a["elapsed"], 1)).font = BODY_FONT
+                for i, au in enumerate(aus_in_order):
+                    mp_col = 2 + i * 2
+                    of_col = 3 + i * 2
+                    if au in mp_mapped:
+                        ws_tl.cell(row=r_idx, column=mp_col,
+                                   value=round(a["mp"].get(au, 0.0), 4)).font = BODY_FONT
+                    ws_tl.cell(row=r_idx, column=of_col,
+                               value=round(a["of"].get(au, 0.0), 4)).font = BODY_FONT
+
+            n_data_rows = len(aligned)
+            n_au        = len(aus_in_order)
+            chart_col0  = 2 + n_au * 2 + 2   # 2-col gap after data table
+
+            # ── line charts: one per AU, 2-column grid ───────────────────────
+            CHART_W     = 16   # cm
+            CHART_H     = 10   # cm
+            ROWS_PER_CH = 20   # approximate Excel rows per chart height
+
+            for idx, au in enumerate(aus_in_order):
+                mp_col = 2 + idx * 2
+                of_col = 3 + idx * 2
+
+                chart = LineChart()
+                chart.title  = f"{au} – {AU_META[au][0]}"
+                chart.style  = 10
+                chart.width  = CHART_W
+                chart.height = CHART_H
+                chart.y_axis.title  = "Intensity (0–1)"
+                chart.y_axis.numFmt = "0.00"
+                chart.y_axis.delete = False
+                chart.x_axis.title  = "Elapsed (s)"
+                chart.x_axis.delete = False
+
+                cats    = Reference(ws_tl, min_col=1,    min_row=2,
+                                    max_row=1 + n_data_rows)
+                of_data = Reference(ws_tl, min_col=of_col, min_row=1,
+                                    max_row=1 + n_data_rows)
+
+                of_s = Series(of_data, title_from_data=True)
+                of_s.graphicalProperties.line.solidFill = "2563EB"
+                of_s.graphicalProperties.line.width     = 25400
+
+                if au in mp_mapped:
+                    mp_data = Reference(ws_tl, min_col=mp_col, min_row=1,
+                                        max_row=1 + n_data_rows)
+                    mp_s = Series(mp_data, title_from_data=True)
+                    mp_s.graphicalProperties.line.solidFill = "1A9E8F"
+                    mp_s.graphicalProperties.line.width     = 25400
+                    chart.series = [mp_s, of_s]
+                else:
+                    chart.series = [of_s]
+
+                chart.set_categories(cats)
+
+                anchor_row = (idx // 2) * ROWS_PER_CH + 2
+                anchor_col = chart_col0 + (idx % 2) * 30
+                ws_tl.add_chart(chart, f"{gcl(anchor_col)}{anchor_row}")
+
+            # ── column widths ────────────────────────────────────────────────
+            ws_tl.column_dimensions[gcl(1)].width = 12
+            for i in range(n_au):
+                ws_tl.column_dimensions[gcl(2 + i * 2)].width = 10
+                ws_tl.column_dimensions[gcl(3 + i * 2)].width = 10
 
         wb.save(path)
 
