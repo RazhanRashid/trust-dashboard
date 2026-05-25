@@ -362,6 +362,9 @@ class FaceAnalyzer:
                 "pupil_norm":     pupil_norm,
                 "box_norm":       [bx, by, bw_, bh_],
                 "eye_norm":       {"l": l_pts, "r": r_pts},
+                # Full 478-point landmark list (normalised 0–1) used to draw the
+                # face mesh overlay on recorded video frames.
+                "landmarks_norm": [[lm.x, lm.y] for lm in lms],
                 # Emotions from blendshapes (updates every frame at ~30 fps)
                 "expressions":    expressions,
                 "au_emotions":    expressions,   # Alias kept for trust_engine compatibility

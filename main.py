@@ -28,7 +28,7 @@ import cv2
 import numpy as np
 import sounddevice as sd
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QStackedWidget,
                               QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox,
@@ -50,15 +50,19 @@ except Exception:
 from theme import (BG, BG_DEEP, PANEL, LINE, LINE_SOFT, TEXT, TEXT_FAINT, TEXT_GHOST,
                     ui_font, load_packaged_fonts)
 from panels import TopStrip, CameraPanel, ScorePanel, VoicePanel, HistoryChart, Footer
-from overlays import OverviewScreen, CalibrationOverlay, SessionSummary
+from overlays import OverviewScreen, CalibrationOverlay, SessionSummary, PosthocWaitingScreen
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 class TrustDashboard(QMainWindow):
     """Top-level window. Hosts a QStackedWidget that swaps between
-    Overview → Calibration → Live → Summary."""
+    Overview → Calibration → Live → Waiting → Summary."""
 
     CAM_W, CAM_H = 320, 240
+
+    # Emitted from the post-hoc background thread (via Qt signal machinery)
+    # so the main thread can safely transition to the summary screen.
+    _postprocess_finished = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -134,6 +138,8 @@ class TrustDashboard(QMainWindow):
         self._postprocess_rows: list | None = None   # Per-frame AU dicts from OpenFace; None = not yet done
         self._postprocess_thread: threading.Thread | None = None
         self._auto_excel_path: Path | None = None    # Auto-saved Excel path for the current session
+        self._pending_summary_stats: dict | None = None   # Stats held until post-hoc completes
+        self._waiting: PosthocWaitingScreen | None = None  # Waiting screen widget
 
         # ── Persistence ─────────────────────────────────────────────────────
         self._sessions_file = self._session_dir / "sessions.json"
@@ -141,6 +147,11 @@ class TrustDashboard(QMainWindow):
         # ── Build the UI ────────────────────────────────────────────────────
         self._build_ui()
         self._show_overview()
+
+        # ── Post-hoc signal → main thread transition ────────────────────────
+        # The background thread emits _postprocess_finished; Qt delivers it
+        # on the main thread so we can safely swap screens.
+        self._postprocess_finished.connect(self._on_postprocess_ui_done)
 
         # ── Main UI tick (60 ms — comfortable for eye, plenty fast for data)
         self._tick = QTimer(self)
@@ -243,6 +254,16 @@ class TrustDashboard(QMainWindow):
         self._cal.skip_clicked.connect(self._finish_calibration_now)
         self._stack.addWidget(self._cal)
         self._stack.setCurrentWidget(self._cal)
+
+    def _show_waiting(self):
+        """Show the post-hoc waiting screen while OpenFace processes the recording."""
+        if self._waiting is not None:
+            self._waiting.stop_spinner()
+            self._stack.removeWidget(self._waiting)
+            self._waiting.deleteLater()
+        self._waiting = PosthocWaitingScreen()
+        self._stack.addWidget(self._waiting)
+        self._stack.setCurrentWidget(self._waiting)
 
     def _show_summary(self, stats: dict):
         if self._sum is not None:
@@ -384,15 +405,21 @@ class TrustDashboard(QMainWindow):
             print(f"[export] Auto-save failed: {e}", flush=True)
             self._auto_excel_path = None
 
-        # Launch OpenFace post-hoc analysis in a background thread if a recording exists.
-        if rec_path and rec_path.exists():
-            self._launch_postprocess(rec_path)
-
-        # Give the summary absolute paths so it can open/display files directly
+        # Store summary stats so _on_postprocess_ui_done() can pass them to
+        # the summary screen once the waiting screen is dismissed.
         summary_stats = dict(stats)
         summary_stats["recording_path"] = str(rec_path) if rec_path else None
         summary_stats["thumbnail_path"] = str(thumb_path) if thumb_path else None
-        self._show_summary(summary_stats)
+        self._pending_summary_stats = summary_stats
+
+        # If OpenFace is available and a recording exists, show the waiting
+        # screen and process in the background. Otherwise go straight to summary.
+        if rec_path and rec_path.exists() and self.face.openface_available:
+            self._show_waiting()
+            self._launch_postprocess(rec_path)
+        else:
+            self._postprocess_rows = []   # Mark as done (no recording / no OpenFace)
+            self._show_summary(summary_stats)
 
     def _back_to_overview(self):
         self._session_ended = False
@@ -429,8 +456,9 @@ class TrustDashboard(QMainWindow):
     def _on_postprocess_done(self, au_rows: list):
         """
         Called from the background thread when OpenFace finishes.
-        Stores the AU rows and rewrites the auto-saved Excel with the accurate AU sheet.
-        This runs on the background thread so no Qt UI calls are made here.
+        Stores the AU rows, rewrites the Excel, then emits a signal so the
+        main thread can safely dismiss the waiting screen and show the summary.
+        No Qt UI calls are made directly here — only the signal emit is safe.
         """
         self._postprocess_rows = au_rows if au_rows else []
         print(f"[post-hoc] Analysis complete — {len(self._postprocess_rows)} frames.", flush=True)
@@ -442,6 +470,24 @@ class TrustDashboard(QMainWindow):
                 print(f"[post-hoc] Excel updated with AU data → {self._auto_excel_path}", flush=True)
             except Exception as e:
                 print(f"[post-hoc] Excel update failed: {e}", flush=True)
+
+        # Signal the main thread to swap screens.
+        self._postprocess_finished.emit()
+
+    def _on_postprocess_ui_done(self):
+        """
+        Runs on the Qt main thread (delivered via signal).
+        Tears down the waiting screen and shows the session summary.
+        """
+        if self._waiting is not None:
+            self._waiting.stop_spinner()
+            self._stack.removeWidget(self._waiting)
+            self._waiting.deleteLater()
+            self._waiting = None
+
+        if self._pending_summary_stats is not None:
+            self._show_summary(self._pending_summary_stats)
+            self._pending_summary_stats = None
 
     # ════════════════════════════════════════════════════════════════════════
     # Recording helpers
@@ -516,15 +562,98 @@ class TrustDashboard(QMainWindow):
     # Recording overlay
     # ════════════════════════════════════════════════════════════════════════
 
+    # MediaPipe face mesh connection sets — hardcoded from the MediaPipe topology.
+    # mediapipe.solutions was removed in MediaPipe 0.10+, so we define the
+    # static index pairs directly.  The 478-point topology is fixed and will
+    # not change between MediaPipe versions.
+
+    # Face oval — 36 edges, clockwise from top-centre
+    _FACE_OVAL: frozenset = frozenset([
+        (10, 338), (338, 297), (297, 332), (332, 284), (284, 251), (251, 389),
+        (389, 356), (356, 454), (454, 323), (323, 361), (361, 288), (288, 397),
+        (397, 365), (365, 379), (379, 378), (378, 400), (400, 377), (377, 152),
+        (152, 148), (148, 176), (176, 149), (149, 150), (150, 136), (136, 172),
+        (172,  58), ( 58, 132), (132,  93), ( 93, 234), (234, 127), (127, 162),
+        (162,  21), ( 21,  54), ( 54, 103), (103,  67), ( 67, 109), (109,  10),
+    ])
+
+    # Left eye outline (16 edges, MediaPipe indices for the subject's left eye)
+    _MESH_L_EYE: frozenset = frozenset([
+        (362, 382), (382, 381), (381, 380), (380, 374), (374, 373), (373, 390),
+        (390, 249), (249, 263), (263, 466), (466, 388), (388, 387), (387, 386),
+        (386, 385), (385, 384), (384, 398), (398, 362),
+    ])
+
+    # Right eye outline (16 edges)
+    _MESH_R_EYE: frozenset = frozenset([
+        ( 33,   7), (  7, 163), (163, 144), (144, 145), (145, 153), (153, 154),
+        (154, 155), (155, 133), (133, 173), (173, 157), (157, 158), (158, 159),
+        (159, 160), (160, 161), (161, 246), (246,  33),
+    ])
+
+    # Iris circles — indices 468-471 (left) and 472-475 (right)
+    _MESH_L_IRIS: frozenset = frozenset([(468, 469), (469, 470), (470, 471), (471, 468)])
+    _MESH_R_IRIS: frozenset = frozenset([(472, 473), (473, 474), (474, 475), (475, 472)])
+
+    # Lips — outer contour
+    _LIPS_OUTER: frozenset = frozenset([
+        ( 61, 185), (185,  40), ( 40,  39), ( 39,  37), ( 37,   0), (  0, 267),
+        (267, 269), (269, 270), (270, 409), (409, 291), (291, 375), (375, 321),
+        (321, 405), (405, 314), (314,  17), ( 17,  84), ( 84, 181), (181,  91),
+        ( 91, 146), (146,  61),
+    ])
+
     @staticmethod
-    def _draw_recording_overlay(frame: np.ndarray, face_data: dict | None,
+    def _draw_connections(frame, pts, connections, colour, thickness=1):
+        """Draw a set of (idx_a, idx_b) mesh connections onto frame."""
+        if connections is None:
+            return
+        for a, b in connections:
+            if a < len(pts) and b < len(pts):
+                cv2.line(frame, pts[a], pts[b], colour, thickness, cv2.LINE_AA)
+
+    def _draw_recording_overlay(self, frame: np.ndarray, face_data: dict | None,
                                  scores: dict | None) -> np.ndarray:
         """
-        Draw a blendshape emotion panel onto a copy of the recording frame.
-        Called once per camera frame (~30 fps) before writing to the video file.
-        The live display is unaffected — this only annotates the saved recording.
+        Draw the MediaPipe face mesh and a blendshape emotion panel onto a copy
+        of the recording frame.  Called once per camera frame (~30 fps) before
+        writing to the video file.  The live display is unaffected.
         """
         h, w = frame.shape[:2]
+
+        # ── Face mesh ─────────────────────────────────────────────────────────
+        lms_norm = (face_data or {}).get("landmarks_norm")
+        if lms_norm:
+            # Convert normalised (0–1) landmark coordinates to pixel coords once.
+            pts = [(int(x * w), int(y * h)) for x, y in lms_norm]
+
+            # Tessellation — draw a faint dot at each of the 468 face landmarks
+            # (full edge tessellation requires 462 hardcoded pairs; dots give the
+            # same wireframe feel at a fraction of the drawing cost).
+            dot_overlay = frame.copy()
+            for px_, py_ in pts[:468]:
+                cv2.circle(dot_overlay, (px_, py_), 1, (255, 255, 255), -1, cv2.LINE_AA)
+            cv2.addWeighted(dot_overlay, 0.45, frame, 0.55, 0, frame)
+
+            # Face oval contour — bright cyan
+            self._draw_connections(frame, pts, self._FACE_OVAL,
+                                   (255, 255, 0), thickness=1)
+
+            # Lip outline — bright coral/red
+            self._draw_connections(frame, pts, self._LIPS_OUTER,
+                                   (60, 100, 255), thickness=1)
+
+            # Eye outlines — bright blue (left) / bright magenta (right)
+            self._draw_connections(frame, pts, self._MESH_L_EYE,
+                                   (255, 80, 0), thickness=2)
+            self._draw_connections(frame, pts, self._MESH_R_EYE,
+                                   (255, 0, 230), thickness=2)
+
+            # Iris circles — same colours as the eye outlines
+            self._draw_connections(frame, pts, self._MESH_L_IRIS,
+                                   (255, 80, 0), thickness=2)
+            self._draw_connections(frame, pts, self._MESH_R_IRIS,
+                                   (255, 0, 230), thickness=2)
 
         # ── Emotion definitions: label, BGR colour ────────────────────────────
         EMOTIONS = [
@@ -642,17 +771,16 @@ class TrustDashboard(QMainWindow):
     # ════════════════════════════════════════════════════════════════════════
     @staticmethod
     def _avf_camera_names() -> tuple[dict[int, str], set[int]]:
-        """Return (names, phone_indices) via direct PyObjC import in the main process.
+        """Return (names, phone_indices).
 
         names        — {avf_index: display_name}
-        phone_indices — set of indices that are Continuity / iPhone cameras,
-                        detected via AVCaptureDevice.deviceType and
-                        isContinuityCamera (macOS 13 / 14 APIs) rather than
-                        relying solely on the display name.
+        phone_indices — indices that are Continuity / iPhone cameras.
 
-        Must run in the main app process — macOS only grants camera permission
-        to the application, not to subprocesses.
+        Tries PyObjC first; falls back to ffmpeg + system_profiler when
+        PyObjC is unavailable (the fallback works reliably on macOS without
+        extra dependencies).
         """
+        # ── Method 1: PyObjC AVFoundation ────────────────────────────────────
         try:
             from AVFoundation import AVCaptureDevice, AVMediaTypeVideo
             devices = AVCaptureDevice.devicesWithMediaType_(AVMediaTypeVideo)
@@ -662,20 +790,16 @@ class TrustDashboard(QMainWindow):
                 name = str(d.localizedName())
                 names[i] = name
                 is_phone = False
-                # ① deviceType string contains "Continuity" on macOS 13+
                 try:
-                    dt = str(d.deviceType()).lower()
-                    if "continuity" in dt:
+                    if "continuity" in str(d.deviceType()).lower():
                         is_phone = True
                 except Exception:
                     pass
-                # ② isContinuityCamera property, macOS 14+
                 try:
                     if d.isContinuityCamera():
                         is_phone = True
                 except Exception:
                     pass
-                # ③ name-based fallback
                 name_lc = name.lower()
                 if any(kw in name_lc for kw in ("iphone", "ipad", "continuity", "desk view")):
                     is_phone = True
@@ -685,8 +809,88 @@ class TrustDashboard(QMainWindow):
             print(f"[camera] Phone/continuity indices: {phone_indices}")
             return names, phone_indices
         except Exception as e:
-            print(f"[camera] AVFoundation query failed: {e}")
-            return {}, set()
+            print(f"[camera] PyObjC unavailable ({e}), falling back to ffmpeg + system_profiler")
+
+        # ── Method 2: ffmpeg device list + system_profiler model-id ──────────
+        # system_profiler reports the hardware model-id (e.g. "iPhone17,4") which
+        # is a reliable signal for Continuity Cameras regardless of display name.
+        names: dict[int, str] = {}
+        phone_indices: set[int] = set()
+        try:
+            import subprocess, re as _re
+
+            # Step A: discover which camera names belong to iPhones/iPads.
+            phone_names: set[str] = set()
+            try:
+                sp_raw = subprocess.check_output(
+                    ["system_profiler", "SPCameraDataType", "-json"],
+                    stderr=subprocess.DEVNULL, timeout=5
+                )
+                sp_data = json.loads(sp_raw)
+                for cam in sp_data.get("SPCameraDataType", []):
+                    model = cam.get("spcamera_model-id", "")
+                    cam_name = cam.get("_name", "")
+                    if model.startswith(("iPhone", "iPad")):
+                        phone_names.add(cam_name)
+                        print(f"[camera] system_profiler: {cam_name!r} is a phone ({model})")
+            except Exception as sp_err:
+                print(f"[camera] system_profiler failed: {sp_err}")
+
+            # Step B: map AVFoundation video indices to names via ffmpeg.
+            result = subprocess.run(
+                ["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+                stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=5
+            )
+            output = result.stderr.decode(errors="replace")
+            in_video = False
+            for line in output.splitlines():
+                if "AVFoundation video devices" in line:
+                    in_video = True
+                    continue
+                if "AVFoundation audio devices" in line:
+                    in_video = False
+                    continue
+                if in_video:
+                    m = _re.search(r'\[(\d+)\]\s+(.+)', line)
+                    if m:
+                        idx = int(m.group(1))
+                        cam_name = m.group(2).strip()
+                        names[idx] = cam_name
+                        # name-based keyword check as belt-and-suspenders
+                        name_lc = cam_name.lower()
+                        if (cam_name in phone_names or
+                                any(kw in name_lc for kw in
+                                    ("iphone", "ipad", "continuity", "desk view"))):
+                            phone_indices.add(idx)
+
+            print(f"[camera] ffmpeg devices      : {names}")
+            print(f"[camera] Phone/continuity indices: {phone_indices}")
+        except Exception as fb_err:
+            print(f"[camera] Fallback detection failed: {fb_err}")
+
+        return names, phone_indices
+
+    # ── Camera preference persistence ────────────────────────────────────────
+    # Saves the last-used camera index to a small JSON file so the same camera
+    # is selected automatically on the next launch.
+
+    def _load_camera_pref(self) -> int | None:
+        """Return the saved preferred camera index, or None if not set."""
+        try:
+            p = self._data_dir / "camera_pref.json"
+            if p.exists():
+                return int(json.loads(p.read_text()).get("index", -1)) or None
+        except Exception:
+            pass
+        return None
+
+    def _save_camera_pref(self, index: int):
+        """Persist the chosen camera index for next launch."""
+        try:
+            p = self._data_dir / "camera_pref.json"
+            p.write_text(json.dumps({"index": index}))
+        except Exception:
+            pass
 
     def _pick_camera(self) -> int:
         # ── Step 0: warm-up open to trigger macOS camera-permission grant ────
@@ -723,16 +927,20 @@ class TrustDashboard(QMainWindow):
         self._available_cameras = available if available else [0]
         print(f"[camera] Available cameras: {self._available_cameras}")
 
-        # ── Step 3: prefer Continuity Camera (iPhone) when present ──────────
-        # Check by AVFoundation device-type flags first (most reliable),
-        # then fall back to name keywords.
+        # ── Step 3: restore last-used camera if it is still available ───────
+        saved = self._load_camera_pref()
+        if saved is not None and saved in self._available_cameras:
+            print(f"[camera] Restored preferred index {saved} ({camera_names.get(saved, '?')})")
+            return saved
+
+        # ── Step 4: default — prefer built-in / USB; phone is last resort ───
         for i in self._available_cameras:
-            if i in phone_indices:
-                print(f"[camera] Selected index {i} ({camera_names.get(i, '?')}) — Continuity Camera")
+            if i not in phone_indices:
+                print(f"[camera] Selected index {i} ({camera_names.get(i, '?')}) — built-in/USB camera")
                 return i
 
         chosen = self._available_cameras[0]
-        print(f"[camera] Selected index {chosen} ({camera_names.get(chosen, '?')}) — first available")
+        print(f"[camera] Selected index {chosen} ({camera_names.get(chosen, '?')}) — phone camera (no built-in found)")
         return chosen
 
     def _start_camera(self):
@@ -759,6 +967,7 @@ class TrustDashboard(QMainWindow):
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         self._cam_ok = False
         self.cam_panel.set_camera_info(next_idx, len(self._available_cameras))
+        self._save_camera_pref(next_idx)   # remember for next launch
 
     def _camera_loop(self):
         while self._running:
@@ -1209,10 +1418,36 @@ class TrustDashboard(QMainWindow):
         ])
 
         # ════════════════════════════════════════════════════════════════════
-        # Sheet 2 — Facial Analysis
+        # Sheet 2 — Facial Analysis  (metrics + blendshape AUs in one place)
         # ════════════════════════════════════════════════════════════════════
-        ws2 = wb.create_sheet("Facial Analysis")
-        _write_sheet(ws2, [
+        # Standard columns use the shared blue header.
+        # Blendshape AU columns are appended with a teal header so they are
+        # visually distinct but still part of the same 1-fps sheet.
+        HDR_FILL_BS = PatternFill("solid", fgColor="0E7490")   # teal — Blendshape AUs
+
+        AU_META = {
+            "AU01": ("Inner Brow Raise",       "Raises the inner corners of the eyebrows. Active in sadness, fear, and worry."),
+            "AU02": ("Outer Brow Raise",       "Raises the outer corners of the eyebrows. Seen in surprise and fear."),
+            "AU04": ("Brow Lowerer",           "Pulls the brows together and down. Key marker of anger, concentration, and confusion."),
+            "AU05": ("Upper Lid Raiser",       "Widens the eye aperture. Strongly associated with surprise and fear."),
+            "AU06": ("Cheek Raiser",           "Raises the cheeks, forming crow's feet. Required component of a genuine (Duchenne) smile."),
+            "AU07": ("Lid Tightener",          "Tightens the lower eyelid. Present in anger, disgust, and focus."),
+            "AU09": ("Nose Wrinkler",          "Wrinkles the nose. Primary marker of disgust."),
+            "AU10": ("Upper Lip Raiser",       "Raises the upper lip. Present in disgust and mild contempt."),
+            "AU12": ("Lip Corner Puller",      "Pulls lip corners outward and upward. Core component of smiling."),
+            "AU14": ("Dimpler",                "Creates dimples by pulling lip corners. Seen in suppressed smiles and smirks."),
+            "AU15": ("Lip Corner Depressor",   "Pulls lip corners downward. Associated with sadness and disappointment."),
+            "AU17": ("Chin Raiser",            "Raises the chin boss. Seen in sadness, doubt, and pouting."),
+            "AU20": ("Lip Stretcher",          "Stretches lips horizontally. Common in fear and nervous tension."),
+            "AU23": ("Lip Tightener",          "Tightens the lips. Present in anger and determination."),
+            "AU25": ("Lips Part",              "Parts the lips. Accompanies many expressions; elevated in surprise, disgust, speech."),
+            "AU26": ("Jaw Drop",               "Opens the jaw. Strong indicator of surprise, shock, or open-mouth speech."),
+            "AU45": ("Blink / Eye Closure",    "Eye closure intensity. High sustained values indicate fatigue or discomfort."),
+        }
+        AU_ORDER = ["AU01","AU02","AU04","AU05","AU06","AU07","AU09","AU10",
+                    "AU12","AU14","AU15","AU17","AU20","AU23","AU25","AU26","AU45"]
+
+        FACIAL_FIXED = [
             ("Timestamp",        "timestamp",    None),
             ("Elapsed (s)",      "elapsed_s",    None),
             ("Facial Score",     "facial",       None),
@@ -1223,12 +1458,13 @@ class TrustDashboard(QMainWindow):
             ("Gaze Deviation %", "gaze_dev",     None),
             ("Pupil (norm.)",    "pupil_norm",   None),
             ("Duchenne Smile",   "duchenne",     None),
-        ], legend=[
+        ]
+        FACIAL_LEGEND = [
             ("Facial Score",     "Composure sub-score derived from eye openness stability, "
                                  "blink regularity, gaze deviation, and expression neutrality (0–100)."),
             ("Face Detected",    "Whether MediaPipe detected and tracked a face in the frame."),
-            ("Expression",       "Dominant facial expression inferred from OpenFace Action Units "
-                                 "(neutral · happy · sad · angry · surprised · fearful · disgusted)."),
+            ("Expression",       "Dominant facial expression inferred from blendshape scores "
+                                 "(neutral · happy · sad · angry · surprised · fearful · disgusted · contempt)."),
             ("Eye Openness %",   "Eye Aspect Ratio × 100. Typical open-eye range: 25–45 %. "
                                  "Values below ~15 % indicate a blink in progress."),
             ("Blink Rate /min",  "Rolling blinks-per-minute count. "
@@ -1239,7 +1475,73 @@ class TrustDashboard(QMainWindow):
                                  "Larger values indicate pupil dilation (higher cognitive arousal)."),
             ("Duchenne Smile",   "Binary flag. 1 = genuine (Duchenne) smile detected: "
                                  "AU06 (cheek raiser) active simultaneously with AU12 (lip corner puller)."),
-        ])
+        ]
+        # Add one legend entry per AU
+        for _au in AU_ORDER:
+            if _au in AU_META:
+                _name, _desc = AU_META[_au]
+                FACIAL_LEGEND.append((f"{_au} – {_name}", _desc))
+
+        ws2 = wb.create_sheet("Facial Analysis")
+        n_fixed = len(FACIAL_FIXED)
+        n_au    = sum(1 for au in AU_ORDER if au in AU_META)
+        total_cols = n_fixed + n_au
+
+        # ── header ─────────────────────────────────────────────────────────
+        for c, (hdr, _, _f) in enumerate(FACIAL_FIXED, 1):
+            cell = ws2.cell(row=1, column=c, value=hdr)
+            cell.font = HDR_FONT; cell.fill = HDR_FILL
+            cell.alignment = CENTER; cell.border = BORDER
+
+        for i, _au in enumerate((au for au in AU_ORDER if au in AU_META), n_fixed + 1):
+            hdr = f"{_au} – {AU_META[_au][0]} (Blendshape)"
+            cell = ws2.cell(row=1, column=i, value=hdr)
+            cell.font = HDR_FONT; cell.fill = HDR_FILL_BS
+            cell.alignment = CENTER; cell.border = BORDER
+
+        ws2.freeze_panes = "A2"
+        ws2.row_dimensions[1].height = 32
+
+        # ── data rows ──────────────────────────────────────────────────────
+        for r_idx, row in enumerate(rows, 2):
+            fill = ALT_FILL if r_idx % 2 == 0 else None
+            # Fixed columns
+            for c, (_, key, fmt) in enumerate(FACIAL_FIXED, 1):
+                raw  = row.get(key, "")
+                val  = fmt(raw) if fmt else raw
+                cell = ws2.cell(row=r_idx, column=c, value=val)
+                cell.font = BODY_FONT; cell.alignment = CENTER
+                if fill: cell.fill = fill
+            # Blendshape AU columns
+            bs_aus = row.get("aus", {})
+            for i, _au in enumerate((au for au in AU_ORDER if au in AU_META), n_fixed + 1):
+                cell = ws2.cell(row=r_idx, column=i,
+                                value=round(bs_aus.get(_au, 0), 4))
+                cell.font = BODY_FONT; cell.alignment = CENTER
+                if fill: cell.fill = fill
+
+        # ── legend ─────────────────────────────────────────────────────────
+        leg2 = len(rows) + 3
+        tc = ws2.cell(row=leg2, column=1, value="LEGEND")
+        tc.font = LEG_TITLE; tc.fill = LEG_FILL; tc.alignment = LEFT
+        ws2.merge_cells(start_row=leg2, start_column=1,
+                        end_row=leg2,   end_column=total_cols)
+        for i, (field, desc) in enumerate(FACIAL_LEGEND, leg2 + 1):
+            k = ws2.cell(row=i, column=1, value=field)
+            k.font = LEG_KEY; k.alignment = LEFT
+            d = ws2.cell(row=i, column=2, value=desc)
+            d.font = LEG_VAL; d.alignment = LEFT
+            ws2.merge_cells(start_row=i, start_column=2,
+                            end_row=i,   end_column=total_cols)
+
+        # ── column widths ───────────────────────────────────────────────────
+        from openpyxl.utils import get_column_letter as gcl
+        ws2.column_dimensions[gcl(1)].width = 22   # Timestamp
+        ws2.column_dimensions[gcl(2)].width = 12   # Elapsed
+        for c in range(3, n_fixed + 1):
+            ws2.column_dimensions[gcl(c)].width = 16
+        for c in range(n_fixed + 1, total_cols + 1):
+            ws2.column_dimensions[gcl(c)].width = 22
 
         # ════════════════════════════════════════════════════════════════════
         # Sheet 3 — Vocal Analysis
@@ -1326,146 +1628,68 @@ class TrustDashboard(QMainWindow):
                                    "this column with real beat-to-beat interval data."),
         ])
 
+
         # ════════════════════════════════════════════════════════════════════
-        # Sheet 7 — Action Units
+        # Sheet 7 — OpenFace Raw  (per-frame, 30 fps, only when post-hoc ran)
         # ════════════════════════════════════════════════════════════════════
-        # AU descriptions (FACS label + what elevated intensity means)
-        AU_META = {
-            "AU01": ("Inner Brow Raise",       "Raises the inner corners of the eyebrows. Active in sadness, fear, and worry."),
-            "AU02": ("Outer Brow Raise",       "Raises the outer corners of the eyebrows. Seen in surprise and fear."),
-            "AU04": ("Brow Lowerer",           "Pulls the brows together and down. Key marker of anger, concentration, and confusion."),
-            "AU05": ("Upper Lid Raiser",       "Widens the eye aperture. Strongly associated with surprise and fear."),
-            "AU06": ("Cheek Raiser",           "Raises the cheeks, forming crow's feet. Required component of a genuine (Duchenne) smile."),
-            "AU07": ("Lid Tightener",          "Tightens the lower eyelid. Present in anger, disgust, and focus."),
-            "AU09": ("Nose Wrinkler",          "Wrinkles the nose. Primary marker of disgust."),
-            "AU10": ("Upper Lip Raiser",       "Raises the upper lip. Present in disgust and mild contempt."),
-            "AU12": ("Lip Corner Puller",      "Pulls lip corners outward and upward. Core component of smiling."),
-            "AU14": ("Dimpler",                "Creates dimples by pulling lip corners. Seen in suppressed smiles and smirks."),
-            "AU15": ("Lip Corner Depressor",   "Pulls lip corners downward. Associated with sadness and disappointment."),
-            "AU17": ("Chin Raiser",            "Raises the chin boss. Seen in sadness, doubt, and pouting."),
-            "AU20": ("Lip Stretcher",          "Stretches lips horizontally. Common in fear and nervous tension."),
-            "AU23": ("Lip Tightener",          "Tightens the lips. Present in anger and determination."),
-            "AU25": ("Lips Part",              "Parts the lips. Accompanies many expressions; elevated in surprise, disgust, speech."),
-            "AU26": ("Jaw Drop",               "Opens the jaw. Strong indicator of surprise, shock, or open-mouth speech."),
-            "AU45": ("Blink / Eye Closure",    "Eye closure intensity. High sustained values indicate fatigue or discomfort."),
-        }
-        AU_ORDER = ["AU01","AU02","AU04","AU05","AU06","AU07","AU09","AU10",
-                    "AU12","AU14","AU15","AU17","AU20","AU23","AU25","AU26","AU45"]
-
-        # Decide AU data source.
-        # Post-hoc OpenFace rows (accurate) are preferred over the blendshape-derived
-        # approximate AUs stored in session_rows during the live session.
-        postproc = self._postprocess_rows   # None = still running; [] = ran but no face; list = success
-        au_source_label = "OpenFace post-hoc (accurate)" if postproc else "MediaPipe blendshapes (approximate)"
-
-        # Build a timestamp_s → postproc_row lookup for fast nearest-frame matching.
-        # Each session row records at 1 fps (elapsed_s = 0, 1, 2 …).
-        # Each postproc row records at video frame rate (~30 fps, timestamp_s = 0.00, 0.033 …).
-        # For each 1-fps session row we find the closest postproc frame by timestamp.
-        def _nearest_postproc_aus(elapsed_s: float) -> dict:
-            if not postproc:
-                return {}
-            best = min(postproc, key=lambda r: abs(r["timestamp_s"] - elapsed_s))
-            return best["aus"] if best.get("success") else {}
-
-        ws7 = wb.create_sheet("Action Units")
-        # ── header ─────────────────────────────────────────────────────────
-        fixed_cols = [("Timestamp", "timestamp"), ("Elapsed (s)", "elapsed_s"),
-                      ("Face Detected", "face_det"), ("Expression", "expression")]
-        all_headers = ([h for h, _ in fixed_cols] +
-                       [f"{au} – {AU_META[au][0]}" for au in AU_ORDER if au in AU_META])
-
-        for c, h in enumerate(all_headers, 1):
-            cell = ws7.cell(row=1, column=c, value=h)
-            cell.font      = HDR_FONT
-            cell.fill      = HDR_FILL
-            cell.alignment = CENTER
-            cell.border    = BORDER
-        ws7.freeze_panes = "A2"
-        ws7.row_dimensions[1].height = 28
-
-        # ── data rows ──────────────────────────────────────────────────────
-        for r_idx, row in enumerate(rows, 2):
-            fill = ALT_FILL if r_idx % 2 == 0 else None
-
-            # Use accurate post-hoc AUs if available, otherwise blendshape approximations.
-            if postproc is not None:
-                aus = _nearest_postproc_aus(row.get("elapsed_s", 0))
-            else:
-                aus = row.get("aus", {})
-
-            vals = (
-                [row.get("timestamp", ""), row.get("elapsed_s", ""),
-                 _yn(row.get("face_det", False)), row.get("expression", "—")] +
-                [aus.get(au, "") for au in AU_ORDER]
-            )
-            for c, v in enumerate(vals, 1):
-                cell = ws7.cell(row=r_idx, column=c, value=v)
-                cell.font      = BODY_FONT
-                cell.alignment = CENTER
-                if fill:
-                    cell.fill = fill
-
-        # ── AU Detail sheet (full per-frame post-hoc data) ──────────────────
-        # Only added when post-hoc analysis has completed successfully.
+        # Full-resolution OpenFace output: one row per video frame.
+        # Blendshape AUs are in Facial Analysis (1 fps). This sheet is for
+        # deep analysis where per-frame accuracy matters.
+        postproc = self._postprocess_rows   # None/[] = not yet run; list = complete
         if postproc:
-            ws_detail = wb.create_sheet("AU Detail (post-hoc)")
-            detail_headers = (["Frame", "Time (s)", "Face Found"] +
-                              [f"{au} – {AU_META[au][0]}" for au in AU_ORDER if au in AU_META])
-            for c, h in enumerate(detail_headers, 1):
-                cell = ws_detail.cell(row=1, column=c, value=h)
+            ws_raw = wb.create_sheet("OpenFace Raw")
+            raw_fixed_hdrs = ["Frame", "Time (s)", "Face Found"]
+            raw_au_hdrs    = [f"{au} – {AU_META[au][0]}" for au in AU_ORDER if au in AU_META]
+            raw_headers    = raw_fixed_hdrs + raw_au_hdrs
+            n_raw_cols     = len(raw_headers)
+
+            for c, h in enumerate(raw_headers, 1):
+                cell = ws_raw.cell(row=1, column=c, value=h)
                 cell.font = HDR_FONT; cell.fill = HDR_FILL
                 cell.alignment = CENTER; cell.border = BORDER
-            ws_detail.freeze_panes = "A2"
-            ws_detail.row_dimensions[1].height = 28
+            ws_raw.freeze_panes = "A2"
+            ws_raw.row_dimensions[1].height = 28
+
             for r_idx, prow in enumerate(postproc, 2):
-                fill = ALT_FILL if r_idx % 2 == 0 else None
+                fill  = ALT_FILL if r_idx % 2 == 0 else None
                 aus_p = prow.get("aus", {})
-                vals = ([prow.get("frame_idx", ""), round(prow.get("timestamp_s", 0), 3),
-                         _yn(bool(prow.get("success")))] +
-                        [round(aus_p.get(au, 0), 4) for au in AU_ORDER])
+                vals  = ([prow.get("frame_idx", ""),
+                          round(prow.get("timestamp_s", 0), 3),
+                          _yn(bool(prow.get("success")))] +
+                         [round(aus_p.get(au, 0), 4) for au in AU_ORDER if au in AU_META])
                 for c, v in enumerate(vals, 1):
-                    cell = ws_detail.cell(row=r_idx, column=c, value=v)
+                    cell = ws_raw.cell(row=r_idx, column=c, value=v)
                     cell.font = BODY_FONT; cell.alignment = CENTER
                     if fill: cell.fill = fill
 
-        # ── legend ─────────────────────────────────────────────────────────
-        leg_start = len(rows) + 3
-        title_cell = ws7.cell(row=leg_start, column=1, value="LEGEND")
-        title_cell.font      = LEG_TITLE
-        title_cell.fill      = LEG_FILL
-        title_cell.alignment = LEFT
-        ws7.merge_cells(start_row=leg_start, start_column=1,
-                        end_row=leg_start, end_column=4)
+            # ── legend ─────────────────────────────────────────────────────
+            leg_raw = len(postproc) + 3
+            tc = ws_raw.cell(row=leg_raw, column=1, value="LEGEND")
+            tc.font = LEG_TITLE; tc.fill = LEG_FILL; tc.alignment = LEFT
+            ws_raw.merge_cells(start_row=leg_raw, start_column=1,
+                               end_row=leg_raw,   end_column=n_raw_cols)
+            ws_raw.cell(row=leg_raw, column=1).value = (
+                "LEGEND  —  Raw per-frame OpenFace output at full video frame rate (~30 fps).  "
+                "AU values are OpenFace regression intensities (AU_r ÷ 5), normalised 0–1.  "
+                "Face Found = Yes only when OpenFace successfully tracked a face in that frame.  "
+                "For 1-fps session summaries with blendshape AUs, see the 'Facial Analysis' sheet."
+            )
+            for i, _au in enumerate((au for au in AU_ORDER if au in AU_META), leg_raw + 1):
+                _name, _desc = AU_META[_au]
+                k = ws_raw.cell(row=i, column=1, value=f"{_au}  {_name}")
+                k.font = LEG_KEY; k.alignment = LEFT
+                d = ws_raw.cell(row=i, column=2, value=_desc)
+                d.font = LEG_VAL; d.alignment = LEFT
+                ws_raw.merge_cells(start_row=i, start_column=2,
+                                   end_row=i,   end_column=n_raw_cols)
 
-        ws7.cell(row=leg_start, column=1).value = (
-            f"LEGEND  —  AU source: {au_source_label}.  "
-            "All AU values are normalised to 0–1 (0 = absent, 1 = maximum intensity).  "
-            "Post-hoc values come from OpenFace regression intensities (AU_r ÷ 5); "
-            "blendshape-derived values are approximate anatomical equivalents from MediaPipe.  "
-            "See 'AU Detail (post-hoc)' sheet for full per-frame OpenFace output when available."
-        )
-
-        for i, au in enumerate(AU_ORDER, leg_start + 1):
-            if au not in AU_META:
-                continue
-            facs_name, desc = AU_META[au]
-            k = ws7.cell(row=i, column=1, value=f"{au}  {facs_name}")
-            k.font      = LEG_KEY
-            k.alignment = LEFT
-            d = ws7.cell(row=i, column=2, value=desc)
-            d.font      = LEG_VAL
-            d.alignment = LEFT
-            ws7.merge_cells(start_row=i, start_column=2, end_row=i, end_column=4)
-
-        # auto-width: fixed cols narrow, AU cols fixed ~14
-        from openpyxl.utils import get_column_letter as gcl
-        ws7.column_dimensions[gcl(1)].width = 22   # Timestamp
-        ws7.column_dimensions[gcl(2)].width = 12   # Elapsed
-        ws7.column_dimensions[gcl(3)].width = 14   # Face Detected
-        ws7.column_dimensions[gcl(4)].width = 14   # Expression
-        for c in range(5, 5 + len(AU_ORDER)):
-            ws7.column_dimensions[gcl(c)].width = 28
+            # ── column widths ───────────────────────────────────────────────
+            from openpyxl.utils import get_column_letter as gcl
+            ws_raw.column_dimensions[gcl(1)].width = 8    # Frame
+            ws_raw.column_dimensions[gcl(2)].width = 10   # Time (s)
+            ws_raw.column_dimensions[gcl(3)].width = 12   # Face Found
+            for c in range(4, n_raw_cols + 1):
+                ws_raw.column_dimensions[gcl(c)].width = 22
 
         wb.save(path)
 

@@ -85,6 +85,123 @@ class CountdownArc(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Post-hoc waiting screen
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _SpinnerArc(QWidget):
+    """Rotating arc that spins indefinitely while OpenFace is processing."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._angle = 0          # current start angle of the arc head
+        self.setFixedSize(QSize(120, 120))
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(16)    # ~60 fps rotation
+
+    def _tick(self):
+        self._angle = (self._angle - 6) % 360   # rotate 6° per frame clockwise
+        self.update()
+
+    def stop(self):
+        self._timer.stop()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        thickness = 10
+        margin    = thickness + 4
+        rect = QRectF(margin, margin,
+                      self.width() - margin * 2, self.height() - margin * 2)
+        # Background ring
+        p.setPen(QPen(QColor(LINE_SOFT), thickness,
+                      Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawArc(rect, 0, 360 * 16)
+        # Spinning arc — 270° sweep so there is always a visible gap
+        p.setPen(QPen(QColor(ACCENT), thickness,
+                      Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawArc(rect, self._angle * 16, 270 * 16)
+
+
+class PosthocWaitingScreen(QWidget):
+    """
+    Full-window screen shown while OpenFace post-hoc analysis runs.
+    Automatically dismissed by main.py once the background thread finishes.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(f"background: {BG};")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.addStretch(2)
+
+        # Centre card
+        card = QFrame()
+        card.setObjectName("waitCard")
+        card.setStyleSheet(f"""
+            #waitCard {{
+                background: {PANEL};
+                border: 1px solid {LINE};
+                border-radius: 12px;
+            }}
+        """)
+        card.setFixedWidth(440)
+        card_l = QVBoxLayout(card)
+        card_l.setContentsMargins(48, 48, 48, 48)
+        card_l.setSpacing(20)
+        card_l.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # Spinner
+        self._spinner = _SpinnerArc()
+        card_l.addWidget(self._spinner, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        # Heading
+        heading = QLabel("Analysing session…")
+        heading.setFont(ui_font(16, QFont.Weight.Bold))
+        heading.setStyleSheet(f"color: {TEXT}; background: transparent;")
+        heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_l.addWidget(heading)
+
+        # Subtitle
+        sub = QLabel("OpenFace is processing the recording.\nThis usually takes 20–60 seconds.")
+        sub.setFont(ui_font(11))
+        sub.setStyleSheet(f"color: {TEXT_DIM}; background: transparent;")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_l.addWidget(sub)
+
+        # Elapsed time counter
+        self._elapsed_lbl = QLabel("0 s")
+        self._elapsed_lbl.setFont(mono_font(10))
+        self._elapsed_lbl.setStyleSheet(f"color: {TEXT_FAINT}; background: transparent;")
+        self._elapsed_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_l.addWidget(self._elapsed_lbl)
+
+        self._start_time = time.time()
+        self._tick_timer = QTimer(self)
+        self._tick_timer.timeout.connect(self._update_elapsed)
+        self._tick_timer.start(1000)
+
+        # Centre the card horizontally
+        h = QHBoxLayout()
+        h.addStretch()
+        h.addWidget(card)
+        h.addStretch()
+        root.addLayout(h)
+        root.addStretch(3)
+
+    def _update_elapsed(self):
+        secs = int(time.time() - self._start_time)
+        self._elapsed_lbl.setText(f"{secs} s")
+
+    def stop_spinner(self):
+        """Call before removing the screen so the timers are cleaned up."""
+        self._spinner.stop()
+        self._tick_timer.stop()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Calibration overlay (full-window)
 # ═══════════════════════════════════════════════════════════════════════════
 class CalibrationOverlay(QWidget):
