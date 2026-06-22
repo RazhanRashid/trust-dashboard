@@ -13,7 +13,7 @@ class TrustEngine:
         # alpha controls how quickly the score reacts to new data.
         # Think of it as a mixing knob:
         #   0.2 means each new reading gets 20% weight, and the recent history gets 80%.
-        # A smaller value makes the score change more slowly and smoothly.
+        # A smaller value makes the scoe change more slowly and smoothly.
         # A larger value makes it jump more quickly but also more erratically.
         self.alpha = 0.2
         # Stores the raw sensor values from the previous camera/audio frame.
