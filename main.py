@@ -293,6 +293,7 @@ class TrustDashboard(QMainWindow):
         """User clicked Start Calibration inside the overlay."""
         self._calibration_started_at = time.time()
         self._calibrating = True
+        self.trust.start_calibration()
         self._session_ended = False
 
     def _finish_calibration_now(self):
@@ -342,7 +343,13 @@ class TrustDashboard(QMainWindow):
             "voice_alpha_ratio":      self._mean_or(self._calibration_vocal["alpha_ratio"], None),
             "voice_jitter":           self._mean_or(self._calibration_vocal["jitter"], None),
         }
+        # Wire up per-user calibration: finalise the 30-s window, save the
+        # per-channel baseline, then hand it to the fresh live engine.
+        if self.trust._calibrating:
+            self.trust.finish_calibration()
+        _cal_baseline = self.trust.baseline.copy()
         self.trust = TrustEngine()
+        self.trust.baseline = _cal_baseline
         self._history = {k: [] for k in ("total", "facial", "vocal", "gaze", "hrv")}
         if self._calibration_pupil:
             self.workload.set_baseline(sum(self._calibration_pupil) / len(self._calibration_pupil))
