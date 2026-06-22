@@ -21,6 +21,13 @@ class TrustEngine:
         # — and tell the UI which signals caused the score to move.
         self._prev_inputs: dict = {}
 
+        # Per-user calibration — baseline[channel] = user's resting score (0–100).
+        # Defaults to 50 (uncalibrated). Call start_calibration() / finish_calibration()
+        # to populate from a live 30-second baseline window at session start.
+        self.baseline: dict[str, float] = {"facial": 50.0, "vocal": 50.0, "gaze": 50.0, "hrv": 50.0}
+        self._calibrating: bool = False
+        self._calib_scores: dict[str, list] = {"facial": [], "vocal": [], "gaze": [], "hrv": []}
+
     def update(self, face_data: dict | None, vocal_data: dict | None,
                hrv_score: int = 65) -> dict:
         # Ask each sub-scorer to convert raw sensor readings into a 0–100 number.
@@ -42,7 +49,19 @@ class TrustEngine:
             self.smoothed[k] = self.alpha * v + (1 - self.alpha) * self.smoothed[k]
 
         # Round all smoothed scores to whole numbers for cleaner display on screen.
-        scores = {k: round(v) for k, v in self.smoothed.items()}
+        # Collect calibration samples when in calibration window
+        if self._calibrating:
+            for ch in ("facial", "vocal", "gaze", "hrv"):
+                self._calib_scores[ch].append(self.smoothed[ch])
+
+        # Apply per-user baseline shift: user's natural resting state maps to 50
+        scores = {}
+        for k in self.smoothed:
+            if k == "total":
+                avg_shift = sum(50.0 - self.baseline.get(ch, 50.0) for ch in ("facial", "vocal", "gaze", "hrv")) / 4
+                scores[k] = round(max(0, min(100, self.smoothed[k] + avg_shift)))
+            else:
+                scores[k] = round(max(0, min(100, self.smoothed[k] + 50.0 - self.baseline.get(k, 50.0))))
 
         # Attach the "why did the score change?" explanation lists so the UI
         # can show tooltips like "brow furrow: −8 pts".
@@ -148,7 +167,7 @@ class TrustEngine:
         # snapping it there immediately. 98% weight on recent history, 2% nudge toward neutral.
         # This avoids a jarring score drop every time someone stops speaking mid-sentence.
         if not vd.get("is_speaking"):
-            return self.smoothed["vocal"] * 0.98 + 50.0 * 0.02, []
+            return self.smoothed["vocal"] * 0.98 + self.baseline.get("vocal", 50.0) * 0.02, []  # drift toward user's baseline when silent
 
         s = 50.0      # Neutral baseline — bonuses from pitch variation and speech energy push the score up
         contribs = [] # Will be filled with the top contributors this frame
@@ -271,6 +290,21 @@ class TrustEngine:
         # Return top-2 contributors and clamp to 0–100.
         contribs.sort(key=lambda x: abs(x[3]), reverse=True)
         return max(0.0, min(100.0, s)), contribs[:2]
+
+    # ─── Calibration API ─────────────────────────────────────────────────── #
+
+    def start_calibration(self) -> None:
+        """Begin collecting baseline samples. Called when the countdown starts."""
+        self._calibrating = True
+        self._calib_scores = {"facial": [], "vocal": [], "gaze": [], "hrv": []}
+
+    def finish_calibration(self) -> None:
+        """Average the calibration samples and store as this user's baseline."""
+        self._calibrating = False
+        for ch, samples in self._calib_scores.items():
+            if samples:
+                self.baseline[ch] = sum(samples) / len(samples)
+        self._calib_scores = {"facial": [], "vocal": [], "gaze": [], "hrv": []}
 
     @staticmethod
     def trust_label(score: int) -> dict:
