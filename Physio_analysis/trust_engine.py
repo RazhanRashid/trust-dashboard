@@ -16,7 +16,6 @@ class TrustEngine:
         # A smaller value makes the score change more slowly and smoothly.
         # A larger value makes it jump more quickly but also more erratically.
         self.alpha = 0.2
-
         # Stores the raw sensor values from the previous camera/audio frame.
         # This lets the engine detect *changes* — for example, "the brow just furrowed"
         # — and tell the UI which signals caused the score to move.
@@ -151,7 +150,7 @@ class TrustEngine:
         if not vd.get("is_speaking"):
             return self.smoothed["vocal"] * 0.98 + 50.0 * 0.02, []
 
-        s = 55.0      # Start slightly above neutral — an active speaking voice is already a positive signal
+        s = 50.0      # Neutral baseline — bonuses from pitch variation and speech energy push the score up
         contribs = [] # Will be filled with the top contributors this frame
 
         # Pitch stability: how consistent is the speaking pitch over time?
@@ -226,7 +225,7 @@ class TrustEngine:
         if not fd or not fd.get("detected"):
             return 50.0, []
 
-        s = 62.0      # Gaze starts above neutral — sustained eye contact is a positive trust signal
+        s = 50.0      # Neutral baseline — bonuses from sustained eye contact push the score up
         contribs = []
 
         # Eye Aspect Ratio (EAR): a number that measures how open the eyes are.
