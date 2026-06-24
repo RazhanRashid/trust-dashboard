@@ -38,7 +38,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QStackedWidget,
 # ── Analyzer modules (unchanged) ─────────────────────────────────────────────
 from Physio_analysis.face_analyzer    import FaceAnalyzer, BLENDSHAPE_AU_MAP
 from Physio_analysis.vocal_analyzer   import VocalAnalyzer
-from Physio_analysis.trust_engine     import TrustEngine
+from Physio_analysis.trust_engine     import TrustEngine, SCORE_CONFIG, SCORE_VERSION
 from Physio_analysis.workload_engine  import WorkloadEngine
 from Physio_analysis.hrv_analyzer     import HRVAnalyzer
 try:
@@ -52,6 +52,13 @@ from theme import (BG, BG_DEEP, PANEL, LINE, LINE_SOFT, TEXT, TEXT_FAINT, TEXT_G
                     ui_font, load_packaged_fonts)
 from panels import TopStrip, CameraPanel, ScorePanel, VoicePanel, HistoryChart, Footer
 from overlays import OverviewScreen, CalibrationOverlay, SessionSummary, PosthocWaitingScreen
+
+try:
+    import websockets
+    import asyncio as _asyncio
+    _HAS_WS = True
+except ImportError:
+    _HAS_WS = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -96,8 +103,17 @@ class TrustDashboard(QMainWindow):
         self._tlx_open = False
         self._session_rows: list = []
         self._session_start: float = 0.0
+        self._session_start_ns: int = 0
+        self._frame_capture_ns: int = 0   # Updated by camera loop; used for latency
         self._last_record_time: float = 0.0
         self._session_ended = False
+        self._event_log: list = []
+        self._raw_facial_rows: list = []
+        self._raw_vocal_rows:  list = []
+        self._ws_clients: set = set()
+        self._ws_loop = None
+        self._ws_queue = None
+        self._ws_enabled: bool = True
 
         # ── Calibration state ───────────────────────────────────────────────
         self._calibrating = False
@@ -358,8 +374,29 @@ class TrustDashboard(QMainWindow):
         self._best_thumb_frame = None
         self._best_thumb_conf = -1.0
         self._session_start = time.time()
+        self._session_start_ns = time.time_ns()
         self._session_rows = []
+        self._raw_facial_rows = []
+        self._raw_vocal_rows  = []
+        self._event_log = []
+        self.log_event("sync", "session_start")
+        self._show_sync_flash("SESSION START")
         self._start_recording()
+
+        # Write session start sidecar for WorldCam/external sync
+        _sidecar = self._recordings_dir / f"{self._session_id}_start.json"
+        try:
+            import json as _json
+            _sidecar.write_text(_json.dumps({
+                "session_id": self._session_id,
+                "start_ns": self._session_start_ns,
+                "start_wall": datetime.now().isoformat(),
+                "score_version": SCORE_VERSION,
+                "score_config": SCORE_CONFIG,
+                "active_channels": [ch for ch, a in self.trust._active.items() if a],
+            }, indent=2))
+        except Exception:
+            pass
 
         # Compute a baseline composure score from calibration samples, then
         # reset the engine so live scores start fresh from the neutral 50.
@@ -393,6 +430,7 @@ class TrustDashboard(QMainWindow):
             self.score_panel.gauge.setBaseline(self._baseline_total)
 
         self._show_live()
+        self._start_ws_server()
 
     def _end_session(self):
         if len(self._session_rows) < 2:
@@ -401,6 +439,8 @@ class TrustDashboard(QMainWindow):
                 "Not enough data yet — wait a few seconds before ending the session.",
             )
             return
+        self.log_event("sync", "session_end")
+        self._show_sync_flash("SESSION END")
         self._session_ended = True
         # Stop recording before computing stats so the writer is flushed
         rec_path, thumb_path = self._stop_recording()
@@ -1000,6 +1040,9 @@ class TrustDashboard(QMainWindow):
         while self._running:
             ok, frame = self._cap.read()
             if ok and frame is not None and frame.mean() > 1.0:
+                _cap_ns = time.time_ns()
+                with self._lock:
+                    self._frame_capture_ns = _cap_ns
                 frame = cv2.flip(frame, 1)
                 self._cam_ok = True
                 with self._lock:
@@ -1034,6 +1077,20 @@ class TrustDashboard(QMainWindow):
                 face_data = self.face.analyze(small)
                 with self._lock:
                     self._last_frame = (frame, face_data)
+                # Raw per-frame facial logging (native rate ~30 fps)
+                if self._session_start_ns and not self._session_ended:
+                    fd = face_data or {}
+                    self._raw_facial_rows.append({
+                        "master_ts_ns": time.time_ns(),
+                        "elapsed_s":    round(time.time() - self._session_start, 4),
+                        "detected":     bool(fd.get("detected")),
+                        "expression":   str(fd.get("dominant", "")),
+                        "eye_ar":       round(float(fd.get("eye_ar") or 0), 4),
+                        "blink_rate":   round(float(fd.get("blink_rate") or 0), 2),
+                        "gaze_dev":     round(float(fd.get("gaze_deviation") or 0), 4),
+                        "pupil_norm":   round(float(fd.get("pupil_norm") or 0), 4),
+                        "duchenne":     int(fd.get("duchenne", 0)),
+                    })
             time.sleep(0.033)
 
     # ════════════════════════════════════════════════════════════════════════
@@ -1057,6 +1114,19 @@ class TrustDashboard(QMainWindow):
                 self._audio_buffer = np.roll(self._audio_buffer, -n)
                 self._audio_buffer[-n:] = samples[:n]
             self._mic_ok = True
+            # Raw per-chunk vocal logging (native rate ~every 0.09s at 4096/44100)
+            if self._session_start_ns and not self._session_ended and result:
+                self._raw_vocal_rows.append({
+                    "master_ts_ns":    time.time_ns(),
+                    "elapsed_s":       round(time.time() - self._session_start, 4),
+                    "is_speaking":     bool(result.get("is_speaking")),
+                    "pitch_stability": round(float(result.get("pitch_stability") or 0.5), 4),
+                    "energy_level":    round(float(result.get("energy_level") or 0), 4),
+                    "tremor_index":    round(float(result.get("tremor_index") or 0), 4),
+                    "dominant_hz":     round(float(result.get("dominant_hz") or 0), 1),
+                    "hnr_db":          round(float(result.get("hnr_db") or 0), 2),
+                    "jitter":          round(float(result.get("jitter") or 0), 5),
+                })
 
         try:
             self._audio_stream = sd.InputStream(channels=1, blocksize=4096, callback=callback)
@@ -1111,6 +1181,26 @@ class TrustDashboard(QMainWindow):
         pupil_now = face_data.get("pupil_norm") if face_data else None
         wl_state  = self.workload.update(pupil_now)
         self._workload_state = wl_state
+
+        # Broadcast tick to live-stream subscribers (stub — passive only)
+        _last_ev = self._event_log[-1] if self._event_log else None
+        self._broadcast_tick({
+            "master_ts_ns": time.time_ns(),
+            "total":        scores.get("total", 50),
+            "channels": {
+                "facial": scores.get("facial", 50),
+                "vocal":  scores.get("vocal",  50),
+                "gaze":   scores.get("gaze",   50),
+                "hrv":    scores.get("hrv",    65),
+            },
+            "dtotal":       scores.get("dscores", {}).get("total", 0.0),
+            "dchannels": {
+                k: scores.get("dscores", {}).get(k, 0.0)
+                for k in ("facial", "vocal", "gaze", "hrv")
+            },
+            "active_channels": scores.get("active_channels", []),
+            "last_event": _last_ev,
+        })
 
         # Roll histories (skip the contributions metadata key)
         for k, v in scores.items():
@@ -1208,12 +1298,21 @@ class TrustDashboard(QMainWindow):
             # ── Timestamps ─────────────────────────────────────────────────
             "timestamp":      now.strftime("%Y-%m-%d %H:%M:%S"),
             "elapsed_s":      elapsed,
+            "master_ts_ns":   time.time_ns(),
             # ── Composure scores ────────────────────────────────────────────
             "total":          int(scores.get("total", 50)),
             "facial":         int(scores.get("facial", 50)),
             "vocal":          int(scores.get("vocal", 50)),
             "gaze":           int(scores.get("gaze", 50)),
             "hrv":            int(scores.get("hrv", 65)),
+            # ── Rate-of-change ─────────────────────────────────────────────
+            "dtotal":         scores.get("dscores", {}).get("total",  0.0),
+            "dfacial":        scores.get("dscores", {}).get("facial", 0.0),
+            "dvocal":         scores.get("dscores", {}).get("vocal",  0.0),
+            "dgaze":          scores.get("dscores", {}).get("gaze",   0.0),
+            "dhrv":           scores.get("dscores", {}).get("hrv",    0.0),
+            "active_channels": scores.get("active_channels", []),
+            "latency_ns":     (time.time_ns() - self._frame_capture_ns) if self._frame_capture_ns else 0,
             # ── Facial ──────────────────────────────────────────────────────
             "face_det":       bool(fd.get("detected")),
             "expression":     str(fd.get("dominant", "—")),
@@ -1295,6 +1394,9 @@ class TrustDashboard(QMainWindow):
             "avg_blink_rate":      avg("blink_rate"),
             "avg_gaze_deviation":  avg("gaze_dev"),
             "trust_history":       [r["total"] for r in rows],
+            "active_channels":     [ch for ch, active in self.trust._active.items() if active],
+            "score_version":       SCORE_VERSION,
+            "score_config":        SCORE_CONFIG,
         }
 
     # ════════════════════════════════════════════════════════════════════════
@@ -1321,6 +1423,9 @@ class TrustDashboard(QMainWindow):
             "trust_hrv":        stats.get("trust_hrv", 65),
             "recording_path":   stats.get("recording_path"),   # relative or None
             "thumbnail_path":   stats.get("thumbnail_path"),   # relative or None
+            "n_events":         len(self._event_log),
+            "score_version":    stats.get("score_version", ""),
+            "active_channels":  stats.get("active_channels", []),
         })
         try:
             with open(self._sessions_file, "w") as f:
@@ -1453,6 +1558,12 @@ class TrustDashboard(QMainWindow):
             ("PCPS",             "pcps",           None),
             ("WIV",              "wiv",            None),
             ("Spike Progress %", "spike_progress", None),
+            ("dTotal",           "dtotal",  None),
+            ("dFacial",          "dfacial", None),
+            ("dVocal",           "dvocal",  None),
+            ("dGaze",            "dgaze",   None),
+            ("dHRV",             "dhrv",    None),
+            ("Latency (ns)",     "latency_ns", None),
         ], legend=[
             ("Trust Total",      "Weighted composure index (0–100). "
                                  "35% Facial + 25% Vocal + 25% Gaze + 15% HRV, "
@@ -1932,6 +2043,120 @@ class TrustDashboard(QMainWindow):
                 ws_tl.column_dimensions[gcl(2 + i * 2)].width = 10
                 ws_tl.column_dimensions[gcl(3 + i * 2)].width = 10
 
+        # ═══════════════════════════════════════════════════════════════════════════
+        # Sheet — Raw Facial (~30 fps)
+        # ═══════════════════════════════════════════════════════════════════════════
+        if self._raw_facial_rows:
+            ws_rf = wb.create_sheet("Raw Facial")
+            rf_cols = [
+                ("Master TS (ns)", "master_ts_ns", None),
+                ("Elapsed (s)",    "elapsed_s",   None),
+                ("Detected",       "detected",    _yn),
+                ("Expression",     "expression",  None),
+                ("Eye AR",         "eye_ar",      None),
+                ("Blink /min",     "blink_rate",  None),
+                ("Gaze Dev",       "gaze_dev",    None),
+                ("Pupil (norm)",   "pupil_norm",  None),
+                ("Duchenne",       "duchenne",    None),
+            ]
+            for c, (hdr, _, _f) in enumerate(rf_cols, 1):
+                cell = ws_rf.cell(row=1, column=c, value=hdr)
+                cell.font = HDR_FONT; cell.fill = HDR_FILL
+                cell.alignment = CENTER; cell.border = BORDER
+            ws_rf.freeze_panes = "A2"
+            for r_idx, rrow in enumerate(self._raw_facial_rows, 2):
+                fill = ALT_FILL if r_idx % 2 == 0 else None
+                for c, (_, key, fmt) in enumerate(rf_cols, 1):
+                    raw = rrow.get(key, "")
+                    val = fmt(raw) if fmt else raw
+                    cell = ws_rf.cell(row=r_idx, column=c, value=val)
+                    cell.font = BODY_FONT; cell.alignment = CENTER
+                    if fill: cell.fill = fill
+            _auto_width(ws_rf)
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # Sheet — Raw Vocal (per audio chunk)
+        # ═══════════════════════════════════════════════════════════════════════════
+        if self._raw_vocal_rows:
+            ws_rv = wb.create_sheet("Raw Vocal")
+            rv_cols = [
+                ("Master TS (ns)",   "master_ts_ns",    None),
+                ("Elapsed (s)",      "elapsed_s",       None),
+                ("Speaking",         "is_speaking",     _yn),
+                ("Pitch Stability",  "pitch_stability", None),
+                ("Energy Level",     "energy_level",    None),
+                ("Tremor Index",     "tremor_index",    None),
+                ("Vocal Hz",         "dominant_hz",     None),
+                ("HNR (dB)",         "hnr_db",          None),
+                ("Jitter",           "jitter",          None),
+            ]
+            for c, (hdr, _, _f) in enumerate(rv_cols, 1):
+                cell = ws_rv.cell(row=1, column=c, value=hdr)
+                cell.font = HDR_FONT; cell.fill = HDR_FILL
+                cell.alignment = CENTER; cell.border = BORDER
+            ws_rv.freeze_panes = "A2"
+            for r_idx, rrow in enumerate(self._raw_vocal_rows, 2):
+                fill = ALT_FILL if r_idx % 2 == 0 else None
+                for c, (_, key, fmt) in enumerate(rv_cols, 1):
+                    raw = rrow.get(key, "")
+                    val = fmt(raw) if fmt else raw
+                    cell = ws_rv.cell(row=r_idx, column=c, value=val)
+                    cell.font = BODY_FONT; cell.alignment = CENTER
+                    if fill: cell.fill = fill
+            _auto_width(ws_rv)
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # Sheet — Score Config
+        # ═══════════════════════════════════════════════════════════════════════════
+        ws_cfg = wb.create_sheet("Score Config")
+        cfg_rows = []
+        def _flatten_cfg(d, prefix=""):
+            for k, v in d.items():
+                full_key = f"{prefix}{k}" if not prefix else f"{prefix}.{k}"
+                if isinstance(v, dict):
+                    _flatten_cfg(v, full_key)
+                else:
+                    cfg_rows.append((full_key, str(v)))
+        _flatten_cfg(SCORE_CONFIG)
+        for c, hdr in enumerate(["Parameter", "Value"], 1):
+            cell = ws_cfg.cell(row=1, column=c, value=hdr)
+            cell.font = HDR_FONT; cell.fill = HDR_FILL
+            cell.alignment = CENTER; cell.border = BORDER
+        ws_cfg.freeze_panes = "A2"
+        for r_idx, (k, v) in enumerate(cfg_rows, 2):
+            fill = ALT_FILL if r_idx % 2 == 0 else None
+            for c, val in enumerate([k, v], 1):
+                cell = ws_cfg.cell(row=r_idx, column=c, value=val)
+                cell.font = BODY_FONT; cell.alignment = CENTER
+                if fill: cell.fill = fill
+        _auto_width(ws_cfg)
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # Sheet — Events
+        # ═══════════════════════════════════════════════════════════════════════════
+        ws_ev = wb.create_sheet("Events")
+        ev_cols = [
+            ("Master TS (ns)",  "master_ts_ns",  None),
+            ("Elapsed (s)",     "elapsed_s",     None),
+            ("Kind",            "kind",          None),
+            ("Label",           "label",         None),
+            ("Wall Clock",      "wall_clock",    None),
+        ]
+        for c, (hdr, _, _f) in enumerate(ev_cols, 1):
+            cell = ws_ev.cell(row=1, column=c, value=hdr)
+            cell.font = HDR_FONT; cell.fill = HDR_FILL
+            cell.alignment = CENTER; cell.border = BORDER
+        ws_ev.freeze_panes = "A2"
+        for r_idx, ev in enumerate(self._event_log, 2):
+            fill = ALT_FILL if r_idx % 2 == 0 else None
+            for c, (_, key, fmt) in enumerate(ev_cols, 1):
+                raw = ev.get(key, "")
+                val = fmt(raw) if fmt else raw
+                cell = ws_ev.cell(row=r_idx, column=c, value=val)
+                cell.font = BODY_FONT; cell.alignment = CENTER
+                if fill: cell.fill = fill
+        _auto_width(ws_ev)
+
         wb.save(path)
 
     # ════════════════════════════════════════════════════════════════════════
@@ -1955,6 +2180,106 @@ class TrustDashboard(QMainWindow):
         if result is not None:
             print(f"[TLX] weighted={result['weighted_tlx']:.1f}  "
                   f"raw={result['raw_tlx']:.1f}", flush=True)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Event logging + sync flash
+    # ════════════════════════════════════════════════════════════════════════
+    def log_event(self, kind: str, label: str):
+        """Log a timestamped event. kind ∈ {'sync', 'breach', 'control', 'manual'}."""
+        if not self._session_start_ns:
+            return
+        entry = {
+            "master_ts_ns": time.time_ns(),
+            "elapsed_s":    round(time.time() - self._session_start, 3),
+            "kind":         kind,
+            "label":        label,
+            "wall_clock":   datetime.now().isoformat(),
+        }
+        self._event_log.append(entry)
+        print(f"[event] {kind}/{label}  elapsed={entry['elapsed_s']}s", flush=True)
+
+    def _show_sync_flash(self, text: str):
+        """Show a brief on-screen sync marker for WorldCam alignment."""
+        from PyQt6.QtWidgets import QLabel
+        from PyQt6.QtCore import Qt
+        flash = QLabel(f"⬤ SYNC: {text}", self)
+        flash.setStyleSheet(
+            "background: #facc15; color: #000; font-size: 18px; font-weight: bold;"
+            "padding: 8px 18px; border-radius: 6px;"
+        )
+        flash.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        flash.adjustSize()
+        # Position top-centre
+        flash.move((self.width() - flash.width()) // 2, 18)
+        flash.raise_()
+        flash.show()
+        QTimer.singleShot(1500, flash.deleteLater)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        # Only fire hotkeys during a live session
+        if self._session_start_ns and not self._session_ended:
+            if key == Qt.Key.Key_B:
+                self.log_event("breach", "manual_breach")
+                self._show_sync_flash("BREACH")
+            elif key == Qt.Key.Key_C:
+                self.log_event("control", "manual_control")
+                self._show_sync_flash("CONTROL")
+            elif key == Qt.Key.Key_M:
+                self.log_event("manual", "manual_marker")
+                self._show_sync_flash("MARKER")
+        super().keyPressEvent(event)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # WebSocket live stream (stub)
+    # ════════════════════════════════════════════════════════════════════════
+    def _start_ws_server(self):
+        if not _HAS_WS or not self._ws_enabled:
+            return
+        import asyncio
+
+        async def _handler(ws):
+            self._ws_clients.add(ws)
+            try:
+                await ws.wait_closed()
+            finally:
+                self._ws_clients.discard(ws)
+
+        async def _broadcaster():
+            while True:
+                payload = await self._ws_queue.get()
+                dead = set()
+                for ws in list(self._ws_clients):
+                    try:
+                        await ws.send(payload)
+                    except Exception:
+                        dead.add(ws)
+                self._ws_clients -= dead
+
+        async def _run():
+            self._ws_queue = asyncio.Queue()
+            server = await websockets.serve(_handler, "127.0.0.1", 8765)
+            asyncio.create_task(_broadcaster())
+            print("[ws] Live stream on ws://127.0.0.1:8765", flush=True)
+            await server.wait_closed()
+
+        def _thread():
+            loop = asyncio.new_event_loop()
+            self._ws_loop = loop
+            loop.run_until_complete(_run())
+
+        threading.Thread(target=_thread, daemon=True).start()
+
+    def _broadcast_tick(self, payload_dict: dict):
+        if not _HAS_WS or self._ws_loop is None or self._ws_queue is None:
+            return
+        if not self._ws_clients:
+            return
+        try:
+            msg = json.dumps(payload_dict)
+            self._ws_loop.call_soon_threadsafe(self._ws_queue.put_nowait, msg)
+        except Exception:
+            pass
 
     # ════════════════════════════════════════════════════════════════════════
     # Window lifecycle

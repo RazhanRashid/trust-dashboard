@@ -1,3 +1,33 @@
+SCORE_VERSION = "1.1.0"
+
+SCORE_CONFIG = {
+    "version":           SCORE_VERSION,
+    "alpha":             0.2,
+    "channels":          ["facial", "vocal", "gaze", "hrv"],
+    "channel_active":    {"facial": True, "vocal": True, "gaze": True, "hrv": False},
+    "emotion_weights":   {
+        "happy": 30, "neutral": 10, "surprised": 4,
+        "fearful": -30, "angry": -35, "disgusted": -30,
+        "sad": -18, "contempt": -40,
+    },
+    "duchenne_weight":   20,
+    "au_weights":        {"AU04": -12, "AU20": -10, "AU14": -8},
+    "au_interaction_pen": 15,
+    "pitch_stab_scale":  38,
+    "tremor_weight":     32,
+    "alpha_ratio_center": -10.0,
+    "alpha_ratio_scale":  0.2,
+    "alpha_ratio_clamp":  [-4.0, 3.0],
+    "sf_baseline":        0.005,
+    "sf_scale":           200.0,
+    "sf_clamp":           [-5.0, 1.0],
+    "ear_thresholds":    [0.14, 0.20, 0.28],
+    "ear_pts":           [-28, -12, 10],
+    "blink_thresholds":  [32, 23, 20, 10],
+    "blink_pts":         [-22, -10, 8],
+    "gaze_dev_weight":   18,
+}
+
 # TrustEngine is the "brain" of the dashboard.
 # It takes live readings from the face camera, microphone, and heart-rate sensor
 # and combines them into a single trust score between 0 and 100.
@@ -15,7 +45,8 @@ class TrustEngine:
         #   0.2 means each new reading gets 20% weight, and the recent history gets 80%.
         # A smaller value makes the score change more slowly and smoothly.
         # A larger value makes it jump more quickly but also more erratically.
-        self.alpha = 0.2
+        self.alpha = SCORE_CONFIG["alpha"]
+        self._active: dict[str, bool] = dict(SCORE_CONFIG["channel_active"])
         # Stores the raw sensor values from the previous camera/audio frame.
         # This lets the engine detect *changes* — for example, "the brow just furrowed"
         # — and tell the UI which signals caused the score to move.
@@ -27,6 +58,7 @@ class TrustEngine:
         self.baseline: dict[str, float] = {"facial": 50.0, "vocal": 50.0, "gaze": 50.0, "hrv": 50.0}
         self._calibrating: bool = False
         self._calib_scores: dict[str, list] = {"facial": [], "vocal": [], "gaze": [], "hrv": []}
+        self._prev_smoothed: dict[str, float] = {k: 50.0 for k in ("total", "facial", "vocal", "gaze", "hrv")}
 
     def update(self, face_data: dict | None, vocal_data: dict | None,
                hrv_score: int = 65) -> dict:
@@ -38,8 +70,14 @@ class TrustEngine:
         gaze,   gaze_contribs   = self._gaze_score(face_data)     # Score from eye movement and blinking
         hrv    = float(hrv_score) if hrv_score is not None else 65.0  # Heart-rate variability score (fixed placeholder for now)
 
-        # Combine the four channel scores using equal 25% weights across all channels.
-        total  = facial * 0.25 + vocal * 0.25 + gaze * 0.25 + hrv * 0.25
+        # Combine channel scores using only active channels (equal weights among active).
+        _raw = {"facial": facial, "vocal": vocal, "gaze": gaze, "hrv": hrv}
+        _active_chs = [ch for ch in ("facial", "vocal", "gaze", "hrv") if self._active.get(ch)]
+        if _active_chs:
+            _w = 1.0 / len(_active_chs)
+            total = sum(_raw[ch] * _w for ch in _active_chs)
+        else:
+            total = 50.0
 
         # Apply exponential smoothing to every channel so scores drift gradually
         # rather than snapping to a new value instantly.
@@ -58,7 +96,8 @@ class TrustEngine:
         scores = {}
         for k in self.smoothed:
             if k == "total":
-                avg_shift = sum(50.0 - self.baseline.get(ch, 50.0) for ch in ("facial", "vocal", "gaze", "hrv")) / 4
+                _shift_chs = _active_chs if _active_chs else ["facial", "vocal", "gaze", "hrv"]
+                avg_shift = sum(50.0 - self.baseline.get(ch, 50.0) for ch in _shift_chs) / len(_shift_chs)
                 scores[k] = round(max(0, min(100, self.smoothed[k] + avg_shift)))
             else:
                 scores[k] = round(max(0, min(100, self.smoothed[k] + 50.0 - self.baseline.get(k, 50.0))))
@@ -70,6 +109,16 @@ class TrustEngine:
             "vocal":  vocal_contribs,
             "gaze":   gaze_contribs,
         }
+
+        # Rate-of-change derivatives
+        dscores = {k: round(self.smoothed[k] - self._prev_smoothed[k], 3)
+                   for k in ("total", "facial", "vocal", "gaze", "hrv")}
+        self._prev_smoothed = dict(self.smoothed)
+        scores["dscores"] = dscores
+
+        # Active channels
+        scores["active_channels"] = list(_active_chs)
+
         return scores   # Hand the complete score dictionary back to whoever called update()
 
     def _facial_score(self, fd: dict | None):
