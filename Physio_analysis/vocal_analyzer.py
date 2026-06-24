@@ -29,7 +29,7 @@ class VocalAnalyzer:
     _F0_BASE_HZ = 27.5    # eGeMAPSv02 stores F0 as semitones above 27.5 Hz (A0); convert back with 27.5 × 2^(s/12)
 
     def __init__(self):
-        self.SPEAK_THRESH = 0.018            # RMS energy below this is treated as silence; same threshold as original
+        self.SPEAK_THRESH = 0.008            # RMS energy below this is treated as silence; lowered to catch quiet speech
         self.pitch_hist:  list[float] = []   # Rolling 60-entry buffer of per-chunk median F0 values used to compute pitch stability
         self.energy_hist: list[float] = []   # Rolling 60-entry buffer of per-chunk RMS values used by the legacy tremor calculation
 
