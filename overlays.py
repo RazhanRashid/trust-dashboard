@@ -732,9 +732,17 @@ class SessionSummary(QWidget):
         self._avg_line = None
         self._markers = None
         self._dot_labels = []
+        self._phase_regions = []
 
         self._chart.setStyleSheet("border: none;")
         chart_l.addWidget(self._chart)
+
+        self._phase_legend_holder = QWidget()
+        self._phase_legend_holder.setStyleSheet("background: transparent;")
+        self._phase_legend_l = QHBoxLayout(self._phase_legend_holder)
+        self._phase_legend_l.setContentsMargins(0, 6, 0, 0)
+        self._phase_legend_l.setSpacing(14)
+        chart_l.addWidget(self._phase_legend_holder)
         v.addWidget(chart_card)
 
         # Notable events card
@@ -886,6 +894,33 @@ class SessionSummary(QWidget):
             self._chart.addItem(low_lbl)
             self._dot_labels.append(low_lbl)
 
+            # Phase bands — translucent regions marking researcher-defined
+            # phases (e.g. Trust Establishment / Violation / Recovery).
+            # Session rows are captured at ~1 sample/sec, so start_s/end_s
+            # line up directly with the sample-index x-axis used above.
+            for region in self._phase_regions:
+                self._chart.removeItem(region)
+            self._phase_regions = []
+            segments = stats.get("phase_segments", [])
+            right_edge = len(hist) - 1
+            for seg in segments:
+                start = seg["start_s"]
+                end = seg["end_s"] if seg["end_s"] is not None else max(right_edge, start)
+                if end <= start:
+                    end = start + 0.01
+                region = pg.LinearRegionItem(values=(start, end), movable=False)
+                cc = QColor(seg["color"])
+                region.setBrush(pg.mkBrush(cc.red(), cc.green(), cc.blue(), 28))
+                for line in region.lines:
+                    line.setPen(pg.mkPen(seg["color"], width=1))
+                region.setZValue(-8)
+                self._chart.addItem(region)
+                self._phase_regions.append(region)
+
+            self._render_phase_legend(segments)
+        else:
+            self._render_phase_legend([])
+
         self._render_flags(stats.get("flags", []))
 
         # ── Thumbnail ──────────────────────────────────────────────────────
@@ -933,6 +968,36 @@ class SessionSummary(QWidget):
             )
         else:
             self._del_btn.hide()
+
+    def _render_phase_legend(self, segments):
+        while self._phase_legend_l.count():
+            item = self._phase_legend_l.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        seen = {}
+        for seg in segments:
+            seen.setdefault(seg["key"], (seg["label"], seg["color"]))
+        if not seen:
+            self._phase_legend_holder.hide()
+            return
+        for label, color in seen.values():
+            dot = QLabel("●")
+            dot.setFont(ui_font(9))
+            dot.setStyleSheet(f"color: {color}; background: transparent;")
+            text = QLabel(label)
+            text.setFont(ui_font(8))
+            text.setStyleSheet(f"color: {TEXT_FAINT}; background: transparent;")
+            pair = QWidget()
+            pair.setStyleSheet("background: transparent;")
+            pair_l = QHBoxLayout(pair)
+            pair_l.setContentsMargins(0, 0, 0, 0)
+            pair_l.setSpacing(5)
+            pair_l.addWidget(dot)
+            pair_l.addWidget(text)
+            self._phase_legend_l.addWidget(pair)
+        self._phase_legend_l.addStretch()
+        self._phase_legend_holder.show()
 
     def _render_flags(self, flags):
         from collections import Counter

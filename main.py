@@ -1490,6 +1490,7 @@ class TrustDashboard(QMainWindow):
             "avg_blink_rate":      avg("blink_rate"),
             "avg_gaze_deviation":  avg("gaze_dev"),
             "trust_history":       [r["total"] for r in rows],
+            "phase_segments":      list(self._phase_segments),
             "active_channels":     [ch for ch, active in self.trust._active.items() if active],
             "score_version":       SCORE_VERSION,
             "score_config":        SCORE_CONFIG,
