@@ -49,6 +49,7 @@ except Exception:
 
 # ── UI modules ───────────────────────────────────────────────────────────────
 from theme import (BG, BG_DEEP, PANEL, LINE, LINE_SOFT, TEXT, TEXT_FAINT, TEXT_GHOST,
+                    ACCENT, DANGER, C_WORKLOAD,
                     ui_font, load_packaged_fonts, trust_band)
 from panels import TopStrip, CameraPanel, ScorePanel, VoicePanel, HistoryChart, Footer, FlagSidebar
 from overlays import OverviewScreen, CalibrationOverlay, SessionSummary, PosthocWaitingScreen
@@ -99,6 +100,7 @@ class TrustDashboard(QMainWindow):
 
         # ── Session / history state ─────────────────────────────────────────
         self._history = {k: [] for k in ("total", "facial", "vocal", "gaze", "hrv")}
+        self._history_t: list[float] = []   # elapsed-session seconds, parallel to self._history
         self._workload_state: dict = {}
         self._tlx_open = False
         self._session_rows: list = []
@@ -137,6 +139,18 @@ class TrustDashboard(QMainWindow):
         self._cal_frames_total = 0
         self._cal_frames_face  = 0
         self._baseline_coverage = None
+
+        # ── Phase tracking (researcher-marked trust-protocol phases) ─────────
+        # Researcher marks each transition manually (hotkeys 1/2/3 or the
+        # TopStrip button) — the system never infers phase changes from the
+        # score. Order is enforced: Establishment → Violation → Recovery.
+        self._phase_defs = [
+            ("establishment", "Trust Establishment", ACCENT),
+            ("violation",      "Trust Violation",     DANGER),
+            ("recovery",        "Trust Recovery",      C_WORKLOAD),
+        ]
+        self._phase_index = -1                  # -1 = no phase marked yet this session
+        self._phase_segments: list[dict] = []    # [{key,label,color,start_s,end_s}], end_s=None while ongoing
 
         # ── Camera bookkeeping ──────────────────────────────────────────────
         self._available_cameras: list[int] = []
@@ -214,6 +228,7 @@ class TrustDashboard(QMainWindow):
         # Top strip
         self.top = TopStrip()
         self.top.end_session_clicked.connect(self._end_session)
+        self.top.phase_advance_clicked.connect(self._on_phase_button_clicked)
         rl.addWidget(self.top)
 
         # Stage — padded content area
@@ -386,6 +401,10 @@ class TrustDashboard(QMainWindow):
         self.trust = TrustEngine()
         self.trust.baseline = _cal_baseline
         self._history = {k: [] for k in ("total", "facial", "vocal", "gaze", "hrv")}
+        self._history_t = []
+        self._phase_index = -1
+        self._phase_segments = []
+        self.top.reset_phase()
         if self._calibration_pupil:
             self.workload.set_baseline(sum(self._calibration_pupil) / len(self._calibration_pupil))
         self._calibrating = False
@@ -522,11 +541,14 @@ class TrustDashboard(QMainWindow):
         self._session_ended = False
         self._session_rows = []
         self._history = {k: [] for k in ("total", "facial", "vocal", "gaze", "hrv")}
+        self._history_t = []
         self.flag_sidebar.clear_flags()
         self._flag_cooldowns = {}
         self._last_flag_total = None
         self._session_flags = []
         self.score_panel.hide_baseline_quality()
+        self._phase_index = -1
+        self._phase_segments = []
         self._show_overview()
 
     # ════════════════════════════════════════════════════════════════════════
@@ -1245,6 +1267,7 @@ class TrustDashboard(QMainWindow):
             if k not in self._history:
                 continue
             self._history[k].append(v)
+        self._history_t.append(time.time() - self._session_start if self._session_start else 0.0)
 
         # Record one row per second
         now = time.time()
@@ -1283,8 +1306,10 @@ class TrustDashboard(QMainWindow):
         self.voice_panel.set_spectrum(spec)
 
         # History chart — full session history (chart manages its own window)
-        h = {k: self._history[k] for k in ("total", "facial", "vocal", "gaze")}
-        self.history_chart.update_traces(h)
+        h  = {k: self._history[k] for k in ("total", "facial", "vocal", "gaze")}
+        ts = self._history_t
+        self.history_chart.update_traces(h, ts)
+        self.history_chart.set_phases(self._phase_segments)
 
         # Workload glow on top strip
         if wl_state:
@@ -1367,6 +1392,9 @@ class TrustDashboard(QMainWindow):
             "timestamp":      now.strftime("%Y-%m-%d %H:%M:%S"),
             "elapsed_s":      elapsed,
             "master_ts_ns":   time.time_ns(),
+            # ── Phase (researcher-marked; see TopStrip / hotkeys 1-2-3) ─────
+            "phase":          (self._phase_defs[self._phase_index][1]
+                                if self._phase_index >= 0 else "Unmarked"),
             # ── Composure scores ────────────────────────────────────────────
             "total":          int(scores.get("total", 50)),
             "facial":         int(scores.get("facial", 50)),
@@ -1606,6 +1634,7 @@ class TrustDashboard(QMainWindow):
         _write_sheet(ws1, [
             ("Timestamp",        "timestamp",      None),
             ("Elapsed (s)",      "elapsed_s",      None),
+            ("Phase",            "phase",          None),
             ("Trust Total",      "total",          None),
             ("Facial",           "facial",         None),
             ("Vocal",            "vocal",          None),
@@ -1634,6 +1663,10 @@ class TrustDashboard(QMainWindow):
             ("dHRV",             "dhrv",    None),
             ("Latency (ns)",     "latency_ns", None),
         ], legend=[
+            ("Phase",             "Researcher-marked experiment phase in effect when this row was "
+                                  "captured: Trust Establishment / Trust Violation / Trust Recovery, "
+                                  "or 'Unmarked' before the researcher marks the first phase. "
+                                  "Marked live via hotkeys 1/2/3 or the TopStrip button — never inferred."),
             ("Trust Total",      "Weighted composure index (0–100). "
                                  "35% Facial + 25% Vocal + 25% Gaze + 15% HRV, "
                                  "smoothed with α=0.20 exponential moving average."),
@@ -1676,6 +1709,7 @@ class TrustDashboard(QMainWindow):
         FACIAL_FIXED = [
             ("Timestamp",        "timestamp",    None),
             ("Elapsed (s)",      "elapsed_s",    None),
+            ("Phase",            "phase",        None),
             ("Facial Score",     "facial",       None),
             ("Face Detected",    "face_det",     _yn),
             ("Expression",       "expression",   None),
@@ -1802,6 +1836,7 @@ class TrustDashboard(QMainWindow):
         _write_sheet(ws3, [
             ("Timestamp",          "timestamp",      None),
             ("Elapsed (s)",        "elapsed_s",      None),
+            ("Phase",              "phase",          None),
             ("Vocal Score",        "vocal",          None),
             ("Speaking",           "speaking",       _yn),
             ("Pitch Stability %",  "pitch_stab",     None),
@@ -1860,6 +1895,7 @@ class TrustDashboard(QMainWindow):
         _write_sheet(ws4, [
             ("Timestamp",          "timestamp", None),
             ("Elapsed (s)",        "elapsed_s", None),
+            ("Phase",              "phase",     None),
             ("Gaze Score",         "gaze",      None),
             ("Gaze Deviation %",   "gaze_dev",  None),
             ("Pupil (norm.)",      "pupil_norm",None),
@@ -1880,6 +1916,7 @@ class TrustDashboard(QMainWindow):
         _write_sheet(ws5, [
             ("Timestamp",          "timestamp",      None),
             ("Elapsed (s)",        "elapsed_s",      None),
+            ("Phase",              "phase",          None),
             ("High Workload",      "high_workload",  _yn),
             ("PCPS",               "pcps",           None),
             ("WIV",                "wiv",            None),
@@ -1903,6 +1940,7 @@ class TrustDashboard(QMainWindow):
         _write_sheet(ws6, [
             ("Timestamp",          "timestamp", None),
             ("Elapsed (s)",        "elapsed_s", None),
+            ("Phase",              "phase",     None),
             ("HRV Score",          "hrv",       None),
         ], legend=[
             ("HRV Score",          "Heart-rate variability composure sub-score (0–100). "
@@ -2267,13 +2305,52 @@ class TrustDashboard(QMainWindow):
         self._event_log.append(entry)
         print(f"[event] {kind}/{label}  elapsed={entry['elapsed_s']}s", flush=True)
 
-    def _show_sync_flash(self, text: str):
-        """Show a brief on-screen sync marker for WorldCam alignment."""
+    # ════════════════════════════════════════════════════════════════════════
+    # Phase tracking (researcher-marked, not inferred from the score)
+    # ════════════════════════════════════════════════════════════════════════
+    def _on_phase_button_clicked(self):
+        """TopStrip 'Mark: <next phase>' button — advance to the next phase."""
+        if self._phase_index + 1 < len(self._phase_defs):
+            self._advance_phase(self._phase_index + 1)
+
+    def _advance_phase(self, target_index: int):
+        """Mark the start of a phase. Enforced sequential order: target_index
+        must be exactly one past the current phase (so the researcher can't
+        skip Violation, or re-mark Establishment after Recovery has begun)."""
+        if not self._session_start_ns or self._session_ended:
+            return
+        if target_index != self._phase_index + 1:
+            if target_index <= self._phase_index:
+                label = self._phase_defs[target_index][1]
+                self._show_sync_flash(f"{label.upper()} ALREADY MARKED", color="#8a91a1", prefix="◆ ")
+            else:
+                next_label = self._phase_defs[self._phase_index + 1][1]
+                self._show_sync_flash(f"MARK {next_label.upper()} FIRST", color=DANGER, prefix="◆ ")
+            return
+
+        key, label, color = self._phase_defs[target_index]
+        now_elapsed = round(time.time() - self._session_start, 3)
+        if self._phase_segments:
+            self._phase_segments[-1]["end_s"] = now_elapsed
+        self._phase_segments.append({
+            "key": key, "label": label, "color": color,
+            "start_s": now_elapsed, "end_s": None,
+        })
+        self._phase_index = target_index
+        self.log_event("phase", f"{key}_start")
+        self._show_sync_flash(label.upper(), color=color, prefix="◆ PHASE: ")
+        self.top.set_phase(label, color, target_index, len(self._phase_defs))
+
+    def _show_sync_flash(self, text: str, color: str = "#facc15", prefix: str = "⬤ SYNC: "):
+        """Show a brief on-screen marker flash. Used for WorldCam sync markers
+        (default yellow) and, with a custom color/prefix, for phase-transition
+        feedback."""
         from PyQt6.QtWidgets import QLabel
         from PyQt6.QtCore import Qt
-        flash = QLabel(f"⬤ SYNC: {text}", self)
+        text_color = "#000" if color == "#facc15" else "#fff"
+        flash = QLabel(f"{prefix}{text}", self)
         flash.setStyleSheet(
-            "background: #facc15; color: #000; font-size: 18px; font-weight: bold;"
+            f"background: {color}; color: {text_color}; font-size: 18px; font-weight: bold;"
             "padding: 8px 18px; border-radius: 6px;"
         )
         flash.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2297,6 +2374,12 @@ class TrustDashboard(QMainWindow):
             elif key == Qt.Key.Key_M:
                 self.log_event("manual", "manual_marker")
                 self._show_sync_flash("MARKER")
+            elif key == Qt.Key.Key_1:
+                self._advance_phase(0)   # Mark: Trust Establishment
+            elif key == Qt.Key.Key_2:
+                self._advance_phase(1)   # Mark: Trust Violation
+            elif key == Qt.Key.Key_3:
+                self._advance_phase(2)   # Mark: Trust Recovery
         super().keyPressEvent(event)
 
     # ════════════════════════════════════════════════════════════════════════
