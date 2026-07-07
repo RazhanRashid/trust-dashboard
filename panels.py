@@ -801,6 +801,19 @@ class HistoryChart(QFrame):
         self._curve_gaze = self._plot.plot([], [],
             pen=pg.mkPen(C_GAZE,   width=1.4, dash=[8, 3]))
 
+        # Session history is unbounded and setData() is called every 60ms
+        # with the full array. Without clipping/downsampling, per-tick
+        # render cost grows with session length (~120k pts/curve over a
+        # 2h session) and the UI progressively lags. clipToView restricts
+        # rendering to whatever x-range is currently visible; downsampling
+        # then reduces that visible slice to ~1 point/pixel. 'peak' mode
+        # keeps min/max per pixel column so sharp trust drops/spikes still
+        # show up instead of being smoothed away.
+        for _curve in (self._curve_total, self._curve_facial,
+                       self._curve_vocal, self._curve_gaze):
+            _curve.setClipToView(True)
+            _curve.setDownsampling(auto=True, method="peak")
+
         # Detect when user pans away from live edge
         self._plot.getPlotItem().getViewBox().sigXRangeChanged.connect(self._on_x_range_changed)
         self._ignore_range_signal = False
@@ -865,7 +878,7 @@ class HistoryChart(QFrame):
             return
         n = len(history["total"])
         if timestamps and len(timestamps) == n:
-            xs = list(timestamps)
+            xs = timestamps   # read-only here; avoid an O(n) copy every tick
         else:
             xs = [i * self._TICK_S for i in range(n)]
         self._full_xs = xs
