@@ -30,7 +30,10 @@ from widgets import (GaugeWidget, BarTrack, ChannelBar, StatusDot,
 # Top strip — header
 # ═══════════════════════════════════════════════════════════════════════════
 class TopStrip(QFrame):
-    end_session_clicked = pyqtSignal()
+    end_session_clicked   = pyqtSignal()
+    phase_advance_clicked = pyqtSignal()
+
+    _PHASE_NAMES = ["Trust Establishment", "Trust Violation", "Trust Recovery"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -106,6 +109,42 @@ class TopStrip(QFrame):
         h.addLayout(meta_wrap)
         h.addStretch()
 
+        # Phase indicator + advance control (researcher marks phases manually)
+        self._phase_dot = QFrame()
+        self._phase_dot.setFixedSize(QSize(8, 8))
+        self._phase_dot.setStyleSheet(f"background: {TEXT_GHOST}; border-radius: 4px;")
+        self._phase_label = QLabel("NO PHASE")
+        self._phase_label.setFont(ui_font(9, QFont.Weight.Bold))
+        self._phase_label.setStyleSheet(f"color: {TEXT_FAINT}; letter-spacing: 1.0px; background: transparent;")
+        phase_row = QHBoxLayout()
+        phase_row.setSpacing(6)
+        phase_row.addWidget(self._phase_dot)
+        phase_row.addWidget(self._phase_label)
+        h.addLayout(phase_row)
+        h.addWidget(self._sep())
+
+        self.phase_btn = QPushButton(f"Mark: {self._PHASE_NAMES[0]}")
+        self.phase_btn.setFont(ui_font(10, QFont.Weight.Medium))
+        self.phase_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.phase_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {PANEL};
+                color: {ACCENT};
+                border: 1px solid {ACCENT};
+                border-radius: 6px;
+                padding: 7px 14px;
+            }}
+            QPushButton:hover {{
+                background: #eef4fc;
+            }}
+            QPushButton:disabled {{
+                color: {TEXT_GHOST};
+                border-color: {LINE};
+            }}
+        """)
+        self.phase_btn.clicked.connect(self.phase_advance_clicked.emit)
+        h.addWidget(self.phase_btn)
+
         # End session button
         self.end_btn = QPushButton("◼  End session")
         self.end_btn.setFont(ui_font(10, QFont.Weight.Medium))
@@ -125,6 +164,28 @@ class TopStrip(QFrame):
         """)
         self.end_btn.clicked.connect(self.end_session_clicked.emit)
         h.addWidget(self.end_btn)
+
+        self.reset_phase()
+
+    def set_phase(self, label: str, color: str, index: int, total: int):
+        """Called after the researcher marks a phase transition."""
+        self._phase_dot.setStyleSheet(f"background: {color}; border-radius: 4px;")
+        self._phase_label.setText(label.upper())
+        self._phase_label.setStyleSheet(f"color: {color}; letter-spacing: 1.0px; background: transparent;")
+        if index + 1 < total:
+            self.phase_btn.setText(f"Mark: {self._PHASE_NAMES[index + 1]}")
+            self.phase_btn.setEnabled(True)
+        else:
+            self.phase_btn.setText("All phases marked")
+            self.phase_btn.setEnabled(False)
+
+    def reset_phase(self):
+        """Called at the start of each new live session."""
+        self._phase_dot.setStyleSheet(f"background: {TEXT_GHOST}; border-radius: 4px;")
+        self._phase_label.setText("NO PHASE")
+        self._phase_label.setStyleSheet(f"color: {TEXT_FAINT}; letter-spacing: 1.0px; background: transparent;")
+        self.phase_btn.setText(f"Mark: {self._PHASE_NAMES[0]}")
+        self.phase_btn.setEnabled(True)
 
     def _pair(self, key: str, val: str):
         row = QHBoxLayout()
@@ -689,6 +750,9 @@ class HistoryChart(QFrame):
         body_l.addWidget(self._plot, 1)
         v.addLayout(body_l)
 
+        self._last_xs: list = []
+        self._phase_regions: list = []
+
     @staticmethod
     def _rgba_with_alpha(hex_color: str, alpha: int) -> tuple:
         c = QColor(hex_color)
@@ -696,17 +760,51 @@ class HistoryChart(QFrame):
 
     _TICK_S = 0.06  # timer fires every 60 ms
 
-    def update_traces(self, history: dict):
-        """history = {'total': [...], 'facial': [...], 'vocal': [...], 'gaze': [...]}"""
+    def update_traces(self, history: dict, timestamps: list | None = None):
+        """history = {'total': [...], 'facial': [...], 'vocal': [...], 'gaze': [...]}.
+        timestamps, if given, are absolute elapsed-session seconds (one per
+        sample) so the x-axis reads real time and phase bands line up
+        correctly. Falls back to a relative in-window index if omitted."""
         if not history.get("total"):
             return
         n = len(history["total"])
-        xs = [i * self._TICK_S for i in range(n)]
+        if timestamps and len(timestamps) == n:
+            xs = list(timestamps)
+        else:
+            xs = [i * self._TICK_S for i in range(n)]
         self._curve_total.setData(xs, history.get("total", []))
         self._curve_facial.setData(xs, history.get("facial", []))
         self._curve_vocal.setData(xs, history.get("vocal", []))
         self._curve_gaze.setData(xs, history.get("gaze", []))
-        self._plot.setXRange(0, max(60 * self._TICK_S, (n - 1) * self._TICK_S), padding=0)
+        lo = xs[0] if xs else 0.0
+        hi = xs[-1] if xs else 60 * self._TICK_S
+        if hi - lo < 60 * self._TICK_S:
+            hi = lo + 60 * self._TICK_S
+        self._plot.setXRange(lo, hi, padding=0)
+        self._last_xs = xs
+
+    def set_phases(self, segments: list):
+        """segments = [{'label','color','start_s','end_s'(or None while
+        ongoing)}, ...]. Draws translucent background bands so the researcher
+        can see which marked phase the visible window falls in."""
+        for region in self._phase_regions:
+            self._plot.removeItem(region)
+        self._phase_regions = []
+        if not segments:
+            return
+        right_edge = self._last_xs[-1] if self._last_xs else 0.0
+        for seg in segments:
+            start = seg["start_s"]
+            end = seg["end_s"] if seg["end_s"] is not None else max(right_edge, start)
+            if end <= start:
+                end = start + 0.01
+            region = pg.LinearRegionItem(values=(start, end), movable=False)
+            region.setBrush(pg.mkBrush(self._rgba_with_alpha(seg["color"], 28)))
+            for line in region.lines:
+                line.setPen(pg.mkPen(seg["color"], width=1))
+            region.setZValue(-10)
+            self._plot.addItem(region)
+            self._phase_regions.append(region)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
