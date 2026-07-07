@@ -49,8 +49,8 @@ except Exception:
 
 # ── UI modules ───────────────────────────────────────────────────────────────
 from theme import (BG, BG_DEEP, PANEL, LINE, LINE_SOFT, TEXT, TEXT_FAINT, TEXT_GHOST,
-                    ui_font, load_packaged_fonts)
-from panels import TopStrip, CameraPanel, ScorePanel, VoicePanel, HistoryChart, Footer
+                    ui_font, load_packaged_fonts, trust_band)
+from panels import TopStrip, CameraPanel, ScorePanel, VoicePanel, HistoryChart, Footer, FlagSidebar
 from overlays import OverviewScreen, CalibrationOverlay, SessionSummary, PosthocWaitingScreen
 
 try:
@@ -127,6 +127,16 @@ class TrustDashboard(QMainWindow):
         self._calibration_vocal = {"pitch_stability": [], "energy_level": [], "tremor_index": [],
                                    "hnr_db": [], "alpha_ratio": [], "jitter": []}
         self._calibration_baseline: dict = {}
+
+        # ── Behavioural flag state ──────────────────────────────────────────
+        self._flag_cooldowns: dict = {}
+        self._last_flag_total = None
+        self._session_flags: list = []
+
+        # ── Calibration coverage ────────────────────────────────────────────
+        self._cal_frames_total = 0
+        self._cal_frames_face  = 0
+        self._baseline_coverage = None
 
         # ── Camera bookkeeping ──────────────────────────────────────────────
         self._available_cameras: list[int] = []
@@ -219,13 +229,13 @@ class TrustDashboard(QMainWindow):
 
         self.cam_panel = CameraPanel()
         self.cam_panel.switch_camera_clicked.connect(self._switch_camera)
-        self.cam_panel.setFixedWidth(310)
+        self.cam_panel.setFixedWidth(300)
 
         self.score_panel = ScorePanel()
-        self.score_panel.setFixedWidth(560)
+        self.score_panel.setFixedWidth(520)
 
         self.voice_panel = VoicePanel()
-        self.voice_panel.setMaximumWidth(360)
+        self.voice_panel.setMaximumWidth(380)
 
         # Cap height so panels don't over-stretch on tall windows
         for _p in (self.cam_panel, self.score_panel, self.voice_panel):
@@ -241,7 +251,14 @@ class TrustDashboard(QMainWindow):
         self.history_chart.setMinimumHeight(220)
         sl.addWidget(self.history_chart, 1)
 
-        rl.addWidget(stage, 1)
+        # Wrap stage + flag sidebar in a middle HBox
+        self.flag_sidebar = FlagSidebar()
+        middle = QHBoxLayout()
+        middle.setContentsMargins(0, 0, 0, 0)
+        middle.setSpacing(0)
+        middle.addWidget(stage, 1)
+        middle.addWidget(self.flag_sidebar)
+        rl.addLayout(middle, 1)
 
         # Footer
         rl.addWidget(Footer())
@@ -311,6 +328,8 @@ class TrustDashboard(QMainWindow):
         self._calibrating = True
         self.trust.start_calibration()
         self._session_ended = False
+        self._cal_frames_total = 0
+        self._cal_frames_face  = 0
 
     def _finish_calibration_now(self):
         """User clicked Skip."""
@@ -429,6 +448,17 @@ class TrustDashboard(QMainWindow):
             self._baseline_total = int(result["total"])
             self.score_panel.gauge.setBaseline(self._baseline_total)
 
+        if self._cal_frames_total > 0:
+            self._baseline_coverage = 100.0 * self._cal_frames_face / self._cal_frames_total
+            self.score_panel.set_baseline_quality(self._baseline_coverage)
+        else:
+            self._baseline_coverage = None
+            self.score_panel.hide_baseline_quality()
+        self.flag_sidebar.clear_flags()
+        self._flag_cooldowns = {}
+        self._last_flag_total = None
+        self._session_flags = []
+
         self._show_live()
         self._start_ws_server()
 
@@ -492,6 +522,11 @@ class TrustDashboard(QMainWindow):
         self._session_ended = False
         self._session_rows = []
         self._history = {k: [] for k in ("total", "facial", "vocal", "gaze", "hrv")}
+        self.flag_sidebar.clear_flags()
+        self._flag_cooldowns = {}
+        self._last_flag_total = None
+        self._session_flags = []
+        self.score_panel.hide_baseline_quality()
         self._show_overview()
 
     # ════════════════════════════════════════════════════════════════════════
@@ -1166,6 +1201,9 @@ class TrustDashboard(QMainWindow):
             )
 
             if self._calibrating and self._calibration_started_at is not None:
+                self._cal_frames_total += 1
+                if face_data and face_data.get("detected"):
+                    self._cal_frames_face += 1
                 self._collect_calibration_samples(face_data, vocal_data)
                 elapsed = time.time() - self._calibration_started_at
                 self._cal.update_progress(elapsed, self._calibration_seconds)
@@ -1202,19 +1240,23 @@ class TrustDashboard(QMainWindow):
             "last_event": _last_ev,
         })
 
-        # Roll histories (skip the contributions metadata key)
+        # Accumulate full session history (chart manages its own trailing window)
         for k, v in scores.items():
             if k not in self._history:
                 continue
             self._history[k].append(v)
-            if len(self._history[k]) > 120:
-                self._history[k].pop(0)
 
         # Record one row per second
         now = time.time()
         if now - self._last_record_time >= 1.0:
             self._record_row(scores, face_data, vocal_data, wl_state)
             self._last_record_time = now
+            total_now = int(scores.get("total", 50))
+            if self._last_flag_total is not None and (self._last_flag_total - total_now) > 10:
+                self._emit_flag("Sharp trust drop", total_now)
+            self._last_flag_total = total_now
+
+        self._check_flags(scores, face_data, vocal_data)
 
         # ── Push to widgets ──
         if frame_bgr is not None:
@@ -1240,8 +1282,8 @@ class TrustDashboard(QMainWindow):
         spec = self._compute_spectrum(audio_buf)
         self.voice_panel.set_spectrum(spec)
 
-        # History chart — keep last 60 samples for the rolling view
-        h = {k: self._history[k][-60:] for k in ("total", "facial", "vocal", "gaze")}
+        # History chart — full session history (chart manages its own window)
+        h = {k: self._history[k] for k in ("total", "facial", "vocal", "gaze")}
         self.history_chart.update_traces(h)
 
         # Workload glow on top strip
@@ -1283,6 +1325,32 @@ class TrustDashboard(QMainWindow):
         if peak <= 0:
             return [0.0] * n_bins
         return (bins / peak).tolist()
+
+    def _emit_flag(self, text: str, total: int):
+        """Append a behavioural flag, debounced ~8s per flag type."""
+        now = time.time()
+        if now - self._flag_cooldowns.get(text, 0.0) < 8.0:
+            return
+        self._flag_cooldowns[text] = now
+        color = trust_band(int(total))[1]
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.flag_sidebar.add_flag(ts, text, color)
+        self._session_flags.append((ts, text, color))
+
+    def _check_flags(self, scores, face_data, vocal_data):
+        """Real-time behavioural triggers. Reads analyzer output defensively —
+        triggers whose signals aren't exposed simply never fire."""
+        total = int(scores.get("total", 50))
+        if face_data and face_data.get("detected"):
+            if face_data.get("blink_rate", 0) > 32:
+                self._emit_flag("Rapid blink rate", total)
+            if face_data.get("gaze_deviation", 0) > 0.8:
+                self._emit_flag("Sustained gaze aversion", total)
+            aus = face_data.get("aus") or {}
+            if aus.get("AU07", 0) > 0.3 and aus.get("AU04", 0) > 0.3:
+                self._emit_flag("Hostile gaze detected", total)
+        if vocal_data and vocal_data.get("tremor_index", 0) > 0.6:
+            self._emit_flag("Voice tremor elevated", total)
 
     def _record_row(self, scores, face_data, vocal_data, wl_state):
         """Capture one second of data.  All %-based fields are stored
@@ -1397,6 +1465,7 @@ class TrustDashboard(QMainWindow):
             "active_channels":     [ch for ch, active in self.trust._active.items() if active],
             "score_version":       SCORE_VERSION,
             "score_config":        SCORE_CONFIG,
+            "flags":               list(self._session_flags),
         }
 
     # ════════════════════════════════════════════════════════════════════════

@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (QWidget, QLabel, QFrame, QHBoxLayout, QVBoxLayout,
 
 from theme import (LINE, LINE_SOFT, TEXT, TEXT_DIM, TEXT_FAINT, TEXT_GHOST,
                     PANEL, PANEL_2, C_FACIAL, C_VOCAL, C_GAZE, C_HRV,
-                    ui_font, mono_font, trust_band, head_qss)
+                    ui_font, mono_font, trust_band, head_qss, BG_DEEP)
 
 
 # ─── Custom-painted gauge ───────────────────────────────────────────────────
@@ -26,7 +26,7 @@ class GaugeWidget(QWidget):
         self._color = QColor("#60a5fa")
         self._band_label = ""
         self._band_color = "#94a3b8"
-        self.setMinimumSize(360, 260)
+        self.setFixedHeight(280)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def setScore(self, score: int, color_hex: str):
@@ -35,7 +35,7 @@ class GaugeWidget(QWidget):
         self.update()
 
     def setBandLabel(self, label: str, color_hex: str):
-        self._band_label = label.upper()
+        self._band_label = label
         self._band_color = color_hex
         self.update()
 
@@ -55,7 +55,7 @@ class GaugeWidget(QWidget):
         p.setBrush(QColor(PANEL))
         p.drawRect(0, 0, w, h)
 
-        thickness = 14
+        thickness = 16
         margin = 18
         diameter = min(w - margin * 2, (h - 20) * 2)
         radius = diameter / 2
@@ -74,30 +74,36 @@ class GaugeWidget(QWidget):
                       Qt.PenCapStyle.RoundCap))
         p.drawArc(arc_rect, 180 * 16, int(active_span * 16))
 
-        # Big number — sits in the upper ~72 % of the radius so the band
-        # label can breathe underneath it without collision.
+        # Big number — scale font to arc radius so it never overflows.
+        num_pt = max(36.0, radius * 0.38)
         num_font = mono_font(88, QFont.Weight.DemiBold)
+        num_font.setPointSizeF(num_pt)
         num_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 94)
         p.setFont(num_font)
         p.setPen(self._color)
-        num_rect = QRectF(0, cy - radius * 0.90, w, radius * 0.68)
+        num_rect = QRectF(0, cy - radius * 0.90, w, radius * 0.60)
         p.drawText(num_rect, Qt.AlignmentFlag.AlignCenter, str(self._score))
 
-        # Band label (e.g. "BASELINE") — drawn between number and "/ 100"
+        # Band label (e.g. "ACTIVATED") snug below the numeral
+        num_bottom = cy - radius * 0.90 + radius * 0.60
         if self._band_label:
-            band_font = mono_font(9, QFont.Weight.DemiBold)
-            band_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 130)
+            band_font = ui_font(11, QFont.Weight.DemiBold)
+            band_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 120)
             p.setFont(band_font)
             p.setPen(QColor(self._band_color))
-            band_rect = QRectF(0, cy - 44, w, 22)
-            p.drawText(band_rect, Qt.AlignmentFlag.AlignCenter, self._band_label)
+            band_rect = QRectF(0, num_bottom, w, 22)
+            p.drawText(band_rect, Qt.AlignmentFlag.AlignCenter,
+                       self._band_label.upper())
+            sub_top = num_bottom + 22
+        else:
+            sub_top = num_bottom + 2
 
         # "/ 100" subtitle
         sub_font = mono_font(8, QFont.Weight.Medium)
         sub_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 130)
         p.setFont(sub_font)
         p.setPen(QColor(TEXT_GHOST))
-        sub_rect = QRectF(0, cy - 20, w, 18)
+        sub_rect = QRectF(0, sub_top, w, 18)
         p.drawText(sub_rect, Qt.AlignmentFlag.AlignCenter, "/ 100")
 
         # Baseline tick — small notch on the arc at the calibrated score
@@ -152,15 +158,20 @@ class BarTrack(QWidget):
 
 # ─── Channel bar row ────────────────────────────────────────────────────────
 class ChannelBar(QWidget):
-    """label | track | numeric value | weight%"""
+    """label | track | numeric value | weight% (with optional stub sublabel)"""
 
     def __init__(self, label: str, color_hex: str, weight_pct: int,
                  is_stub: bool = False, parent=None):
         super().__init__(parent)
+        self._is_stub = is_stub
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(12)
 
         lbl_color = TEXT_FAINT if is_stub else color_hex
         lbl = QLabel(label)
@@ -170,7 +181,8 @@ class ChannelBar(QWidget):
 
         self._track = BarTrack(color_hex, is_stub=is_stub)
 
-        self._num = QLabel("50")
+        num_text = "—" if is_stub else "50"
+        self._num = QLabel(num_text)
         self._num.setFixedWidth(32)
         self._num.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._num.setFont(mono_font(10, QFont.Weight.Medium))
@@ -182,12 +194,21 @@ class ChannelBar(QWidget):
         w_lbl.setFont(mono_font(8))
         w_lbl.setStyleSheet(f"color: {TEXT_GHOST}; letter-spacing: 0.5px;")
 
-        layout.addWidget(lbl)
-        layout.addWidget(self._track, 1)
-        layout.addWidget(self._num)
-        layout.addWidget(w_lbl)
+        row.addWidget(lbl)
+        row.addWidget(self._track, 1)
+        row.addWidget(self._num)
+        row.addWidget(w_lbl)
+        outer.addLayout(row)
+
+        if is_stub:
+            sub = QLabel("Sensor not connected")
+            sub.setFont(ui_font(8))
+            sub.setStyleSheet(f"color: {TEXT_FAINT}; padding-left: 70px;")
+            outer.addWidget(sub)
 
     def setValue(self, value: float):
+        if self._is_stub:
+            return  # don't overwrite the dash
         self._track.setValue(value)
         self._num.setText(str(int(round(value))))
 
@@ -199,8 +220,8 @@ class TrustBadge(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumHeight(28)
-        self.setFont(mono_font(10, QFont.Weight.DemiBold))
+        self.setMinimumHeight(34)
+        self.setFont(mono_font(14, QFont.Weight.DemiBold))
         self.setBand("Calibrating…", TEXT_DIM)
 
     def setBand(self, label: str, color_hex: str):
@@ -212,11 +233,41 @@ class TrustBadge(QLabel):
                 color: {color_hex};
                 border: 1px solid {color_hex};
                 background-color: {bg};
-                border-radius: 14px;
-                padding: 6px 16px;
+                border-radius: 16px;
+                padding: 7px 20px;
                 letter-spacing: 1px;
             }}
         """)
+
+
+# ─── Baseline quality dot ───────────────────────────────────────────────────
+class BaselineQualityDot(QWidget):
+    """~11×11 px filled circle reporting calibration baseline quality."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._color = QColor(TEXT_GHOST)
+        self.setFixedSize(QSize(11, 11))
+
+    def set_quality(self, pct: float):
+        if pct >= 90:
+            self._color = QColor("#3b9edd")
+            quality = "Good"
+        elif pct >= 70:
+            self._color = QColor("#f5c842")
+            quality = "Fair"
+        else:
+            self._color = QColor("#e03e3e")
+            quality = "Poor"
+        self.setToolTip(f"Baseline quality: {quality} ({pct:.0f}% face coverage)")
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(self._color)
+        p.drawEllipse(0, 0, 11, 11)
 
 
 # ─── Status dot (header) ────────────────────────────────────────────────────
@@ -264,8 +315,8 @@ class MetricBox(QFrame):
         """)
 
         v = QVBoxLayout(self)
-        v.setContentsMargins(12, 9, 12, 9)
-        v.setSpacing(2)
+        v.setContentsMargins(10, 6, 10, 6)
+        v.setSpacing(1)
 
         self._label = QLabel(label.upper())
         self._label.setFont(ui_font(8, QFont.Weight.DemiBold))

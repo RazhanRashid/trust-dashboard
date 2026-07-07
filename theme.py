@@ -33,14 +33,17 @@ ACCENT      = "#2872c4"   # primary blue (logo mark, focus states)
 DANGER      = "#c93a3a"   # End Session, error states
 
 
-# ─── Trust bands ─ same hex values trust_engine.py emits ────────────────────
+# DISPLAY-ONLY mapping: the colour + label the UI shows for a given 0–100 score.
+# NOT part of scoring/weighting — trust_engine.py does not read this.
 TRUST_BANDS = [
-    (82, "Calm + Engaged", "#4ade80"),
-    (64, "Relaxed",        "#34d399"),
-    (46, "Baseline",       "#60a5fa"),
-    (28, "Activated",      "#fb923c"),
-    (0,  "Heightened",     "#f87171"),
+    (82, "Calm + Engaged", "#3b9edd"),   # clear blue
+    (64, "Relaxed",        "#4fc4a0"),   # teal-green (perceptually distinct)
+    (46, "Baseline",       "#f5c842"),   # amber
+    (28, "Activated",      "#f07d2a"),   # orange
+    (0,  "Heightened",     "#e03e3e"),   # red
 ]
+
+HRV_IS_PLACEHOLDER = True  # set False when a real HRV sensor is connected
 
 def trust_band(score: int):
     """Return (label, hex_color) for a 0–100 trust score."""

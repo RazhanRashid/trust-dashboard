@@ -1247,9 +1247,9 @@ class OverviewScreen(QWidget):
                 labelOpts={
                     "color": TEXT_FAINT,
                     "position": 0.05,
-                    "font": mono_font(7),
                 },
             )
+            avg_line.label.setFont(mono_font(7))
             trend_plot.addItem(avg_line)
 
             # Main trend line (no symbols — we'll add custom colored scatter)

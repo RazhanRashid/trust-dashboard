@@ -12,7 +12,8 @@ import numpy as np
 from PyQt6.QtCore import Qt, QSize, pyqtSignal
 from PyQt6.QtGui import QFont, QImage, QPixmap, QColor
 from PyQt6.QtWidgets import (QWidget, QFrame, QLabel, QPushButton, QVBoxLayout,
-                              QHBoxLayout, QGridLayout, QSizePolicy)
+                              QHBoxLayout, QGridLayout, QSizePolicy, QListWidget,
+                              QListWidgetItem)
 
 import pyqtgraph as pg
 
@@ -20,10 +21,11 @@ from theme import (BG, BG_DEEP, PANEL, PANEL_2, LINE, LINE_SOFT,
                     TEXT, TEXT_DIM, TEXT_FAINT, TEXT_GHOST,
                     C_FACIAL, C_VOCAL, C_GAZE, C_HRV, C_WORKLOAD,
                     ACCENT, DANGER,
-                    ui_font, mono_font, trust_band, panel_qss, head_qss)
+                    ui_font, mono_font, trust_band, panel_qss, head_qss,
+                    HRV_IS_PLACEHOLDER, TRUST_BANDS)
 from widgets import (GaugeWidget, BarTrack, ChannelBar, StatusDot,
                       MetricBox, PanelHead, WaveformWidget, SpectrumWidget,
-                      AttributionStrip)
+                      AttributionStrip, BaselineQualityDot)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -240,6 +242,7 @@ class CameraPanel(QFrame):
             }}
         """)
         self._video.setText("waiting for camera…")
+        body_l.addWidget(self._video)
 
         # 2×2 metric grid (face metrics)
         grid = QGridLayout()
@@ -348,28 +351,35 @@ class ScorePanel(QFrame):
 
         v.addWidget(PanelHead("Composure index", "α 0.20 · ema"))
 
+
         body_l = QVBoxLayout()
         body_l.setContentsMargins(22, 14, 22, 20)
         body_l.setSpacing(14)
 
-        # Gauge
+        # Gauge — no stretch above; gauge starts just below the header
         self.gauge = GaugeWidget()
         gw = QHBoxLayout()
-        gw.addStretch()
         gw.addWidget(self.gauge)
-        gw.addStretch()
         body_l.addLayout(gw)
+
+        # Baseline quality dot (right-aligned, small) — shown after calibration
+        self._baseline_dot = BaselineQualityDot()
+        self._baseline_dot.hide()
+        dot_row = QHBoxLayout()
+        dot_row.addStretch()
+        dot_row.addWidget(self._baseline_dot)
+        body_l.addLayout(dot_row)
+        body_l.addSpacing(4)
 
         # Attribution strip
         self._attribution = AttributionStrip()
         body_l.addWidget(self._attribution)
+        body_l.addSpacing(12)
 
         # Column header row for the channel bars
         hdr = QHBoxLayout()
         hdr.setContentsMargins(0, 0, 0, 0)
         hdr.setSpacing(12)
-        hdr_spacer = QLabel()
-        hdr_spacer.setFixedWidth(58)
         hdr_score = QLabel("SCORE")
         hdr_score.setFixedWidth(32)
         hdr_score.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -380,7 +390,6 @@ class ScorePanel(QFrame):
         hdr_wt.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         hdr_wt.setFont(ui_font(7, QFont.Weight.DemiBold))
         hdr_wt.setStyleSheet(f"color: {TEXT_GHOST}; letter-spacing: 1px;")
-        hdr.addWidget(hdr_spacer)
         hdr.addStretch(1)
         hdr.addWidget(hdr_score)
         hdr.addWidget(hdr_wt)
@@ -392,7 +401,7 @@ class ScorePanel(QFrame):
         self.bar_facial = ChannelBar("Facial", C_FACIAL, 25)
         self.bar_vocal  = ChannelBar("Vocal",  C_VOCAL,  25)
         self.bar_gaze   = ChannelBar("Gaze",   C_GAZE,   25)
-        self.bar_hrv    = ChannelBar("HRV",    C_HRV,    25, is_stub=True)
+        self.bar_hrv    = ChannelBar("HRV",    C_HRV,    25, is_stub=HRV_IS_PLACEHOLDER)
         for b in (self.bar_facial, self.bar_vocal, self.bar_gaze, self.bar_hrv):
             bars.addWidget(b)
         body_l.addLayout(bars)
@@ -444,6 +453,13 @@ class ScorePanel(QFrame):
         self.bar_vocal.setValue(vocal)
         self.bar_gaze.setValue(gaze)
         self.bar_hrv.setValue(hrv)
+
+    def set_baseline_quality(self, pct: float):
+        self._baseline_dot.set_quality(pct)
+        self._baseline_dot.show()
+
+    def hide_baseline_quality(self):
+        self._baseline_dot.hide()
 
     def update_attribution(self, delta: float, contributions: dict):
         self._attribution.update(delta, contributions)
@@ -545,7 +561,6 @@ class VoicePanel(QFrame):
         grid.addWidget(self._metrics["jitter"], 2, 1)   # Row 2 added: eGeMAPS local jitter
         body_l.addLayout(grid)
 
-        body_l.addStretch()
         v.addLayout(body_l)
 
     def _toggle_spectrum(self, checked: bool):
@@ -609,23 +624,53 @@ class VoicePanel(QFrame):
 # History chart (pyqtgraph PlotWidget)
 # ═══════════════════════════════════════════════════════════════════════════
 class HistoryChart(QFrame):
-    """Live 60-sample chart with Trust + Facial + Vocal + Gaze traces."""
+    """Full-session scrollable chart — composure-band zones, 4 traces, live snap."""
+
+    WINDOW_S = 60.0   # trailing window shown by default
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("histPanel")
         self.setStyleSheet(panel_qss("histPanel"))
 
+        self._following = True   # True = auto-follow the live edge
+        self._full_xs: list[float] = []
+
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
-        v.addWidget(PanelHead("Composure history", "live"))
+
+        # Header: title on left, live/snap button on right
+        head_frame = QFrame()
+        head_frame.setObjectName("panelHead")
+        head_frame.setStyleSheet(head_qss())
+        head_frame.setFixedHeight(42)
+        head_h = QHBoxLayout(head_frame)
+        head_h.setContentsMargins(22, 0, 22, 0)
+        head_title = QLabel("COMPOSURE HISTORY")
+        head_title.setFont(ui_font(8, QFont.Weight.DemiBold))
+        head_title.setStyleSheet(f"color: {TEXT_FAINT}; letter-spacing: 1.3px; background: transparent;")
+        self._live_btn = QPushButton("● live")
+        self._live_btn.setFont(mono_font(8))
+        self._live_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._live_btn.setStyleSheet(f"""
+            QPushButton {{
+                color: #2da46a; background: transparent;
+                border: none; padding: 0;
+            }}
+            QPushButton:hover {{ color: {TEXT_FAINT}; }}
+        """)
+        self._live_btn.clicked.connect(self._snap_to_live)
+        head_h.addWidget(head_title)
+        head_h.addStretch()
+        head_h.addWidget(self._live_btn)
+        v.addWidget(head_frame)
 
         body_l = QVBoxLayout()
         body_l.setContentsMargins(20, 12, 20, 18)
         body_l.setSpacing(6)
 
-        # Legend row (custom — pyqtgraph's built-in is ugly)
+        # Legend row
         legend = QHBoxLayout()
         legend.setSpacing(20)
         for name, color in [("Composure", ACCENT),
@@ -646,14 +691,13 @@ class HistoryChart(QFrame):
         legend.addStretch()
         body_l.addLayout(legend)
 
-        # PlotWidget — styled to match the cool slate palette
+        # PlotWidget
         pg.setConfigOption("background", PANEL)
         pg.setConfigOption("foreground", TEXT_FAINT)
         self._plot = pg.PlotWidget()
         self._plot.setBackground(PANEL)
         self._plot.setYRange(0, 100, padding=0)
         self._plot.showGrid(x=False, y=True, alpha=0.18)
-        # Hide axes that shouldn't show; style the ones that do
         for ax in ("top", "right"):
             self._plot.getAxis(ax).hide()
         self._plot.getAxis("left").setPen(pg.mkPen(LINE_SOFT))
@@ -666,17 +710,29 @@ class HistoryChart(QFrame):
         self._plot.getAxis("bottom").setStyle(tickLength=-4, showValues=True)
         self._plot.getAxis("bottom").setLabel("Time (s)", color=TEXT_GHOST,
                                               **{"font-size": "9px"})
-        # Remove the rectangle pyqtgraph draws around the ViewBox
         self._plot.getPlotItem().getViewBox().setBorder(None)
-        self._plot.setMouseEnabled(x=False, y=False)
+        self._plot.setMouseEnabled(x=True, y=False)
         self._plot.setMenuEnabled(False)
         self._plot.hideButtons()
 
-        # Curves — Total solid + filled, channels with distinct dash patterns
+        # Composure-band background zones
+        prev_top = 100
+        for thr, _lbl, hexc in TRUST_BANDS:
+            cc = QColor(hexc)
+            region = pg.LinearRegionItem(values=(thr, prev_top),
+                                         orientation="horizontal", movable=False)
+            region.setBrush(pg.mkBrush(cc.red(), cc.green(), cc.blue(), 20))
+            for ln in region.lines:
+                ln.setPen(pg.mkPen(None))
+            region.setZValue(-10)
+            self._plot.addItem(region)
+            prev_top = thr
+
+        c = QColor(ACCENT)
         self._curve_total = self._plot.plot([], [],
             pen=pg.mkPen(ACCENT, width=2.4),
             fillLevel=0,
-            brush=pg.mkBrush(self._rgba_with_alpha(ACCENT, 30)))
+            brush=pg.mkBrush(c.red(), c.green(), c.blue(), 30))
         self._curve_facial = self._plot.plot([], [],
             pen=pg.mkPen(C_FACIAL, width=1.4, dash=[5, 4]))
         self._curve_vocal = self._plot.plot([], [],
@@ -684,7 +740,10 @@ class HistoryChart(QFrame):
         self._curve_gaze = self._plot.plot([], [],
             pen=pg.mkPen(C_GAZE,   width=1.4, dash=[8, 3]))
 
-        # Remove the Qt frame pyqtgraph inherits (QFrame subclass)
+        # Detect when user pans away from live edge
+        self._plot.getPlotItem().getViewBox().sigXRangeChanged.connect(self._on_x_range_changed)
+        self._ignore_range_signal = False
+
         self._plot.setStyleSheet("border: none;")
         body_l.addWidget(self._plot, 1)
         v.addLayout(body_l)
@@ -694,19 +753,138 @@ class HistoryChart(QFrame):
         c = QColor(hex_color)
         return (c.red(), c.green(), c.blue(), alpha)
 
+    def _on_x_range_changed(self, vb, x_range):
+        """Detect user pan — disengage live follow if they scrolled left."""
+        if self._ignore_range_signal or not self._full_xs:
+            return
+        x_max = self._full_xs[-1]
+        right_edge = x_range[1]
+        # If the right edge of the view is more than 2s behind the data edge, stop following
+        if right_edge < x_max - 2.0:
+            if self._following:
+                self._following = False
+                self._live_btn.setText("↩ snap live")
+                self._live_btn.setStyleSheet(f"""
+                    QPushButton {{
+                        color: {TEXT_FAINT}; background: transparent;
+                        border: none; padding: 0;
+                    }}
+                    QPushButton:hover {{ color: {TEXT}; }}
+                """)
+
+    def _snap_to_live(self):
+        self._following = True
+        self._live_btn.setText("● live")
+        self._live_btn.setStyleSheet(f"""
+            QPushButton {{
+                color: #2da46a; background: transparent;
+                border: none; padding: 0;
+            }}
+            QPushButton:hover {{ color: {TEXT_FAINT}; }}
+        """)
+        if self._full_xs:
+            x_max = self._full_xs[-1]
+            x_min = max(0.0, x_max - self.WINDOW_S)
+            self._ignore_range_signal = True
+            self._plot.setXRange(x_min, x_max, padding=0)
+            self._ignore_range_signal = False
+
     _TICK_S = 0.06  # timer fires every 60 ms
 
     def update_traces(self, history: dict):
-        """history = {'total': [...], 'facial': [...], 'vocal': [...], 'gaze': [...]}"""
+        """history = {'total': [...], 'facial': [...], 'vocal': [...], 'gaze': [...]}
+        Receives the *full* session history (unbounded length)."""
         if not history.get("total"):
             return
         n = len(history["total"])
         xs = [i * self._TICK_S for i in range(n)]
+        self._full_xs = xs
+
         self._curve_total.setData(xs, history.get("total", []))
         self._curve_facial.setData(xs, history.get("facial", []))
         self._curve_vocal.setData(xs, history.get("vocal", []))
         self._curve_gaze.setData(xs, history.get("gaze", []))
-        self._plot.setXRange(0, max(60 * self._TICK_S, (n - 1) * self._TICK_S), padding=0)
+
+        x_max = xs[-1] if xs else 0.0
+        self._plot.setLimits(xMin=0, xMax=max(x_max, self.WINDOW_S))
+
+        if self._following:
+            x_min = max(0.0, x_max - self.WINDOW_S)
+            self._ignore_range_signal = True
+            self._plot.setXRange(x_min, max(x_max, self.WINDOW_S), padding=0)
+            self._ignore_range_signal = False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Flag sidebar — collapsible right-docked behavioural indicator log
+# ═══════════════════════════════════════════════════════════════════════════
+class FlagSidebar(QFrame):
+    EXPANDED_W  = 200
+    COLLAPSED_W = 36
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("flagSidebar")
+        self.setStyleSheet(f"""
+            #flagSidebar {{
+                background: {BG_DEEP};
+                border-left: 1px solid {LINE};
+            }}
+        """)
+        self.setFixedWidth(self.COLLAPSED_W)
+        self._expanded = False
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 6, 0, 6)
+        v.setSpacing(4)
+
+        self._toggle = QPushButton("▶")
+        self._toggle.setToolTip("Behavioural flags")
+        self._toggle.setFont(ui_font(9, QFont.Weight.Medium))
+        self._toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._toggle.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {TEXT_FAINT};
+                border: none; padding: 4px;
+            }}
+            QPushButton:hover {{ color: {TEXT}; }}
+        """)
+        self._toggle.clicked.connect(self.toggle)
+        v.addWidget(self._toggle)
+
+        self._list = QListWidget()
+        self._list.setStyleSheet(f"""
+            QListWidget {{
+                background: {PANEL};
+                border: none;
+                font-size: 9pt;
+            }}
+        """)
+        self._list.hide()
+        v.addWidget(self._list, 1)
+
+    def toggle(self):
+        self._expanded = not self._expanded
+        if self._expanded:
+            self.setFixedWidth(self.EXPANDED_W)
+            self._toggle.setText("Flags ◀")
+            self._toggle.setToolTip("")
+            self._list.show()
+        else:
+            self.setFixedWidth(self.COLLAPSED_W)
+            self._toggle.setText("▶")
+            self._toggle.setToolTip("Behavioural flags")
+            self._list.hide()
+
+    def add_flag(self, time_str: str, text: str, color_hex: str):
+        item = QListWidgetItem(f"{time_str} — {text}")
+        item.setForeground(QColor(color_hex))
+        self._list.insertItem(0, item)
+        while self._list.count() > 50:
+            self._list.takeItem(self._list.count() - 1)
+
+    def clear_flags(self):
+        self._list.clear()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
