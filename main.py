@@ -29,8 +29,8 @@ import cv2
 import numpy as np
 import sounddevice as sd
 
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import Qt, QTimer, QUrl
+from PyQt6.QtGui import QFont, QDesktopServices
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QStackedWidget,
                               QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox,
                               QFileDialog)
@@ -312,6 +312,7 @@ class TrustDashboard(QMainWindow):
             self._overview.deleteLater()
         self._overview = OverviewScreen(self._sessions_file)
         self._overview.start_clicked.connect(self._start_session)
+        self._overview.session_clicked.connect(self._show_past_session_summary)
         self._stack.addWidget(self._overview)
         self._stack.setCurrentWidget(self._overview)
 
@@ -328,16 +329,39 @@ class TrustDashboard(QMainWindow):
         self._stack.addWidget(self._cal)
         self._stack.setCurrentWidget(self._cal)
 
-    def _show_summary(self, stats: dict):
+    def _show_summary(self, stats: dict, export_handler=None):
+        """export_handler lets callers repoint the Export button — the
+        just-ended live session exports its in-memory rows, but a summary
+        opened from the overview's session list has no in-memory rows to
+        export, so it reveals the already auto-saved Excel file instead."""
         if self._sum is not None:
             self._stack.removeWidget(self._sum)
             self._sum.deleteLater()
         self._sum = SessionSummary()
         self._sum.populate(stats)
         self._sum.back_clicked.connect(self._back_to_overview)
-        self._sum.export_clicked.connect(self._export_csv)
+        self._sum.export_clicked.connect(export_handler or self._export_csv)
         self._stack.addWidget(self._sum)
         self._stack.setCurrentWidget(self._sum)
+
+    def _show_past_session_summary(self, sess: dict):
+        """Open the read-only summary for a previously recorded session,
+        selected by clicking a card in the overview's session list."""
+        self._show_summary(sess, export_handler=lambda: self._reveal_session_export(sess))
+
+    def _reveal_session_export(self, sess: dict):
+        """Open the Excel file that was auto-saved for this session at the
+        time it ended, rather than trying to rebuild one from (empty)
+        live session data."""
+        session_id = sess.get("session_id", "")
+        path = self._session_dir / f"trust-session-{session_id}.xlsx"
+        if path.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        else:
+            QMessageBox.information(
+                self, "Export not found",
+                f"No saved Excel export was found for this session:\n{path}",
+            )
 
     # ════════════════════════════════════════════════════════════════════════
     # Session lifecycle
@@ -1547,6 +1571,15 @@ class TrustDashboard(QMainWindow):
             "n_events":         len(self._event_log),
             "score_version":    stats.get("score_version", ""),
             "active_channels":  stats.get("active_channels", []),
+            # Everything below is stored purely so a session card in the
+            # overview list can be clicked later and show a full summary
+            # (chart, phase bands, flags) without needing the original
+            # in-memory session rows.
+            "peak_trust":       stats.get("peak_trust", stats.get("trust_total", 50)),
+            "low_trust":        stats.get("low_trust",  stats.get("trust_total", 50)),
+            "trust_history":    stats.get("trust_history", []),
+            "phase_segments":   stats.get("phase_segments", []),
+            "flags":            stats.get("flags", []),
         })
         try:
             with open(self._sessions_file, "w") as f:

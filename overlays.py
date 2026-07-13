@@ -956,10 +956,23 @@ class SessionSummary(QWidget):
 # ═══════════════════════════════════════════════════════════════════════════
 # Overview / landing page
 # ═══════════════════════════════════════════════════════════════════════════
+class _ClickableCard(QFrame):
+    """QFrame that emits `clicked` on a left-click — used for session cards
+    so the whole row (not just a sub-widget) opens the session summary."""
+
+    clicked = pyqtSignal()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
 class OverviewScreen(QWidget):
     """Landing page — past sessions list + Start Session button."""
 
-    start_clicked = pyqtSignal()
+    start_clicked   = pyqtSignal()
+    session_clicked = pyqtSignal(dict)   # emitted with the clicked session's stats dict
 
     def __init__(self, sessions_file: Path, parent=None):
         super().__init__(parent)
@@ -1323,16 +1336,30 @@ class OverviewScreen(QWidget):
         except Exception:
             return []
 
+    def _with_abs_paths(self, sess: dict) -> dict:
+        """recording_path/thumbnail_path are stored relative to the data
+        dir (see main.py's _end_session._rel) so they survive being moved;
+        resolve them to absolute paths before handing off to SessionSummary,
+        which checks Path(...).exists() directly."""
+        out = dict(sess)
+        base = Path.home() / "Desktop" / "trust-dashboard"
+        for key in ("recording_path", "thumbnail_path"):
+            rel = out.get(key)
+            if rel:
+                out[key] = str(base / rel)
+        return out
+
     def _make_session_card(self, sess: dict, prev_sess: dict | None = None) -> QFrame:
         total = int(sess.get("trust_total", 50))
         label, color = trust_band(total)
 
-        card = QFrame()
+        card = _ClickableCard()
         card.setObjectName("sessCard")
         card.setStyleSheet(panel_qss("sessCard") + """
             #sessCard:hover { background: #f0f3f8; }
         """)
         card.setCursor(Qt.CursorShape.PointingHandCursor)
+        card.clicked.connect(lambda: self.session_clicked.emit(self._with_abs_paths(sess)))
 
         h = QHBoxLayout(card)
         h.setContentsMargins(16, 12, 16, 12)
