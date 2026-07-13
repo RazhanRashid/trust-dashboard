@@ -13,7 +13,7 @@ from PyQt6.QtCore import Qt, QSize, pyqtSignal
 from PyQt6.QtGui import QFont, QImage, QPixmap, QColor
 from PyQt6.QtWidgets import (QWidget, QFrame, QLabel, QPushButton, QVBoxLayout,
                               QHBoxLayout, QGridLayout, QSizePolicy, QListWidget,
-                              QListWidgetItem)
+                              QListWidgetItem, QComboBox)
 
 import pyqtgraph as pg
 
@@ -920,6 +920,141 @@ class HistoryChart(QFrame):
             region.setZValue(-10)
             self._plot.addItem(region)
             self._phase_regions.append(region)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Blendshape watch — live single-blendshape monitor
+# ═══════════════════════════════════════════════════════════════════════════
+class BlendshapeWatch(QFrame):
+    """Pick one of the 52 raw MediaPipe blendshapes and watch its 0-1 score
+    move in real time. This is deliberately separate from HistoryChart:
+    blendshapes are 0-1 (not the 0-100 composure scale) and this is a
+    moment-to-moment inspection tool, not a session record — it only keeps
+    a short trailing window in memory, nothing is retained once the
+    selection changes or the window scrolls past."""
+
+    WINDOW_S = 15.0   # trailing window kept in memory / shown
+
+    blendshape_changed = pyqtSignal(str)
+
+    def __init__(self, blendshape_names: list[str], parent=None):
+        super().__init__(parent)
+        self.setObjectName("bsPanel")
+        self.setStyleSheet(panel_qss("bsPanel"))
+        self.setFixedHeight(130)
+
+        self._xs: list[float] = []
+        self._ys: list[float] = []
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+
+        # Header: title on left, blendshape selector on right
+        head_frame = QFrame()
+        head_frame.setObjectName("panelHead")
+        head_frame.setStyleSheet(head_qss())
+        head_frame.setFixedHeight(42)
+        head_h = QHBoxLayout(head_frame)
+        head_h.setContentsMargins(22, 0, 22, 0)
+        head_title = QLabel("BLENDSHAPE WATCH")
+        head_title.setFont(ui_font(8, QFont.Weight.DemiBold))
+        head_title.setStyleSheet(f"color: {TEXT_FAINT}; letter-spacing: 1.3px; background: transparent;")
+        self._combo = QComboBox()
+        self._combo.addItems(blendshape_names)
+        self._combo.setFont(mono_font(9))
+        self._combo.setFixedWidth(200)
+        self._combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._combo.setStyleSheet(f"""
+            QComboBox {{
+                color: {TEXT_DIM}; background: {PANEL_2};
+                border: 1px solid {LINE_SOFT}; border-radius: 4px;
+                padding: 3px 8px;
+            }}
+            QComboBox:hover {{ border-color: {TEXT_FAINT}; }}
+            QComboBox::drop-down {{ border: none; width: 18px; }}
+            QComboBox QAbstractItemView {{
+                background: {PANEL_2}; color: {TEXT_DIM};
+                border: 1px solid {LINE_SOFT};
+                selection-background-color: {ACCENT};
+                outline: none;
+            }}
+        """)
+        self._combo.currentTextChanged.connect(self._on_selection_changed)
+        head_h.addWidget(head_title)
+        head_h.addStretch()
+        head_h.addWidget(self._combo)
+        v.addWidget(head_frame)
+
+        body_l = QHBoxLayout()
+        body_l.setContentsMargins(20, 12, 20, 14)
+        body_l.setSpacing(16)
+
+        # Big numeric readout for the selected blendshape's current score
+        self._value_lbl = QLabel("—")
+        self._value_lbl.setFont(mono_font(26, QFont.Weight.DemiBold))
+        self._value_lbl.setStyleSheet(f"color: {ACCENT};")
+        self._value_lbl.setFixedWidth(84)
+        self._value_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        body_l.addWidget(self._value_lbl)
+
+        # Sparkline — trailing WINDOW_S seconds only
+        pg.setConfigOption("background", PANEL)
+        pg.setConfigOption("foreground", TEXT_FAINT)
+        self._plot = pg.PlotWidget()
+        self._plot.setBackground(PANEL)
+        self._plot.setYRange(0, 1, padding=0.08)
+        self._plot.showGrid(x=False, y=True, alpha=0.15)
+        for ax in ("top", "right"):
+            self._plot.getAxis(ax).hide()
+        self._plot.getAxis("left").setPen(pg.mkPen(LINE_SOFT))
+        self._plot.getAxis("left").setTextPen(pg.mkPen(TEXT_GHOST))
+        self._plot.getAxis("left").setStyle(tickLength=-4, showValues=True)
+        self._plot.getAxis("bottom").hide()
+        self._plot.getPlotItem().getViewBox().setBorder(None)
+        self._plot.setMouseEnabled(x=False, y=False)
+        self._plot.setMenuEnabled(False)
+        self._plot.hideButtons()
+
+        c = QColor(ACCENT)
+        self._curve = self._plot.plot([], [],
+            pen=pg.mkPen(ACCENT, width=2.0),
+            fillLevel=0,
+            brush=pg.mkBrush(c.red(), c.green(), c.blue(), 30))
+
+        body_l.addWidget(self._plot, 1)
+        v.addLayout(body_l)
+
+    def current_blendshape(self) -> str:
+        return self._combo.currentText()
+
+    def _on_selection_changed(self, name: str):
+        # Switching signals mid-window would otherwise plot a discontinuous
+        # jump as if it were one continuous trace — wipe the buffer instead.
+        self._xs.clear()
+        self._ys.clear()
+        self._curve.setData([], [])
+        self._value_lbl.setText("—")
+        self.blendshape_changed.emit(name)
+
+    def update_value(self, value: float | None, elapsed_s: float):
+        """value: the selected blendshape's raw 0-1 score for this tick, or
+        None when no face is currently detected (readout freezes, trace
+        pauses rather than dropping to zero)."""
+        if value is None:
+            return
+        self._value_lbl.setText(f"{value * 100:.0f}%")
+
+        self._xs.append(elapsed_s)
+        self._ys.append(value)
+        cutoff = elapsed_s - self.WINDOW_S
+        while self._xs and self._xs[0] < cutoff:
+            self._xs.pop(0)
+            self._ys.pop(0)
+        self._curve.setData(self._xs, self._ys)
+
+        lo = max(0.0, elapsed_s - self.WINDOW_S)
+        self._plot.setXRange(lo, max(lo + self.WINDOW_S, elapsed_s), padding=0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -1,5 +1,5 @@
 """
-face_analyzer.py — Hybrid MediaPipe (real-time) + OpenFace (post-hoc) face analysis
+face_analyzer.py — MediaPipe real-time face analysis
 ──────────────────────────────────────────────────────────────────────────────────────
 During a live session MediaPipe handles everything synchronously on every frame:
   • 478 face landmark points
@@ -9,28 +9,17 @@ During a live session MediaPipe handles everything synchronously on every frame:
   • Iris radius / inter-ocular distance → pupil size proxy
   • 52 blendshape scores → real-time emotion scoring and approximate Action Units
 
-After a session ends, OpenFace is run on the saved .mp4 recording (post-hoc):
-  • Accurate FACS Action Unit intensities (AU_r) and presence flags (AU_c)
-  • Precise emotion scores from AU combinations
-  • Accurate Duchenne smile detection
-  These results are written into the Excel export by main.py.
-
-Why this split?
-  MediaPipe runs in ~10 ms per frame and keeps the display at 30 fps.
-  OpenFace takes ~600 ms per frame — too slow for real-time — but processes
-  a full video in a single efficient pass, making it ideal for post-session analysis.
-  See FACE_ANALYSIS_ARCHITECTURE.md for a full explanation.
+MediaPipe runs in ~10 ms per frame, keeping the display at 30 fps. All emotion
+and Action Unit values (see BLENDSHAPE_EMOTION_WEIGHTS / BLENDSHAPE_AU_MAP below)
+are approximations derived from blendshapes, computed live — there is no
+post-hoc analysis pass.
 """
 
-import os                      # File existence checks and temp-file deletion
+import os                      # File existence checks
 import time                    # Blink-rate timing window
-import tempfile                # Temp files and directories for OpenFace
-import subprocess              # Launches the OpenFace FeatureExtraction binary
-import shutil                  # Deletes the temp output directory after reading
-import csv                     # Parses the CSV that OpenFace writes
 import urllib.request          # Downloads the MediaPipe model file on first run
 import numpy as np             # Vector and geometry maths
-import cv2                     # Colour-space conversion and temp JPEG writing
+import cv2                     # Colour-space conversion
 
 import mediapipe as mp                                                   # MediaPipe runtime
 from mediapipe.tasks import python as mp_python                          # BaseOptions
@@ -38,7 +27,6 @@ from mediapipe.tasks.python import vision as mp_vision                   # FaceL
 from mediapipe.tasks.python.vision import FaceLandmarkerOptions, RunningMode  # Task config
 
 # ── File paths ─────────────────────────────────────────────────────────────────
-OPENFACE_BIN = os.path.expanduser("~/OpenFace/build/bin/FeatureExtraction")   # Compiled OpenFace binary
 MODEL_URL    = ("https://storage.googleapis.com/mediapipe-models/"
                 "face_landmarker/face_landmarker/float16/1/face_landmarker.task")
 MODEL_PATH   = os.path.join(os.path.dirname(__file__), "face_landmarker.task")  # Cached alongside this file
@@ -112,8 +100,8 @@ BLENDSHAPE_EMOTION_WEIGHTS = {
 
 # ── Blendshape → approximate Action Unit mapping ───────────────────────────────
 # Provides approximate AU intensities from blendshapes during the live session.
-# These are used by trust_engine for real-time scoring of AU04, AU07, AU20 etc.
-# Post-hoc OpenFace analysis replaces these with accurate values in the Excel export.
+# These are used by trust_engine for real-time scoring of AU04, AU07, AU20 etc.,
+# and are logged directly to the Excel export.
 # Format: AU_code → list of (blendshape_name, weight) pairs
 BLENDSHAPE_AU_MAP = {
     "AU01": [("browInnerUp",      1.00)],                               # Inner brow raise
@@ -131,34 +119,6 @@ BLENDSHAPE_AU_MAP = {
     "AU26": [("jawOpen",          1.00)],                               # Jaw drop
     "AU45": [("eyeBlinkLeft",     0.50), ("eyeBlinkRight",     0.50)],  # Blink / eye closure
 }
-
-# ── OpenFace AU → emotion weights (used only in post-hoc analysis) ─────────────
-# Follows the Ekman AU classification table exactly:
-#   Anger:    4+5+7+23     Contempt: R12A+R14A   Disgust:  9+15+16
-#   Fear:     1+2+4+5+7+20+26       Happiness: 6+12
-#   Sadness:  1+4+15                Surprise:  1+2+5B+26
-#
-# Scoring formula: score = Σ( AU_c × AU_r/5 × weight )
-#   AU_c = presence flag (0 or 1) — gates out noise on neutral faces
-#   AU_r = intensity (0–5, divided by 5 to give 0–1)
-#
-# Notes on edge cases:
-#   AU16 (lower lip depressor) is not tracked by OpenFace.
-#     → Substituted with AU10 (upper lip raiser), which co-occurs in disgust.
-#   R12A / R14A (right-side unilateral AUs) are not separated by OpenFace.
-#     → Approximated with bilateral AU12 + AU14; asymmetry is not captured.
-#   AU5B in surprise is the wide-eyed variant of AU05 — mapped directly to AU05.
-AU_EMOTION_WEIGHTS = {
-    "happy":    [("AU06", 0.50), ("AU12", 0.50)],                           # 6+12: equal weight
-    "sad":      [("AU01", 0.35), ("AU04", 0.30), ("AU15", 0.35)],           # 1+4+15
-    "angry":    [("AU04", 0.25), ("AU05", 0.25), ("AU07", 0.25), ("AU23", 0.25)],  # 4+5+7+23: equal
-    "surprised":[("AU01", 0.25), ("AU02", 0.25), ("AU05", 0.25), ("AU26", 0.25)],  # 1+2+5B+26: equal
-    "fearful":  [("AU01", 0.12), ("AU02", 0.12), ("AU04", 0.16),            # 1+2+4+5+7+20+26
-                 ("AU05", 0.16), ("AU07", 0.12), ("AU20", 0.16), ("AU26", 0.16)],
-    "disgusted":[("AU09", 0.40), ("AU15", 0.35), ("AU10", 0.25)],           # 9+15+16(≈AU10)
-    "contempt": [("AU12", 0.50), ("AU14", 0.50)],                           # R12A+R14A (bilateral approx.)
-}
-
 
 class FaceAnalyzer:
     def __init__(self):
@@ -182,17 +142,6 @@ class FaceAnalyzer:
         )
         self.mp_detector = mp_vision.FaceLandmarker.create_from_options(options)
         print("MediaPipe ready.")
-
-        # ── OpenFace setup (optional — used for post-hoc analysis only) ───────
-        # If the OpenFace binary is not found we skip the warmup and set a flag.
-        # The app still runs fully; post-hoc AU analysis is simply skipped.
-        self.openface_available = os.path.exists(OPENFACE_BIN)
-        if self.openface_available:
-            print(f"  OpenFace binary: {OPENFACE_BIN}")
-            self._warmup_openface()   # Pre-load models so the first post-hoc run is fast
-            print("OpenFace ready (post-hoc mode).")
-        else:
-            print("  OpenFace not found — post-hoc AU analysis disabled.")
 
         # ── Blink tracking state ──────────────────────────────────────────────
         self.blink_count        = 0
@@ -320,7 +269,6 @@ class FaceAnalyzer:
             # ── Blendshape-based emotions and AUs ─────────────────────────────
             # MediaPipe outputs 52 blendshape scores every frame.
             # We map them to emotion intensities and approximate AU values.
-            # These replace the OpenFace background-thread results from the old design.
             if result.face_blendshapes:
                 # Build a name → score lookup from the blendshape list.
                 bs_dict = {bs.category_name: bs.score
@@ -328,7 +276,6 @@ class FaceAnalyzer:
                 expressions = self._blendshapes_to_emotions(bs_dict)
                 aus_approx  = self._blendshapes_to_aus(bs_dict)
                 # Approximate Duchenne smile: both cheek raiser and lip corner puller active.
-                # This is a rough equivalent to the OpenFace AU06×AU12 check.
                 duchenne = float(
                     (bs_dict.get("cheekSquintLeft",  0) +
                      bs_dict.get("cheekSquintRight", 0) +
@@ -378,7 +325,7 @@ class FaceAnalyzer:
                 # Emotions from blendshapes (updates every frame at ~30 fps)
                 "expressions":    expressions,
                 "au_emotions":    expressions,   # Alias kept for trust_engine compatibility
-                "aus":            aus_approx,    # All mapped AUs (30 codes); replaced by accurate values in post-hoc Excel
+                "aus":            aus_approx,    # All mapped AUs, approximate — logged directly to the Excel export
                 "duchenne":       duchenne,
                 "dominant":       dominant,
             }
@@ -428,179 +375,13 @@ class FaceAnalyzer:
     def _blendshapes_to_aus(self, bs: dict) -> dict:
         """
         Map blendshape scores to approximate Action Unit intensities (0–1 scale).
-        These are anatomically motivated but less precise than OpenFace AU_r values.
-        They give trust_engine something to work with in real time; the post-hoc
-        OpenFace pass replaces them with accurate values in the Excel export.
+        These are anatomically motivated approximations, not FACS-certified values,
+        but they give trust_engine something to work with in real time.
         """
         aus = {}
         for au, components in BLENDSHAPE_AU_MAP.items():
             aus[au] = min(1.0, sum(bs.get(name, 0.0) * wt for name, wt in components))
         return aus
-
-    # ── Post-hoc OpenFace analysis ─────────────────────────────────────────────
-
-    @classmethod
-    def analyze_video(cls, video_path: str) -> list[dict]:
-        """
-        Run OpenFace on a session recording and return a list of per-frame AU dicts.
-
-        This is called automatically by main.py after a session ends, in a background
-        thread. It does not affect the live dashboard display.
-
-        Each returned dict has keys:
-            frame_idx, timestamp_s, success,
-            AU01..AU45 (intensity 0–1), AU01_c..AU45_c (presence 0/1),
-            expressions (emotion scores), duchenne
-
-        Returns an empty list if OpenFace is unavailable or fails.
-        """
-        if not os.path.exists(OPENFACE_BIN):
-            print("[post-hoc] OpenFace binary not found — skipping AU analysis.")
-            return []
-
-        out_dir  = tempfile.mkdtemp(prefix="of_out_")
-        frm_dir  = tempfile.mkdtemp(prefix="of_frm_")
-        try:
-            # OpenFace's bundled OpenCV often lacks video-decoding support.
-            # Extract frames as JPEG images with system ffmpeg, then pass the
-            # image directory to OpenFace via -fdir (image reading always works).
-            print(f"[post-hoc] Extracting frames from {video_path} …", flush=True)
-            extract = subprocess.run(
-                ["ffmpeg", "-y", "-i", video_path,
-                 "-q:v", "2",                       # high-quality JPEG
-                 os.path.join(frm_dir, "frame_%06d.jpg")],
-                capture_output=True, timeout=600,
-            )
-            n_frames = len([f for f in os.listdir(frm_dir) if f.endswith(".jpg")])
-            if extract.returncode != 0 or n_frames == 0:
-                err = extract.stderr.decode(errors="replace").strip()
-                print(f"[post-hoc] ffmpeg frame extraction failed: {err[-300:]}", flush=True)
-                return []
-
-            # OpenFace sets timestamp=0 for every row in -fdir mode because it
-            # doesn't know the frame rate.  Get fps from the source file so we
-            # can reconstruct timestamps as (frame_idx - 1) / fps.
-            video_fps = 30.0
-            try:
-                probe = subprocess.run(
-                    ["ffprobe", "-v", "error", "-select_streams", "v:0",
-                     "-show_entries", "stream=r_frame_rate",
-                     "-of", "default=noprint_wrappers=1:nokey=1", video_path],
-                    capture_output=True, text=True, timeout=10,
-                )
-                if probe.returncode == 0 and probe.stdout.strip():
-                    num, den = probe.stdout.strip().split("/")
-                    video_fps = float(num) / float(den)
-            except Exception:
-                pass
-
-            print(f"[post-hoc] Extracted {n_frames} frames at {video_fps:.2f} fps — running OpenFace …", flush=True)
-
-            cmd = [
-                OPENFACE_BIN,
-                "-fdir",    frm_dir,    # image directory — bypasses video decoding
-                "-out_dir", out_dir,
-                "-q",
-                "-aus",
-            ]
-            try:
-                result = subprocess.run(cmd, capture_output=True, timeout=1800)
-                if result.returncode != 0:
-                    err = result.stderr.decode(errors="replace").strip()
-                    print(f"[post-hoc] OpenFace stderr: {err[-400:]}", flush=True)
-            except subprocess.TimeoutExpired:
-                print("[post-hoc] OpenFace timed out.", flush=True)
-                return []
-
-            # Find the CSV that OpenFace wrote.
-            csv_path = None
-            for fname in os.listdir(out_dir):
-                if fname.endswith(".csv"):
-                    csv_path = os.path.join(out_dir, fname)
-                    break
-            if csv_path is None:
-                print("[post-hoc] OpenFace wrote no CSV.", flush=True)
-                return []
-
-            rows = []
-            AU_NAMES = ["AU01","AU02","AU04","AU05","AU06","AU07",
-                        "AU09","AU10","AU12","AU14","AU15","AU17",
-                        "AU20","AU23","AU25","AU26","AU45"]
-
-            with open(csv_path, newline="") as fh:
-                reader = csv.DictReader(fh)
-                for raw in reader:
-                    # Strip whitespace from all column names (OpenFace pads them).
-                    row = {k.strip(): v.strip() for k, v in raw.items()}
-
-                    def f(key, default=0.0):
-                        try: return float(row.get(key, default))
-                        except (ValueError, TypeError): return default
-
-                    # Success flag: 1 if OpenFace found a face in this frame, 0 if not.
-                    success = int(f("success"))
-
-                    # AU intensities normalised from the 0–5 OpenFace scale to 0–1.
-                    aus_r = {au: f(f"{au}_r") / 5.0 for au in AU_NAMES}
-
-                    # AU presence flags (0 or 1) — the noise gate.
-                    aus_c = {au: int(f(f"{au}_c")) for au in AU_NAMES}
-
-                    # Compute emotion scores using the same AU weighting as before.
-                    expressions = {}
-                    for emotion, components in AU_EMOTION_WEIGHTS.items():
-                        score = sum(aus_c.get(au, 0) * aus_r.get(au, 0.0) * wt
-                                    for au, wt in components)
-                        expressions[emotion] = min(1.0, score)
-                    expressions["neutral"] = max(0.0, 1.0 - sum(expressions.values()))
-
-                    # Accurate Duchenne smile: both AU06 and AU12 present and active.
-                    duchenne = float(
-                        (aus_c.get("AU06", 0) * aus_r.get("AU06", 0.0) +
-                         aus_c.get("AU12", 0) * aus_r.get("AU12", 0.0)) / 2.0
-                    )
-
-                    rows.append({
-                        "frame_idx":   int(f("frame")),
-                        "timestamp_s": round((int(f("frame")) - 1) / video_fps, 3),
-                        "success":     success,
-                        "aus":         aus_r,                       # Intensity 0–1 per AU
-                        "aus_c":       aus_c,                       # Presence flag per AU
-                        "expressions": expressions,
-                        "duchenne":    duchenne,
-                    })
-
-            print(f"[post-hoc] OpenFace parsed {len(rows)} frames.", flush=True)
-            return rows
-
-        except Exception as e:
-            print(f"[post-hoc] Error during OpenFace video analysis: {e}", flush=True)
-            return []
-        finally:
-            shutil.rmtree(out_dir,  ignore_errors=True)
-            shutil.rmtree(frm_dir,  ignore_errors=True)
-
-    # ── OpenFace utilities (used by analyze_video) ─────────────────────────────
-
-    def _warmup_openface(self):
-        """
-        Sends a blank image through OpenFace to pre-load its models into memory.
-        Called once at startup so the first post-hoc analysis doesn't have extra delay.
-        """
-        fd, jpg_path = tempfile.mkstemp(suffix=".jpg", prefix="of_warm_")
-        os.close(fd)
-        out_dir = tempfile.mkdtemp(prefix="of_warm_")
-        try:
-            blank = np.ones((360, 640, 3), dtype=np.uint8) * 128   # Plain grey — no face, but models still load
-            cv2.imwrite(jpg_path, blank)
-            cmd = [OPENFACE_BIN, "-f", jpg_path, "-out_dir", out_dir, "-q", "-aus"]
-            subprocess.run(cmd, capture_output=True, timeout=15.0)
-        except Exception:
-            pass   # Warmup failure is non-critical
-        finally:
-            try: os.unlink(jpg_path)
-            except OSError: pass
-            shutil.rmtree(out_dir, ignore_errors=True)
 
     # ── Private helpers ────────────────────────────────────────────────────────
 

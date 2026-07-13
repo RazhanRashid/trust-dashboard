@@ -29,14 +29,14 @@ import cv2
 import numpy as np
 import sounddevice as sd
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QStackedWidget,
                               QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox,
                               QFileDialog)
 
 # ── Analyzer modules (unchanged) ─────────────────────────────────────────────
-from Physio_analysis.face_analyzer    import FaceAnalyzer, BLENDSHAPE_AU_MAP
+from Physio_analysis.face_analyzer    import FaceAnalyzer
 from Physio_analysis.vocal_analyzer   import VocalAnalyzer
 from Physio_analysis.trust_engine     import TrustEngine, SCORE_CONFIG, SCORE_VERSION
 from Physio_analysis.workload_engine  import WorkloadEngine
@@ -50,9 +50,10 @@ except Exception:
 # ── UI modules ───────────────────────────────────────────────────────────────
 from theme import (BG, BG_DEEP, PANEL, LINE, LINE_SOFT, TEXT, TEXT_FAINT, TEXT_GHOST,
                     ACCENT, DANGER, C_WORKLOAD,
-                    ui_font, load_packaged_fonts, trust_band)
-from panels import TopStrip, CameraPanel, ScorePanel, VoicePanel, HistoryChart, Footer, FlagSidebar
-from overlays import OverviewScreen, CalibrationOverlay, SessionSummary, PosthocWaitingScreen
+                    ui_font, load_packaged_fonts, trust_band, TRUST_BANDS)
+from panels import (TopStrip, CameraPanel, ScorePanel, VoicePanel, HistoryChart,
+                     Footer, FlagSidebar, BlendshapeWatch)
+from overlays import OverviewScreen, CalibrationOverlay, SessionSummary
 
 try:
     import websockets
@@ -61,6 +62,37 @@ try:
 except ImportError:
     _HAS_WS = False
 
+# Canonical MediaPipe blendshape names, ARKit order (index 0 = _neutral).
+# Shared by the Excel export column order (_build_excel) and the live
+# Blendshape Watch panel's selector, so both stay in sync with one list.
+BLENDSHAPE_NAMES = [
+    "_neutral",
+    "browDownLeft",    "browDownRight",    "browInnerUp",
+    "browOuterUpLeft", "browOuterUpRight",
+    "cheekPuff",       "cheekSquintLeft",  "cheekSquintRight",
+    "eyeBlinkLeft",    "eyeBlinkRight",
+    "eyeLookDownLeft", "eyeLookDownRight",
+    "eyeLookInLeft",   "eyeLookInRight",
+    "eyeLookOutLeft",  "eyeLookOutRight",
+    "eyeLookUpLeft",   "eyeLookUpRight",
+    "eyeSquintLeft",   "eyeSquintRight",
+    "eyeWideLeft",     "eyeWideRight",
+    "jawForward",      "jawLeft",          "jawOpen",         "jawRight",
+    "mouthClose",
+    "mouthDimpleLeft", "mouthDimpleRight",
+    "mouthFrownLeft",  "mouthFrownRight",
+    "mouthFunnel",     "mouthLeft",
+    "mouthLowerDownLeft", "mouthLowerDownRight",
+    "mouthPressLeft",  "mouthPressRight",
+    "mouthPucker",     "mouthRight",
+    "mouthRollLower",  "mouthRollUpper",
+    "mouthShrugLower", "mouthShrugUpper",
+    "mouthSmileLeft",  "mouthSmileRight",
+    "mouthStretchLeft","mouthStretchRight",
+    "mouthUpperUpLeft","mouthUpperUpRight",
+    "noseSneerLeft",   "noseSneerRight",
+]
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 class TrustDashboard(QMainWindow):
@@ -68,10 +100,6 @@ class TrustDashboard(QMainWindow):
     Overview → Calibration → Live → Waiting → Summary."""
 
     CAM_W, CAM_H = 320, 240
-
-    # Emitted from the post-hoc background thread (via Qt signal machinery)
-    # so the main thread can safely transition to the summary screen.
-    _postprocess_finished = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -97,10 +125,12 @@ class TrustDashboard(QMainWindow):
         self._sample_rate   = 44100
         self._running       = True
         self._cap = None
+        self._measured_cam_fps: float = 30.0   # set for real in _start_camera / _switch_camera
 
         # ── Session / history state ─────────────────────────────────────────
         self._history = {k: [] for k in ("total", "facial", "vocal", "gaze", "hrv")}
         self._history_t: list[float] = []   # elapsed-session seconds, parallel to self._history
+        self._watched_blendshape: str = BLENDSHAPE_NAMES[0]  # set for real once BlendshapeWatch exists
         self._workload_state: dict = {}
         self._tlx_open = False
         self._session_rows: list = []
@@ -174,26 +204,12 @@ class TrustDashboard(QMainWindow):
         # ── Latest scores (read by camera loop for recording overlay) ────────
         self._last_scores: dict = {}   # Written by _update_body; read by _camera_loop
 
-        # ── Post-hoc OpenFace analysis ───────────────────────────────────────
-        # After a session ends, OpenFace is run on the .mp4 recording in a
-        # background thread. Results are stored here and written into the Excel.
-        self._postprocess_rows: list | None = None   # Per-frame AU dicts from OpenFace; None = not yet done
-        self._postprocess_thread: threading.Thread | None = None
-        self._auto_excel_path: Path | None = None    # Auto-saved Excel path for the current session
-        self._pending_summary_stats: dict | None = None   # Stats held until post-hoc completes
-        self._waiting: PosthocWaitingScreen | None = None  # Waiting screen widget
-
         # ── Persistence ─────────────────────────────────────────────────────
         self._sessions_file = self._session_dir / "sessions.json"
 
         # ── Build the UI ────────────────────────────────────────────────────
         self._build_ui()
         self._show_overview()
-
-        # ── Post-hoc signal → main thread transition ────────────────────────
-        # The background thread emits _postprocess_finished; Qt delivers it
-        # on the main thread so we can safely swap screens.
-        self._postprocess_finished.connect(self._on_postprocess_ui_done)
 
         # ── Main UI tick (60 ms — comfortable for eye, plenty fast for data)
         self._tick = QTimer(self)
@@ -261,6 +277,13 @@ class TrustDashboard(QMainWindow):
         row1.addWidget(self.voice_panel, 1)
         sl.addLayout(row1, 0)
 
+        # Row 1.5: blendshape watch — full-width, short, sits between the
+        # summary panels and the long-form history chart below.
+        self.blendshape_watch = BlendshapeWatch(BLENDSHAPE_NAMES)
+        self.blendshape_watch.blendshape_changed.connect(self._on_blendshape_changed)
+        self._watched_blendshape = self.blendshape_watch.current_blendshape()
+        sl.addWidget(self.blendshape_watch, 0)
+
         # Row 2: history chart full-width
         self.history_chart = HistoryChart()
         self.history_chart.setMinimumHeight(220)
@@ -304,16 +327,6 @@ class TrustDashboard(QMainWindow):
         self._cal.skip_clicked.connect(self._finish_calibration_now)
         self._stack.addWidget(self._cal)
         self._stack.setCurrentWidget(self._cal)
-
-    def _show_waiting(self):
-        """Show the post-hoc waiting screen while OpenFace processes the recording."""
-        if self._waiting is not None:
-            self._waiting.stop_spinner()
-            self._stack.removeWidget(self._waiting)
-            self._waiting.deleteLater()
-        self._waiting = PosthocWaitingScreen()
-        self._stack.addWidget(self._waiting)
-        self._stack.setCurrentWidget(self._waiting)
 
     def _show_summary(self, stats: dict):
         if self._sum is not None:
@@ -508,34 +521,23 @@ class TrustDashboard(QMainWindow):
         stats["session_id"]     = self._session_id
         self._save_session(stats)
 
-        # Auto-save a base Excel to the session directory immediately.
-        # This file is updated automatically with accurate AU data once
-        # post-hoc OpenFace analysis completes.
-        self._postprocess_rows = None   # Clear any result from a previous session
+        # Auto-save the session Excel export to the session directory.
         auto_excel = self._session_dir / f"trust-session-{self._session_id}.xlsx"
         try:
             self._build_excel(str(auto_excel))
-            self._auto_excel_path = auto_excel
-            print(f"[export] Auto-saved base Excel → {auto_excel}", flush=True)
+            print(f"[export] Auto-saved Excel → {auto_excel}", flush=True)
         except Exception as e:
             print(f"[export] Auto-save failed: {e}", flush=True)
-            self._auto_excel_path = None
 
-        # Store summary stats so _on_postprocess_ui_done() can pass them to
-        # the summary screen once the waiting screen is dismissed.
+        # Transcode the recording to H.264 in the background so it plays back
+        # cleanly in QuickTime. Runs unconditionally, independent of the UI.
+        if rec_path and rec_path.exists():
+            self._transcode_recording(rec_path)
+
         summary_stats = dict(stats)
         summary_stats["recording_path"] = str(rec_path) if rec_path else None
         summary_stats["thumbnail_path"] = str(thumb_path) if thumb_path else None
-        self._pending_summary_stats = summary_stats
-
-        # If OpenFace is available and a recording exists, show the waiting
-        # screen and process in the background. Otherwise go straight to summary.
-        if rec_path and rec_path.exists() and self.face.openface_available:
-            self._show_waiting()
-            self._launch_postprocess(rec_path)
-        else:
-            self._postprocess_rows = []   # Mark as done (no recording / no OpenFace)
-            self._show_summary(summary_stats)
+        self._show_summary(summary_stats)
 
     def _back_to_overview(self):
         self._session_ended = False
@@ -552,24 +554,17 @@ class TrustDashboard(QMainWindow):
         self._show_overview()
 
     # ════════════════════════════════════════════════════════════════════════
-    # Post-hoc OpenFace analysis
+    # Background video transcode
     # ════════════════════════════════════════════════════════════════════════
-
-    def _launch_postprocess(self, video_path: Path):
+    def _transcode_recording(self, video_path: Path):
         """
-        Start OpenFace post-hoc analysis on the session recording in a daemon
-        background thread. The main UI thread is never blocked.
-
-        When analysis completes, _on_postprocess_done() is called which:
-          1. Stores the per-frame AU rows in self._postprocess_rows
-          2. Re-saves the auto Excel with the accurate AU sheet included
+        Re-encode the just-recorded .mp4 (written with the mp4v fourcc for
+        reliable capture) to H.264 in a daemon background thread, so it plays
+        back cleanly in QuickTime and other players. Runs unconditionally
+        after every session, independent of any analysis pipeline; the UI is
+        never blocked waiting for it.
         """
-        # If a previous post-hoc thread is still running, leave it — it will finish
-        # harmlessly in the background. self._postprocess_rows will be overwritten
-        # only when this new session's thread completes.
         def _worker(path: Path):
-            rows = FaceAnalyzer.analyze_video(str(path))
-            # Transcode to H.264 for QuickTime after OpenFace has finished reading.
             tmp = path.with_suffix(".h264_tmp.mp4")
             try:
                 r = subprocess.run(
@@ -587,49 +582,9 @@ class TrustDashboard(QMainWindow):
             except Exception as e:
                 tmp.unlink(missing_ok=True)
                 print(f"[rec] H.264 transcode error: {e}", flush=True)
-            self._on_postprocess_done(rows)
 
-        self._postprocess_thread = threading.Thread(
-            target=_worker, args=(video_path,), daemon=True
-        )
-        self._postprocess_thread.start()
-        print("[post-hoc] Background OpenFace thread started.", flush=True)
-
-    def _on_postprocess_done(self, au_rows: list):
-        """
-        Called from the background thread when OpenFace finishes.
-        Stores the AU rows, rewrites the Excel, then emits a signal so the
-        main thread can safely dismiss the waiting screen and show the summary.
-        No Qt UI calls are made directly here — only the signal emit is safe.
-        """
-        self._postprocess_rows = au_rows if au_rows else []
-        print(f"[post-hoc] Analysis complete — {len(self._postprocess_rows)} frames.", flush=True)
-
-        # Re-save the Excel now that accurate AU data is available.
-        if self._auto_excel_path:
-            try:
-                self._build_excel(str(self._auto_excel_path))
-                print(f"[post-hoc] Excel updated with AU data → {self._auto_excel_path}", flush=True)
-            except Exception as e:
-                print(f"[post-hoc] Excel update failed: {e}", flush=True)
-
-        # Signal the main thread to swap screens.
-        self._postprocess_finished.emit()
-
-    def _on_postprocess_ui_done(self):
-        """
-        Runs on the Qt main thread (delivered via signal).
-        Tears down the waiting screen and shows the session summary.
-        """
-        if self._waiting is not None:
-            self._waiting.stop_spinner()
-            self._stack.removeWidget(self._waiting)
-            self._waiting.deleteLater()
-            self._waiting = None
-
-        if self._pending_summary_stats is not None:
-            self._show_summary(self._pending_summary_stats)
-            self._pending_summary_stats = None
+        threading.Thread(target=_worker, args=(video_path,), daemon=True).start()
+        print("[rec] Background H.264 transcode started.", flush=True)
 
     # ════════════════════════════════════════════════════════════════════════
     # Recording helpers
@@ -646,7 +601,12 @@ class TrustDashboard(QMainWindow):
         h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         if w < 1 or h < 1:
             w, h = 1280, 720
-        fps = self._cap.get(cv2.CAP_PROP_FPS)
+        # Use the empirically-measured delivery rate (set in _start_camera /
+        # _switch_camera) rather than cap.get(CAP_PROP_FPS) — the driver
+        # can report a fps that doesn't match what's actually delivered,
+        # and stamping the container with the wrong fps is what made
+        # recordings play back sped up.
+        fps = self._measured_cam_fps
         if fps < 10 or fps > 120:
             fps = 30.0
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")   # reliable write; transcoded to H.264 post-session
@@ -655,7 +615,7 @@ class TrustDashboard(QMainWindow):
             with self._writer_lock:
                 self._writer = writer
             self._recording_path = path
-            print(f"[rec] Recording → {path}  ({w}×{h})")
+            print(f"[rec] Recording → {path}  ({w}×{h} @ {fps:.1f}fps)")
         else:
             print("[rec] VideoWriter failed to open — no recording")
 
@@ -1067,6 +1027,24 @@ class TrustDashboard(QMainWindow):
         print(f"[camera] Selected index {chosen} ({camera_names.get(chosen, '?')}) — phone camera (no built-in found)")
         return chosen
 
+    def _measure_cam_fps(self, n_frames: int = 20) -> float:
+        """Actually clock how fast self._cap delivers frames, rather than
+        trusting cap.get(CAP_PROP_FPS) — some AVFoundation drivers just echo
+        back whatever fps was requested via cap.set() without truly honoring
+        it (e.g. still deliver 30fps at 720p even after a 60fps request).
+        Stamping the recorded VideoWriter with a nominal fps that doesn't
+        match the true delivery rate is exactly what caused recordings to
+        play back sped up, so we measure directly instead."""
+        n_ok = 0
+        t0 = time.time()
+        for _ in range(n_frames):
+            ok, _ = self._cap.read()
+            if ok:
+                n_ok += 1
+        elapsed = time.time() - t0
+        measured = (n_ok / elapsed) if elapsed > 0 and n_ok > 0 else 30.0
+        return max(10.0, min(measured, 60.0))
+
     def _start_camera(self):
         if self._cap is not None:
             return  # already running
@@ -1074,7 +1052,9 @@ class TrustDashboard(QMainWindow):
         self._cap = cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION)
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        time.sleep(0.3)
+        self._cap.set(cv2.CAP_PROP_FPS, 60)
+        self._measured_cam_fps = self._measure_cam_fps()
+        print(f"[cam] requested 60fps @1280x720 — measured {self._measured_cam_fps:.1f}fps actual delivery")
         self.cam_panel.set_camera_info(idx, len(self._available_cameras))
         threading.Thread(target=self._camera_loop,   daemon=True).start()
         threading.Thread(target=self._analysis_loop, daemon=True).start()
@@ -1089,9 +1069,18 @@ class TrustDashboard(QMainWindow):
         self._cap = cv2.VideoCapture(next_idx, cv2.CAP_AVFOUNDATION)
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self._cap.set(cv2.CAP_PROP_FPS, 60)
+        self._measured_cam_fps = self._measure_cam_fps()
+        print(f"[cam] switched camera — measured {self._measured_cam_fps:.1f}fps actual delivery")
         self._cam_ok = False
         self.cam_panel.set_camera_info(next_idx, len(self._available_cameras))
         self._save_camera_pref(next_idx)   # remember for next launch
+
+    def _on_blendshape_changed(self, name: str):
+        """User picked a different blendshape in the BlendshapeWatch dropdown.
+        BlendshapeWatch has already wiped its own display buffer — we just
+        need to start reading a different key out of face_data each tick."""
+        self._watched_blendshape = name
 
     def _camera_loop(self):
         while self._running:
@@ -1123,13 +1112,35 @@ class TrustDashboard(QMainWindow):
                             self._writer.write(rec_frame)
                         except Exception:
                             pass
-            time.sleep(0.033)
+            else:
+                # No frame this pass (camera hiccup/disconnected) — a short
+                # sleep here just avoids a hot spin loop. On the success path
+                # we deliberately do NOT sleep: cap.read() already blocks
+                # until the camera hardware delivers its next frame, so an
+                # unconditional extra sleep on top of that was silently
+                # halving the real capture rate — recordings were being
+                # written at roughly half the fps stamped in the file,
+                # which is exactly why played-back video looked sped up.
+                time.sleep(0.01)
 
     def _analysis_loop(self):
+        # Same double-throttle bug _camera_loop had: analyze() already costs
+        # real time (MediaPipe inference), so an unconditional sleep(0.033)
+        # afterward was stacking on top of that and staling face_data —
+        # every blendshape score, emotion, and gaze metric feeding the live
+        # charts — by up to an extra frame interval on every single pass.
+        # Fix: only do the (expensive) analyze() call when a genuinely new
+        # frame has arrived since last time (tracked via the camera loop's
+        # capture timestamp), and idle-sleep briefly otherwise. This also
+        # avoids wastefully re-analyzing the same still frame back-to-back
+        # now that _camera_loop can hand off frames much faster.
+        last_seen_ns = 0
         while self._running:
             with self._lock:
-                frame = self._pending_frame
-            if frame is not None:
+                frame    = self._pending_frame
+                frame_ns = self._frame_capture_ns
+            if frame is not None and frame_ns != last_seen_ns:
+                last_seen_ns = frame_ns
                 small = cv2.resize(frame, (640, 360))
                 face_data = self.face.analyze(small)
                 with self._lock:
@@ -1148,7 +1159,11 @@ class TrustDashboard(QMainWindow):
                         "pupil_norm":   round(float(fd.get("pupil_norm") or 0), 4),
                         "duchenne":     int(fd.get("duchenne", 0)),
                     })
-            time.sleep(0.033)
+            else:
+                # No new frame since last pass — brief idle wait rather than
+                # a hot spin loop, and much shorter than the old 33ms so a
+                # freshly-arrived frame gets picked up almost immediately.
+                time.sleep(0.005)
 
     # ════════════════════════════════════════════════════════════════════════
     # Audio thread
@@ -1305,6 +1320,14 @@ class TrustDashboard(QMainWindow):
         spec = self._compute_spectrum(audio_buf)
         self.voice_panel.set_spectrum(spec)
 
+        # Blendshape watch — raw 0-1 score for whichever blendshape is
+        # currently selected in the dropdown. Not part of self._history:
+        # BlendshapeWatch keeps its own short trailing window only.
+        bs_value = None
+        if face_data and face_data.get("detected"):
+            bs_value = face_data.get("blendshapes", {}).get(self._watched_blendshape)
+        self.blendshape_watch.update_value(bs_value, self._history_t[-1] if self._history_t else 0.0)
+
         # History chart — full session history (chart manages its own window)
         h  = {k: self._history[k] for k in ("total", "facial", "vocal", "gaze")}
         ts = self._history_t
@@ -1444,7 +1467,7 @@ class TrustDashboard(QMainWindow):
             "pcps":           round(float(wd.get("pcps",           1000.0)), 2),
             "wiv":            round(float(wd.get("wiv",            1000.0)), 2),
             "spike_progress": round(float(wd.get("spike_progress",    0.0)) * 100, 1),
-            # ── Action Units (OpenFace, normalized 0–1 from 0–5 scale) ─────
+            # ── Action Units (approximated from MediaPipe blendshapes, 0–1) ─
             # aus dict keys: AU01 AU02 AU04 AU05 AU06 AU07 AU09 AU10
             #                AU12 AU14 AU15 AU17 AU20 AU23 AU25 AU26 AU45
             "aus":            {au: round(v, 3)
@@ -1578,6 +1601,28 @@ class TrustDashboard(QMainWindow):
                         best = max(best, min(max_w, len(str(cell.value)) + 2))
                 ws.column_dimensions[get_column_letter(col[0].column)].width = best
 
+        def _write_legend(ws, legend, n_data_rows, total_cols):
+            """Shared LEGEND block writer — used by every 1/sec sheet so
+            self-documentation stays consistent across the workbook."""
+            leg_start = n_data_rows + 3   # blank row gap
+            title_cell = ws.cell(row=leg_start, column=1, value="LEGEND")
+            title_cell.font      = LEG_TITLE
+            title_cell.fill      = LEG_FILL
+            title_cell.alignment = LEFT
+            ws.merge_cells(start_row=leg_start, start_column=1,
+                           end_row=leg_start,   end_column=total_cols)
+
+            for i, (field, desc) in enumerate(legend, leg_start + 1):
+                k = ws.cell(row=i, column=1, value=field)
+                k.font      = LEG_KEY
+                k.alignment = LEFT
+                d = ws.cell(row=i, column=2, value=desc)
+                d.font      = LEG_VAL
+                d.alignment = LEFT
+                if total_cols > 2:
+                    ws.merge_cells(start_row=i, start_column=2,
+                                   end_row=i,   end_column=total_cols)
+
         def _write_sheet(ws, columns, legend):
             """columns: list of (header_label, row_key, formatter_fn | None)
                legend:  list of (field_name, description)"""
@@ -1604,25 +1649,7 @@ class TrustDashboard(QMainWindow):
                         cell.fill = fill
 
             # ── legend ──────────────────────────────────────────────────────
-            leg_start = len(rows) + 3   # blank row gap
-            title_cell = ws.cell(row=leg_start, column=1, value="LEGEND")
-            title_cell.font      = LEG_TITLE
-            title_cell.fill      = LEG_FILL
-            title_cell.alignment = LEFT
-            ws.merge_cells(start_row=leg_start, start_column=1,
-                           end_row=leg_start,   end_column=len(columns))
-
-            for i, (field, desc) in enumerate(legend, leg_start + 1):
-                k = ws.cell(row=i, column=1, value=field)
-                k.font      = LEG_KEY
-                k.alignment = LEFT
-                d = ws.cell(row=i, column=2, value=desc)
-                d.font      = LEG_VAL
-                d.alignment = LEFT
-                if len(columns) > 2:
-                    ws.merge_cells(start_row=i, start_column=2,
-                                   end_row=i,   end_column=len(columns))
-
+            _write_legend(ws, legend, len(rows), len(columns))
             _auto_width(ws)
 
         wb = openpyxl.Workbook()
@@ -1684,6 +1711,7 @@ class TrustDashboard(QMainWindow):
         # Blendshape AU columns are appended with a teal header so they are
         # visually distinct but still part of the same 1-fps sheet.
         HDR_FILL_BS = PatternFill("solid", fgColor="0E7490")   # teal — Blendshape AUs
+        HDR_FILL_AU = PatternFill("solid", fgColor="B45309")   # amber — Action Units (FACS)
 
         AU_META = {
             "AU01": ("Inner Brow Raise",       "Raises the inner corners of the eyebrows. Active in sadness, fear, and worry."),
@@ -1739,38 +1767,25 @@ class TrustDashboard(QMainWindow):
         ]
 
         # Canonical MediaPipe blendshape order (ARKit topology, index 0 = _neutral)
-        BS_ORDER = [
-            "_neutral",
-            "browDownLeft",    "browDownRight",    "browInnerUp",
-            "browOuterUpLeft", "browOuterUpRight",
-            "cheekPuff",       "cheekSquintLeft",  "cheekSquintRight",
-            "eyeBlinkLeft",    "eyeBlinkRight",
-            "eyeLookDownLeft", "eyeLookDownRight",
-            "eyeLookInLeft",   "eyeLookInRight",
-            "eyeLookOutLeft",  "eyeLookOutRight",
-            "eyeLookUpLeft",   "eyeLookUpRight",
-            "eyeSquintLeft",   "eyeSquintRight",
-            "eyeWideLeft",     "eyeWideRight",
-            "jawForward",      "jawLeft",          "jawOpen",         "jawRight",
-            "mouthClose",
-            "mouthDimpleLeft", "mouthDimpleRight",
-            "mouthFrownLeft",  "mouthFrownRight",
-            "mouthFunnel",     "mouthLeft",
-            "mouthLowerDownLeft", "mouthLowerDownRight",
-            "mouthPressLeft",  "mouthPressRight",
-            "mouthPucker",     "mouthRight",
-            "mouthRollLower",  "mouthRollUpper",
-            "mouthShrugLower", "mouthShrugUpper",
-            "mouthSmileLeft",  "mouthSmileRight",
-            "mouthStretchLeft","mouthStretchRight",
-            "mouthUpperUpLeft","mouthUpperUpRight",
-            "noseSneerLeft",   "noseSneerRight",
+        # — see module-level BLENDSHAPE_NAMES, shared with the live Blendshape
+        # Watch panel selector.
+        BS_ORDER = BLENDSHAPE_NAMES
+
+        # Action-Unit legend entries, generated from AU_META so descriptions
+        # stay in one place instead of duplicated between header and legend.
+        AU_LEGEND = [("Action Units (FACS)",
+                      "Approximate FACS Action Unit intensities (0–1), inferred from "
+                      "MediaPipe blendshape combinations — not a substitute for "
+                      "certified FACS coding.")] + [
+            (f"{code} – {AU_META[code][0]}", AU_META[code][1]) for code in AU_ORDER
         ]
+        FULL_FACIAL_LEGEND = FACIAL_LEGEND + AU_LEGEND
 
         ws2 = wb.create_sheet("Facial Analysis")
         n_fixed    = len(FACIAL_FIXED)
+        n_au       = len(AU_ORDER)
         n_bs       = len(BS_ORDER)
-        total_cols = n_fixed + n_bs
+        total_cols = n_fixed + n_au + n_bs
 
         # ── header — fixed metrics (blue) ───────────────────────────────────
         for c, (hdr, _, _f) in enumerate(FACIAL_FIXED, 1):
@@ -1778,9 +1793,16 @@ class TrustDashboard(QMainWindow):
             cell.font = HDR_FONT; cell.fill = HDR_FILL
             cell.alignment = CENTER; cell.border = BORDER
 
+        # ── header — action units (amber) ───────────────────────────────────
+        for i, au_code in enumerate(AU_ORDER):
+            c    = n_fixed + 1 + i
+            cell = ws2.cell(row=1, column=c, value=f"{au_code} – {AU_META[au_code][0]}")
+            cell.font = HDR_FONT; cell.fill = HDR_FILL_AU
+            cell.alignment = CENTER; cell.border = BORDER
+
         # ── header — blendshapes (teal) ─────────────────────────────────────
         for i, bs_name in enumerate(BS_ORDER):
-            c    = n_fixed + 1 + i
+            c    = n_fixed + n_au + 1 + i
             cell = ws2.cell(row=1, column=c, value=bs_name)
             cell.font = HDR_FONT; cell.fill = HDR_FILL_BS
             cell.alignment = CENTER; cell.border = BORDER
@@ -1798,28 +1820,25 @@ class TrustDashboard(QMainWindow):
                 cell = ws2.cell(row=r_idx, column=c, value=val)
                 cell.font = BODY_FONT; cell.alignment = CENTER
                 if fill: cell.fill = fill
+            # Action Unit columns
+            au_data = row.get("aus", {})
+            for i, au_code in enumerate(AU_ORDER):
+                c    = n_fixed + 1 + i
+                val  = au_data.get(au_code, "")
+                cell = ws2.cell(row=r_idx, column=c, value=val)
+                cell.font = BODY_FONT; cell.alignment = CENTER
+                if fill: cell.fill = fill
             # Blendshape columns
             bs_data = row.get("blendshapes", {})
             for i, bs_name in enumerate(BS_ORDER):
-                c    = n_fixed + 1 + i
+                c    = n_fixed + n_au + 1 + i
                 val  = bs_data.get(bs_name, "")
                 cell = ws2.cell(row=r_idx, column=c, value=val)
                 cell.font = BODY_FONT; cell.alignment = CENTER
                 if fill: cell.fill = fill
 
         # ── legend ─────────────────────────────────────────────────────────
-        leg2 = len(rows) + 3
-        tc = ws2.cell(row=leg2, column=1, value="LEGEND")
-        tc.font = LEG_TITLE; tc.fill = LEG_FILL; tc.alignment = LEFT
-        ws2.merge_cells(start_row=leg2, start_column=1,
-                        end_row=leg2,   end_column=total_cols)
-        for i, (field, desc) in enumerate(FACIAL_LEGEND, leg2 + 1):
-            k = ws2.cell(row=i, column=1, value=field)
-            k.font = LEG_KEY; k.alignment = LEFT
-            d = ws2.cell(row=i, column=2, value=desc)
-            d.font = LEG_VAL; d.alignment = LEFT
-            ws2.merge_cells(start_row=i, start_column=2,
-                            end_row=i,   end_column=total_cols)
+        _write_legend(ws2, FULL_FACIAL_LEGEND, len(rows), total_cols)
 
         # ── column widths ───────────────────────────────────────────────────
         from openpyxl.utils import get_column_letter as gcl
@@ -1827,7 +1846,9 @@ class TrustDashboard(QMainWindow):
         ws2.column_dimensions[gcl(2)].width = 12   # Elapsed
         for c in range(3, n_fixed + 1):
             ws2.column_dimensions[gcl(c)].width = 16
-        for c in range(n_fixed + 1, total_cols + 1):
+        for c in range(n_fixed + 1, n_fixed + n_au + 1):
+            ws2.column_dimensions[gcl(c)].width = 22  # AU header text is longer
+        for c in range(n_fixed + n_au + 1, total_cols + 1):
             ws2.column_dimensions[gcl(c)].width = 18  # blendshape names are longer
 
         # ════════════════════════════════════════════════════════════════════
@@ -1951,206 +1972,6 @@ class TrustDashboard(QMainWindow):
         ])
 
 
-        # ════════════════════════════════════════════════════════════════════
-        # Sheet 7 — OpenFace Raw  (per-frame, 30 fps, only when post-hoc ran)
-        # ════════════════════════════════════════════════════════════════════
-        # Full-resolution OpenFace output: one row per video frame.
-        # Blendshape AUs are in Facial Analysis (1 fps). This sheet is for
-        # deep analysis where per-frame accuracy matters.
-        postproc = self._postprocess_rows   # None/[] = not yet run; list = complete
-        if postproc:
-            ws_raw = wb.create_sheet("OpenFace Raw")
-            raw_fixed_hdrs = ["Frame", "Time (s)", "Face Found"]
-            raw_au_hdrs    = [f"{au} – {AU_META[au][0]}" for au in AU_ORDER if au in AU_META]
-            raw_headers    = raw_fixed_hdrs + raw_au_hdrs
-            n_raw_cols     = len(raw_headers)
-
-            for c, h in enumerate(raw_headers, 1):
-                cell = ws_raw.cell(row=1, column=c, value=h)
-                cell.font = HDR_FONT; cell.fill = HDR_FILL
-                cell.alignment = CENTER; cell.border = BORDER
-            ws_raw.freeze_panes = "A2"
-            ws_raw.row_dimensions[1].height = 28
-
-            for r_idx, prow in enumerate(postproc, 2):
-                fill  = ALT_FILL if r_idx % 2 == 0 else None
-                aus_p = prow.get("aus", {})
-                vals  = ([prow.get("frame_idx", ""),
-                          round(prow.get("timestamp_s", 0), 3),
-                          _yn(bool(prow.get("success")))] +
-                         [round(aus_p.get(au, 0), 4) for au in AU_ORDER if au in AU_META])
-                for c, v in enumerate(vals, 1):
-                    cell = ws_raw.cell(row=r_idx, column=c, value=v)
-                    cell.font = BODY_FONT; cell.alignment = CENTER
-                    if fill: cell.fill = fill
-
-            # ── legend ─────────────────────────────────────────────────────
-            leg_raw = len(postproc) + 3
-            tc = ws_raw.cell(row=leg_raw, column=1, value="LEGEND")
-            tc.font = LEG_TITLE; tc.fill = LEG_FILL; tc.alignment = LEFT
-            ws_raw.merge_cells(start_row=leg_raw, start_column=1,
-                               end_row=leg_raw,   end_column=n_raw_cols)
-            ws_raw.cell(row=leg_raw, column=1).value = (
-                "LEGEND  —  Raw per-frame OpenFace output at full video frame rate (~30 fps).  "
-                "AU values are OpenFace regression intensities (AU_r ÷ 5), normalised 0–1.  "
-                "Face Found = Yes only when OpenFace successfully tracked a face in that frame.  "
-                "For 1-fps session summaries with blendshape AUs, see the 'Facial Analysis' sheet."
-            )
-            for i, _au in enumerate((au for au in AU_ORDER if au in AU_META), leg_raw + 1):
-                _name, _desc = AU_META[_au]
-                k = ws_raw.cell(row=i, column=1, value=f"{_au}  {_name}")
-                k.font = LEG_KEY; k.alignment = LEFT
-                d = ws_raw.cell(row=i, column=2, value=_desc)
-                d.font = LEG_VAL; d.alignment = LEFT
-                ws_raw.merge_cells(start_row=i, start_column=2,
-                                   end_row=i,   end_column=n_raw_cols)
-
-            # ── column widths ───────────────────────────────────────────────
-            from openpyxl.utils import get_column_letter as gcl
-            ws_raw.column_dimensions[gcl(1)].width = 8    # Frame
-            ws_raw.column_dimensions[gcl(2)].width = 10   # Time (s)
-            ws_raw.column_dimensions[gcl(3)].width = 12   # Face Found
-            for c in range(4, n_raw_cols + 1):
-                ws_raw.column_dimensions[gcl(c)].width = 22
-
-        # ════════════════════════════════════════════════════════════════════
-        # Sheet — AU Timeline  (only when post-hoc ran)
-        # Per-AU line charts showing MediaPipe blendshape vs OpenFace over
-        # the session, so you can see whether the two systems spike together.
-        # MediaPipe is sampled at 1 fps; OpenFace values are snapped to the
-        # nearest successfully-tracked frame at each MediaPipe timestamp.
-        # ════════════════════════════════════════════════════════════════════
-        if postproc:
-            from openpyxl.chart import LineChart, Reference, Series
-            from openpyxl.utils import get_column_letter as gcl
-
-            aus_in_order = [au for au in AU_ORDER if au in AU_META]
-            good_of      = [p for p in postproc if p.get("success")]
-            of_times     = [p.get("timestamp_s", 0.0) for p in good_of]
-
-            def _nearest_of_aus(elapsed):
-                if not of_times:
-                    return {}
-                idx = min(range(len(of_times)),
-                          key=lambda i: abs(of_times[i] - elapsed))
-                return good_of[idx].get("aus", {})
-
-            aligned = [
-                {
-                    "elapsed": row.get("elapsed_s", 0.0),
-                    "mp":      row.get("aus", {}),
-                    "of":      _nearest_of_aus(row.get("elapsed_s", 0.0)),
-                }
-                for row in rows
-            ]
-
-            ws_tl = wb.create_sheet("AU Timeline")
-
-            TEAL = PatternFill("solid", fgColor="1A9E8F")
-            BLUE = PatternFill("solid", fgColor="2563EB")
-
-            mp_mapped = set(BLENDSHAPE_AU_MAP.keys())
-
-            # ── data table ──────────────────────────────────────────────────
-            # Col 1: Elapsed (s)
-            # For each AU: col 2+2i = MP blendshape (omitted for unmapped AUs),
-            #              col 3+2i = OF nearest frame
-            cell = ws_tl.cell(row=1, column=1, value="Elapsed (s)")
-            cell.font = HDR_FONT; cell.fill = HDR_FILL
-            cell.alignment = CENTER; cell.border = BORDER
-
-            GRAY = PatternFill("solid", fgColor="94A3B8")
-
-            def _bs_label(au):
-                """Return the base blendshape name for an AU (bilateral suffix stripped).
-                e.g. AU07 → eyeSquintLeft/Right → 'eyeSquint'
-                     AU01 → browInnerUp         → 'browInnerUp'"""
-                components = BLENDSHAPE_AU_MAP.get(au, [])
-                if not components:
-                    return None
-                name = components[0][0]
-                return name.replace("Left", "").replace("Right", "")
-
-            for i, au in enumerate(aus_in_order):
-                mp_col = 2 + i * 2
-                of_col = 3 + i * 2
-                bs_name = _bs_label(au)
-                if bs_name:
-                    c = ws_tl.cell(row=1, column=mp_col, value=f"{bs_name} (MP)")
-                    c.font = HDR_FONT; c.fill = TEAL; c.alignment = CENTER; c.border = BORDER
-                else:
-                    c = ws_tl.cell(row=1, column=mp_col, value=f"{au} (MP – n/a)")
-                    c.font = HDR_FONT; c.fill = GRAY; c.alignment = CENTER; c.border = BORDER
-                c = ws_tl.cell(row=1, column=of_col, value=f"{au} – {AU_META[au][0]} (OF)")
-                c.font = HDR_FONT; c.fill = BLUE; c.alignment = CENTER; c.border = BORDER
-
-            for r_idx, a in enumerate(aligned, 2):
-                ws_tl.cell(row=r_idx, column=1,
-                           value=round(a["elapsed"], 1)).font = BODY_FONT
-                for i, au in enumerate(aus_in_order):
-                    mp_col = 2 + i * 2
-                    of_col = 3 + i * 2
-                    if au in mp_mapped:
-                        ws_tl.cell(row=r_idx, column=mp_col,
-                                   value=round(a["mp"].get(au, 0.0), 4)).font = BODY_FONT
-                    ws_tl.cell(row=r_idx, column=of_col,
-                               value=round(a["of"].get(au, 0.0), 4)).font = BODY_FONT
-
-            n_data_rows = len(aligned)
-            n_au        = len(aus_in_order)
-            chart_col0  = 2 + n_au * 2 + 2   # 2-col gap after data table
-
-            # ── line charts: one per AU, 2-column grid ───────────────────────
-            CHART_W     = 16   # cm
-            CHART_H     = 10   # cm
-            ROWS_PER_CH = 20   # approximate Excel rows per chart height
-
-            for idx, au in enumerate(aus_in_order):
-                mp_col = 2 + idx * 2
-                of_col = 3 + idx * 2
-
-                chart = LineChart()
-                chart.title  = f"{au} – {AU_META[au][0]}"
-                chart.style  = 10
-                chart.width  = CHART_W
-                chart.height = CHART_H
-                chart.y_axis.title  = "Intensity (0–1)"
-                chart.y_axis.numFmt = "0.00"
-                chart.y_axis.delete = False
-                chart.x_axis.title  = "Elapsed (s)"
-                chart.x_axis.delete = False
-
-                cats    = Reference(ws_tl, min_col=1,    min_row=2,
-                                    max_row=1 + n_data_rows)
-                of_data = Reference(ws_tl, min_col=of_col, min_row=1,
-                                    max_row=1 + n_data_rows)
-
-                of_s = Series(of_data, title_from_data=True)
-                of_s.graphicalProperties.line.solidFill = "2563EB"
-                of_s.graphicalProperties.line.width     = 25400
-
-                if au in mp_mapped:
-                    mp_data = Reference(ws_tl, min_col=mp_col, min_row=1,
-                                        max_row=1 + n_data_rows)
-                    mp_s = Series(mp_data, title_from_data=True)
-                    mp_s.graphicalProperties.line.solidFill = "1A9E8F"
-                    mp_s.graphicalProperties.line.width     = 25400
-                    chart.series = [mp_s, of_s]
-                else:
-                    chart.series = [of_s]
-
-                chart.set_categories(cats)
-
-                anchor_row = (idx // 2) * ROWS_PER_CH + 2
-                anchor_col = chart_col0 + (idx % 2) * 30
-                ws_tl.add_chart(chart, f"{gcl(anchor_col)}{anchor_row}")
-
-            # ── column widths ────────────────────────────────────────────────
-            ws_tl.column_dimensions[gcl(1)].width = 12
-            for i in range(n_au):
-                ws_tl.column_dimensions[gcl(2 + i * 2)].width = 10
-                ws_tl.column_dimensions[gcl(3 + i * 2)].width = 10
-
         # ═══════════════════════════════════════════════════════════════════════════
         # Sheet — Raw Facial (~30 fps)
         # ═══════════════════════════════════════════════════════════════════════════
@@ -2180,6 +2001,16 @@ class TrustDashboard(QMainWindow):
                     cell = ws_rf.cell(row=r_idx, column=c, value=val)
                     cell.font = BODY_FONT; cell.alignment = CENTER
                     if fill: cell.fill = fill
+            _write_legend(ws_rf, [
+                ("Master TS (ns)", "Shared nanosecond clock used to align this sheet with "
+                                    "Raw Vocal and the 1/sec sheets despite differing sample rates."),
+                ("Eye AR",          "Raw Eye Aspect Ratio (0–1) before the ×100 scaling used on the 1/sec sheets."),
+                ("Blink /min",      "Rolling blinks-per-minute count, sampled at camera frame rate (~30 fps) "
+                                    "rather than the 1/sec throttle used elsewhere."),
+                ("Gaze Dev",        "Raw head-pose deviation (0–1) before the ×100 scaling used on the 1/sec sheets."),
+                ("Pupil (norm)",    "Iris radius normalised to inter-ocular distance, sampled every frame."),
+                ("Duchenne",        "Binary flag: AU06 + AU12 both active in this frame."),
+            ], len(self._raw_facial_rows), len(rf_cols))
             _auto_width(ws_rf)
 
         # ═══════════════════════════════════════════════════════════════════════════
@@ -2211,6 +2042,16 @@ class TrustDashboard(QMainWindow):
                     cell = ws_rv.cell(row=r_idx, column=c, value=val)
                     cell.font = BODY_FONT; cell.alignment = CENTER
                     if fill: cell.fill = fill
+            _write_legend(ws_rv, [
+                ("Master TS (ns)",   "Shared nanosecond clock used to align this sheet with "
+                                      "Raw Facial and the 1/sec sheets despite differing sample rates."),
+                ("Pitch Stability",  "Raw 0–1 value before the ×100 scaling used on the Vocal Analysis sheet."),
+                ("Energy Level",     "Raw 0–1 perceptual loudness before the ×100 scaling used elsewhere."),
+                ("Tremor Index",     "Raw 0–1 composite vocal instability, sampled once per audio chunk "
+                                      "rather than the 1/sec throttle used on the Vocal Analysis sheet."),
+                ("HNR (dB)",         "Harmonics-to-Noise Ratio for this audio chunk. Normal speech > 20 dB."),
+                ("Jitter",           "Local jitter (fraction, not ×100) for this audio chunk. Normal speech < 0.01."),
+            ], len(self._raw_vocal_rows), len(rv_cols))
             _auto_width(ws_rv)
 
         # ═══════════════════════════════════════════════════════════════════════════
@@ -2264,6 +2105,115 @@ class TrustDashboard(QMainWindow):
                 cell.font = BODY_FONT; cell.alignment = CENTER
                 if fill: cell.fill = fill
         _auto_width(ws_ev)
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # Sheet — Flags (behavioural triggers, same log-sheet pattern as Events)
+        # ═══════════════════════════════════════════════════════════════════════════
+        ws_fl = wb.create_sheet("Flags")
+        fl_cols = ["Time", "Flag", "Trust Band"]
+        band_label_by_color = {color: label for _, label, color in TRUST_BANDS}
+        for c, hdr in enumerate(fl_cols, 1):
+            cell = ws_fl.cell(row=1, column=c, value=hdr)
+            cell.font = HDR_FONT; cell.fill = HDR_FILL
+            cell.alignment = CENTER; cell.border = BORDER
+        ws_fl.freeze_panes = "A2"
+        for r_idx, (ts, text, color) in enumerate(self._session_flags, 2):
+            fill = ALT_FILL if r_idx % 2 == 0 else None
+            for c, val in enumerate([ts, text, band_label_by_color.get(color, color)], 1):
+                cell = ws_fl.cell(row=r_idx, column=c, value=val)
+                cell.font = BODY_FONT; cell.alignment = CENTER
+                if fill: cell.fill = fill
+            band_cell = ws_fl.cell(row=r_idx, column=3)
+            band_cell.fill = PatternFill("solid", fgColor=color.lstrip("#"))
+        _write_legend(ws_fl, [
+            ("Flag",        "Behavioural trigger detected live during the session "
+                             "(rapid blink rate, sustained gaze aversion, hostile-gaze AU combination, "
+                             "voice tremor, sharp trust drop). Each flag type is debounced ~8s."),
+            ("Trust Band",  "Trust-total band in effect at the moment the flag fired, "
+                             "matching the colour bands used in the live sidebar."),
+        ], len(self._session_flags), len(fl_cols))
+        _auto_width(ws_fl)
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # Sheet — Summary (session stats + phase breakdown, moved to front of workbook)
+        # ═══════════════════════════════════════════════════════════════════════════
+        stats = self._compute_session_stats()
+        ws_sum = wb.create_sheet("Summary")
+        for c, hdr in enumerate(["Metric", "Value"], 1):
+            cell = ws_sum.cell(row=1, column=c, value=hdr)
+            cell.font = HDR_FONT; cell.fill = HDR_FILL
+            cell.alignment = CENTER; cell.border = BORDER
+        ws_sum.freeze_panes = "A2"
+
+        def _r1(v):
+            return round(v, 1) if isinstance(v, float) else v
+
+        summary_rows = [
+            ("Session ID",              getattr(self, "_session_id", "")),
+            ("Score Engine Version",    stats.get("score_version", "")),
+            ("Active Channels",         ", ".join(stats.get("active_channels", [])) or "—"),
+            ("Duration",                stats.get("duration_str", "")),
+            ("Samples Recorded",        stats.get("n_samples", 0)),
+            ("Behavioural Flags Triggered", len(self._session_flags)),
+            ("Avg Trust Total",         _r1(stats.get("trust_total"))),
+            ("Peak Trust",              stats.get("peak_trust")),
+            ("Low Trust",               stats.get("low_trust")),
+            ("Avg Facial",              _r1(stats.get("trust_facial"))),
+            ("Avg Vocal",               _r1(stats.get("trust_vocal"))),
+            ("Avg Gaze",                _r1(stats.get("trust_gaze"))),
+            ("Avg HRV",                 _r1(stats.get("trust_hrv"))),
+            ("Face Detected %",         _r1(stats.get("pct_face_detected"))),
+            ("Speaking %",              _r1(stats.get("pct_speaking"))),
+            ("High Workload %",         _r1(stats.get("pct_high_workload"))),
+            ("Avg Pitch Stability %",   _r1(stats.get("avg_pitch_stability"))),
+            ("Avg Tremor %",            _r1(stats.get("avg_tremor"))),
+            ("Avg HNR (dB)",            _r1(stats.get("avg_hnr_db"))),
+            ("Avg Jitter %",            _r1(stats.get("avg_jitter"))),
+            ("Avg Alpha Ratio",         _r1(stats.get("avg_alpha_ratio"))),
+            ("Avg Blink Rate /min",     _r1(stats.get("avg_blink_rate"))),
+            ("Avg Gaze Deviation %",    _r1(stats.get("avg_gaze_deviation"))),
+        ]
+        for r_idx, (k, v) in enumerate(summary_rows, 2):
+            fill = ALT_FILL if r_idx % 2 == 0 else None
+            for c, val in enumerate([k, v], 1):
+                cell = ws_sum.cell(row=r_idx, column=c, value=val)
+                cell.font = BODY_FONT; cell.alignment = CENTER
+                if fill: cell.fill = fill
+
+        # ── phase breakdown table ────────────────────────────────────────────
+        ph_title_row = len(summary_rows) + 4
+        ph_title = ws_sum.cell(row=ph_title_row, column=1, value="PHASE BREAKDOWN")
+        ph_title.font = LEG_TITLE; ph_title.fill = LEG_FILL; ph_title.alignment = LEFT
+        ws_sum.merge_cells(start_row=ph_title_row, start_column=1,
+                            end_row=ph_title_row,   end_column=2)
+
+        ph_hdr_row = ph_title_row + 1
+        ph_cols = ["Phase", "Start (s)", "End (s)", "Duration (s)"]
+        for c, hdr in enumerate(ph_cols, 1):
+            cell = ws_sum.cell(row=ph_hdr_row, column=c, value=hdr)
+            cell.font = HDR_FONT; cell.fill = HDR_FILL
+            cell.alignment = CENTER; cell.border = BORDER
+
+        last_elapsed = rows[-1]["elapsed_s"] if rows else 0
+        for i, seg in enumerate(self._phase_segments):
+            r_idx = ph_hdr_row + 1 + i
+            fill = ALT_FILL if r_idx % 2 == 0 else None
+            start_s = seg.get("start_s", 0)
+            end_s   = seg.get("end_s")
+            if end_s is None:
+                end_s = last_elapsed   # phase still open when the session ended
+            duration = round(end_s - start_s, 1)
+            for c, val in enumerate([seg.get("label", seg.get("key", "")),
+                                      round(start_s, 1), round(end_s, 1), duration], 1):
+                cell = ws_sum.cell(row=r_idx, column=c, value=val)
+                cell.font = BODY_FONT; cell.alignment = CENTER
+                if fill: cell.fill = fill
+
+        _auto_width(ws_sum)
+
+        # Summary is the most useful landing page for someone opening the file
+        # cold — move it to the front without disturbing the build order above.
+        wb.move_sheet("Summary", offset=-wb.sheetnames.index("Summary"))
 
         wb.save(path)
 

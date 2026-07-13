@@ -161,7 +161,7 @@ class TrustEngine:
 
         # Duchenne smile check: a *genuine* smile activates both the cheek muscles (AU06)
         # and the lip corner muscles (AU12) together. A forced smile usually only shows AU12.
-        # OpenFace combines them into a single Duchenne score (0 = fake/absent, 1 = genuine).
+        # These are combined into a single Duchenne score (0 = fake/absent, 1 = genuine).
         # Genuine smiles are a strong trust signal, worth up to +20 points.
         duchenne = fd.get("duchenne", 0)
         prv_d = prev.get("face_duchenne", duchenne)   # Previous frame's Duchenne smile value
@@ -171,7 +171,8 @@ class TrustEngine:
         s += duchenne * 20           # Add up to 20 points for a full genuine smile
         prev["face_duchenne"] = duchenne
 
-        # Action Units (AUs) are specific facial muscle movements detected by OpenFace.
+        # Action Units (AUs) are specific facial muscle movements, approximated here
+        # from MediaPipe blendshapes.
         # These three are tension and stress indicators:
         #   AU04 = brow furrow (the frown between the eyebrows)
         #   AU20 = lip stretcher (lips pulled sideways under tension)
