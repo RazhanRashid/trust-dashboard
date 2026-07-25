@@ -4,9 +4,12 @@ opencv-python>=4.8,<4.12
 Pillow>=10.0
 sounddevice>=0.4
 matplotlib>=3.7
+PyQt6>=6.5
+pyqtgraph>=0.13
 PySide6>=6.5
 openpyxl>=3.1
 pyobjc-framework-AVFoundation>=9.0; sys_platform == 'darwin'
 opensmile>=2.4
 scipy>=1.11
 websockets>=10.0
+bleak>=0.21

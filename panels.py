@@ -13,7 +13,7 @@ from PyQt6.QtCore import Qt, QSize, pyqtSignal
 from PyQt6.QtGui import QFont, QImage, QPixmap, QColor
 from PyQt6.QtWidgets import (QWidget, QFrame, QLabel, QPushButton, QVBoxLayout,
                               QHBoxLayout, QGridLayout, QSizePolicy, QListWidget,
-                              QListWidgetItem, QComboBox)
+                              QListWidgetItem, QComboBox, QScrollArea)
 
 import pyqtgraph as pg
 
@@ -412,10 +412,18 @@ class ScorePanel(QFrame):
 
         v.addWidget(PanelHead("Composure index", "α 0.20 · ema"))
 
-
-        body_l = QVBoxLayout()
-        body_l.setContentsMargins(22, 14, 22, 20)
-        body_l.setSpacing(14)
+        # The body's content (gauge + attribution + channel bars + cognitive
+        # load) has a real minimum height that can exceed what's left after
+        # TopStrip/Footer/blendshape-watch/history-chart claim their space,
+        # especially near the window's minimum size. A QScrollArea degrades
+        # to a scrollbar in that case instead of Qt's layout compressing
+        # Fixed-size children below their own size, which produces
+        # overlapping widgets.
+        body_widget = QWidget()
+        body_widget.setStyleSheet(f"background: {PANEL};")
+        body_l = QVBoxLayout(body_widget)
+        body_l.setContentsMargins(22, 10, 22, 14)
+        body_l.setSpacing(6)
 
         # Gauge — no stretch above; gauge starts just below the header
         self.gauge = GaugeWidget()
@@ -430,12 +438,10 @@ class ScorePanel(QFrame):
         dot_row.addStretch()
         dot_row.addWidget(self._baseline_dot)
         body_l.addLayout(dot_row)
-        body_l.addSpacing(4)
 
         # Attribution strip
         self._attribution = AttributionStrip()
         body_l.addWidget(self._attribution)
-        body_l.addSpacing(12)
 
         # Column header row for the channel bars
         hdr = QHBoxLayout()
@@ -458,7 +464,7 @@ class ScorePanel(QFrame):
 
         # Channel bars
         bars = QVBoxLayout()
-        bars.setSpacing(10)
+        bars.setSpacing(4)
         self.bar_facial = ChannelBar("Facial", C_FACIAL, 25)
         self.bar_vocal  = ChannelBar("Vocal",  C_VOCAL,  25)
         self.bar_gaze   = ChannelBar("Gaze",   C_GAZE,   25)
@@ -504,7 +510,14 @@ class ScorePanel(QFrame):
         body_l.addWidget(self._wl_state)
 
         body_l.addStretch()
-        v.addLayout(body_l)
+
+        scroll = QScrollArea()
+        scroll.setWidget(body_widget)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet(f"QScrollArea {{ background: {PANEL}; border: none; }}")
+        scroll.viewport().setStyleSheet(f"background: {PANEL};")
+        v.addWidget(scroll)
 
     def update_scores(self, total: int, facial: int, vocal: int, gaze: int, hrv: int):
         label, color = trust_band(int(total))
@@ -514,6 +527,11 @@ class ScorePanel(QFrame):
         self.bar_vocal.setValue(vocal)
         self.bar_gaze.setValue(gaze)
         self.bar_hrv.setValue(hrv)
+
+    def set_hrv_connected(self, connected: bool):
+        """Un-stub the HRV bar once a real BLE sensor (e.g. Polar H10) is
+        streaming data; re-stub it if the sensor drops out."""
+        self.bar_hrv.setStub(not connected)
 
     def set_baseline_quality(self, pct: float):
         self._baseline_dot.set_quality(pct)
@@ -737,7 +755,8 @@ class HistoryChart(QFrame):
         for name, color in [("Composure", ACCENT),
                              ("Facial", C_FACIAL),
                              ("Vocal", C_VOCAL),
-                             ("Gaze", C_GAZE)]:
+                             ("Gaze", C_GAZE),
+                             ("HRV", C_HRV)]:
             sw = QFrame()
             sw.setFixedSize(QSize(14, 3))
             sw.setStyleSheet(f"background: {color}; border-radius: 2px;")
@@ -800,6 +819,8 @@ class HistoryChart(QFrame):
             pen=pg.mkPen(C_VOCAL,  width=1.4, dash=[2, 3]))
         self._curve_gaze = self._plot.plot([], [],
             pen=pg.mkPen(C_GAZE,   width=1.4, dash=[8, 3]))
+        self._curve_hrv = self._plot.plot([], [],
+            pen=pg.mkPen(C_HRV,    width=1.4, dash=[1, 3]))
 
         # Session history is unbounded and setData() is called every 60ms
         # with the full array. Without clipping/downsampling, per-tick
@@ -810,7 +831,7 @@ class HistoryChart(QFrame):
         # keeps min/max per pixel column so sharp trust drops/spikes still
         # show up instead of being smoothed away.
         for _curve in (self._curve_total, self._curve_facial,
-                       self._curve_vocal, self._curve_gaze):
+                       self._curve_vocal, self._curve_gaze, self._curve_hrv):
             _curve.setClipToView(True)
             _curve.setDownsampling(auto=True, method="peak")
 
@@ -869,7 +890,7 @@ class HistoryChart(QFrame):
     _TICK_S = 0.06  # timer fires every 60 ms
 
     def update_traces(self, history: dict, timestamps: list | None = None):
-        """history = {'total': [...], 'facial': [...], 'vocal': [...], 'gaze': [...]}.
+        """history = {'total': [...], 'facial': [...], 'vocal': [...], 'gaze': [...], 'hrv': [...]}.
         timestamps, if given, are absolute elapsed-session seconds (one per
         sample) so the x-axis reads real time and phase bands line up
         correctly. Falls back to a relative in-window index if omitted.
@@ -886,6 +907,7 @@ class HistoryChart(QFrame):
         self._curve_facial.setData(xs, history.get("facial", []))
         self._curve_vocal.setData(xs, history.get("vocal", []))
         self._curve_gaze.setData(xs, history.get("gaze", []))
+        self._curve_hrv.setData(xs, history.get("hrv", []))
 
         x_max = xs[-1] if xs else 0.0
         self._plot.setLimits(xMin=0, xMax=max(x_max, self.WINDOW_S))

@@ -93,6 +93,8 @@ class CalibrationOverlay(QWidget):
     start_clicked = pyqtSignal()    # user clicked Start Calibration
     skip_clicked  = pyqtSignal()    # user clicked Skip
 
+    HRV_MIN_SAMPLES = 8   # RMSSD-backed beats needed before the HRV baseline counts as "captured"
+
     SENTENCES = [
         '"The meeting is scheduled for Thursday at three in the afternoon."',
         '"I usually take the main road when the weather allows it."',
@@ -238,6 +240,22 @@ class CalibrationOverlay(QWidget):
         voice_row.addStretch()
         stat_l.addLayout(voice_row)
 
+        self._hrv_dot = self._make_dot()
+        self._hrv_lbl = QLabel("Searching for HR strap…")
+        self._hrv_lbl.setFont(ui_font(10))
+        self._hrv_lbl.setStyleSheet(f"color: {TEXT_FAINT};")
+        hrv_row = QHBoxLayout()
+        hrv_row.setSpacing(10)
+        hrv_row.addWidget(self._hrv_dot)
+        hrv_name = QLabel("HRV")
+        hrv_name.setFixedWidth(48)
+        hrv_name.setFont(ui_font(10, QFont.Weight.DemiBold))
+        hrv_name.setStyleSheet(f"color: {TEXT};")
+        hrv_row.addWidget(hrv_name)
+        hrv_row.addWidget(self._hrv_lbl)
+        hrv_row.addStretch()
+        stat_l.addLayout(hrv_row)
+
         stat_l.addStretch()
         body.addWidget(stat_card, 2)
         v.addLayout(body, 1)
@@ -320,7 +338,8 @@ class CalibrationOverlay(QWidget):
         )
         self._video.setPixmap(pix)
 
-    def update_indicators(self, face_detected: bool, voice_samples: int):
+    def update_indicators(self, face_detected: bool, voice_samples: int,
+                          hrv_status: str = "disabled", hrv_samples: int = 0):
         if face_detected:
             self._set_dot(self._face_dot, "#2da46a")
             self._face_lbl.setText("Detected ✓")
@@ -338,6 +357,27 @@ class CalibrationOverlay(QWidget):
             self._set_dot(self._voice_dot, TEXT_GHOST)
             self._voice_lbl.setText("Speak to calibrate…")
             self._voice_lbl.setStyleSheet(f"color: {TEXT_FAINT};")
+
+        if hrv_status == "disabled":
+            self._set_dot(self._hrv_dot, TEXT_GHOST)
+            self._hrv_lbl.setText("No HR strap support (bleak not installed)")
+            self._hrv_lbl.setStyleSheet(f"color: {TEXT_FAINT};")
+        elif hrv_samples >= self.HRV_MIN_SAMPLES:
+            self._set_dot(self._hrv_dot, "#2da46a")
+            self._hrv_lbl.setText(f"Captured ({hrv_samples} beats) ✓")
+            self._hrv_lbl.setStyleSheet(f"color: {TEXT};")
+        elif hrv_status == "connected":
+            self._set_dot(self._hrv_dot, "#c99a2e")
+            self._hrv_lbl.setText("Connected — gathering beats…")
+            self._hrv_lbl.setStyleSheet(f"color: {TEXT_FAINT};")
+        elif hrv_status in ("scanning", "connecting"):
+            self._set_dot(self._hrv_dot, TEXT_GHOST)
+            self._hrv_lbl.setText("Searching for HR strap…")
+            self._hrv_lbl.setStyleSheet(f"color: {TEXT_FAINT};")
+        else:
+            self._set_dot(self._hrv_dot, TEXT_GHOST)
+            self._hrv_lbl.setText("No HR strap detected")
+            self._hrv_lbl.setStyleSheet(f"color: {TEXT_FAINT};")
 
 
 # ─── Pixmap helper ──────────────────────────────────────────────────────────
@@ -692,10 +732,21 @@ class SessionSummary(QWidget):
     def populate(self, stats: dict):
         total = int(stats.get("trust_total", 50))
         label, color = trust_band(total)
-        self._meta.setText(
+        meta_text = (
             f"Duration {stats.get('duration_str', '00:00')}  ·  "
             f"{stats.get('n_samples', 0)} samples recorded"
         )
+        participant = stats.get("participant") or {}
+        p_bits = []
+        if participant.get("sex") and participant["sex"] != "Prefer not to say":
+            p_bits.append(str(participant["sex"]))
+        if participant.get("age"):
+            p_bits.append(f"{participant['age']}yo")
+        if participant.get("culture"):
+            p_bits.append(str(participant["culture"]))
+        if p_bits:
+            meta_text += "  ·  " + ", ".join(p_bits)
+        self._meta.setText(meta_text)
         self._big_num.setText(str(total))
         self._big_num.setStyleSheet(f"color: {color}; background: transparent;")
         self._big_label.setText(label.upper())

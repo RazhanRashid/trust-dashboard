@@ -29,6 +29,15 @@ import cv2
 import numpy as np
 import sounddevice as sd
 
+# OpenCV capture backend — AVFoundation only exists on macOS; DirectShow is the
+# reliable low-latency choice on Windows; CAP_ANY lets OpenCV pick on Linux.
+if sys.platform == "darwin":
+    _CAM_BACKEND = cv2.CAP_AVFOUNDATION
+elif sys.platform == "win32":
+    _CAM_BACKEND = cv2.CAP_DSHOW
+else:
+    _CAM_BACKEND = cv2.CAP_ANY
+
 from PyQt6.QtCore import Qt, QTimer, QUrl
 from PyQt6.QtGui import QFont, QDesktopServices
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QStackedWidget,
@@ -41,11 +50,6 @@ from Physio_analysis.vocal_analyzer   import VocalAnalyzer
 from Physio_analysis.trust_engine     import TrustEngine, SCORE_CONFIG, SCORE_VERSION
 from Physio_analysis.workload_engine  import WorkloadEngine
 from Physio_analysis.hrv_analyzer     import HRVAnalyzer
-try:
-    from Physio_analysis.nasa_tlx import NasaTLX  # noqa: F401
-    HAS_TLX = True
-except Exception:
-    HAS_TLX = False
 
 # ── UI modules ───────────────────────────────────────────────────────────────
 from theme import (BG, BG_DEEP, PANEL, LINE, LINE_SOFT, TEXT, TEXT_FAINT, TEXT_GHOST,
@@ -54,6 +58,7 @@ from theme import (BG, BG_DEEP, PANEL, LINE, LINE_SOFT, TEXT, TEXT_FAINT, TEXT_G
 from panels import (TopStrip, CameraPanel, ScorePanel, VoicePanel, HistoryChart,
                      Footer, FlagSidebar, BlendshapeWatch)
 from overlays import OverviewScreen, CalibrationOverlay, SessionSummary
+from demographics_dialog import DemographicsDialog
 
 try:
     import websockets
@@ -114,7 +119,6 @@ class TrustDashboard(QMainWindow):
         self.trust    = TrustEngine()
         self.workload = WorkloadEngine()
         self.hrv      = HRVAnalyzer()
-        self.workload.set_tlx_callback(self._on_workload_spike)
 
         # ── Threading + shared state ─────────────────────────────────────────
         self._lock = threading.Lock()
@@ -132,7 +136,6 @@ class TrustDashboard(QMainWindow):
         self._history_t: list[float] = []   # elapsed-session seconds, parallel to self._history
         self._watched_blendshape: str = BLENDSHAPE_NAMES[0]  # set for real once BlendshapeWatch exists
         self._workload_state: dict = {}
-        self._tlx_open = False
         self._session_rows: list = []
         self._session_start: float = 0.0
         self._session_start_ns: int = 0
@@ -147,6 +150,10 @@ class TrustDashboard(QMainWindow):
         self._ws_queue = None
         self._ws_enabled: bool = True
 
+        # ── Participant info (collected before calibration each session) ────
+        self._demographics: dict = {}
+        self._demo_dialog = None
+
         # ── Calibration state ───────────────────────────────────────────────
         self._calibrating = False
         self._calibration_started_at = None
@@ -158,6 +165,7 @@ class TrustDashboard(QMainWindow):
         # the VoicePanel can show "vs calibration" deltas for the two new metric boxes (HNR and Jitter).
         self._calibration_vocal = {"pitch_stability": [], "energy_level": [], "tremor_index": [],
                                    "hnr_db": [], "alpha_ratio": [], "jitter": []}
+        self._calibration_hrv: list[float] = []
         self._calibration_baseline: dict = {}
 
         # ── Behavioural flag state ──────────────────────────────────────────
@@ -367,12 +375,26 @@ class TrustDashboard(QMainWindow):
     # Session lifecycle
     # ════════════════════════════════════════════════════════════════════════
     def _start_session(self):
-        """User clicked Start on the overview — open calibration overlay."""
+        """User clicked Start on the overview — collect participant info
+        (sex, age, culture) before anything else, then open calibration."""
+        self._demo_dialog = DemographicsDialog(self)
+        self._demo_dialog.completed.connect(self._on_demographics_complete)
+        self._demo_dialog.open()
+
+    def _on_demographics_complete(self, result: dict | None):
+        """Fired when the participant-info dialog finishes. `result` is a
+        {"sex", "age", "culture"} dict, or None if the researcher cancelled —
+        in which case we stay on the overview and never touch the camera."""
+        self._demo_dialog = None
+        if result is None:
+            return
+        self._demographics = result
         self._show_calibration()
         # Start camera + audio in background so the calibration preview
         # already has a live feed when the user clicks Start Calibration.
         self._start_camera()
         self._start_audio()
+        self.hrv.start()  # scans/connects to a BLE HR strap (e.g. Polar H10) in the background
 
     def _begin_calibration(self):
         """User clicked Start Calibration inside the overlay."""
@@ -410,6 +432,12 @@ class TrustDashboard(QMainWindow):
                 self._calibration_vocal["alpha_ratio"].append(float(vocal_data["alpha_ratio"]))
             if vocal_data.get("jitter", 0.0) != 0.0:
                 self._calibration_vocal["jitter"].append(float(vocal_data["jitter"]))
+        # Only count a beat once the analyzer has a real RMSSD reading — while
+        # "connected" but still filling its rolling R-R window it reports the
+        # stub score, which must not pollute the HRV baseline.
+        hrv_display = self.hrv.get_display()
+        if hrv_display.get("rmssd_ms") is not None:
+            self._calibration_hrv.append(float(hrv_display["score"]))
 
     @staticmethod
     def _mean_or(values, fallback):
@@ -429,12 +457,20 @@ class TrustDashboard(QMainWindow):
             "voice_hnr_db":           self._mean_or(self._calibration_vocal["hnr_db"], None),
             "voice_alpha_ratio":      self._mean_or(self._calibration_vocal["alpha_ratio"], None),
             "voice_jitter":           self._mean_or(self._calibration_vocal["jitter"], None),
+            # None means no RMSSD-backed reading arrived during the window (no strap worn/
+            # connected) — same "no data" convention as the eGeMAPS voice fields above.
+            "hrv_score":              self._mean_or(self._calibration_hrv, None),
         }
         # Wire up per-user calibration: finalise the 30-s window, save the
         # per-channel baseline, then hand it to the fresh live engine.
         if self.trust._calibrating:
             self.trust.finish_calibration()
         _cal_baseline = self.trust.baseline.copy()
+        if self._calibration_hrv:
+            # The trust engine's own calibration hook (_calib_scores) never fires for HRV
+            # because trust.update() isn't called while the calibration screen is showing —
+            # so the resting HRV baseline has to be computed and set here instead.
+            _cal_baseline["hrv"] = sum(self._calibration_hrv) / len(self._calibration_hrv)
         self.trust = TrustEngine()
         self.trust.baseline = _cal_baseline
         self._history = {k: [] for k in ("total", "facial", "vocal", "gaze", "hrv")}
@@ -556,7 +592,7 @@ class TrustDashboard(QMainWindow):
         # Transcode the recording to H.264 in the background so it plays back
         # cleanly in QuickTime. Runs unconditionally, independent of the UI.
         if rec_path and rec_path.exists():
-            self._transcode_recording(rec_path)
+            self._transcode_recording(rec_path, getattr(self, "_rec_actual_fps", None))
 
         summary_stats = dict(stats)
         summary_stats["recording_path"] = str(rec_path) if rec_path else None
@@ -580,23 +616,31 @@ class TrustDashboard(QMainWindow):
     # ════════════════════════════════════════════════════════════════════════
     # Background video transcode
     # ════════════════════════════════════════════════════════════════════════
-    def _transcode_recording(self, video_path: Path):
+    def _transcode_recording(self, video_path: Path, actual_fps: float | None = None):
         """
         Re-encode the just-recorded .mp4 (written with the mp4v fourcc for
         reliable capture) to H.264 in a daemon background thread, so it plays
         back cleanly in QuickTime and other players. Runs unconditionally
         after every session, independent of any analysis pipeline; the UI is
         never blocked waiting for it.
+
+        *actual_fps* is the true frames-written / real-elapsed-time rate
+        measured during recording (see `_stop_recording`), which can differ
+        from the container's nominal fps if capture throughput dipped during
+        the session. Passing it as an input `-r` override re-times every
+        frame at the real rate so the output duration matches the real
+        session length instead of playing back sped up.
         """
         def _worker(path: Path):
             tmp = path.with_suffix(".h264_tmp.mp4")
             try:
-                r = subprocess.run(
-                    ["ffmpeg", "-y", "-i", str(path),
-                     "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                     "-movflags", "+faststart", "-an", str(tmp)],
-                    capture_output=True, timeout=600,
-                )
+                cmd = ["ffmpeg", "-y"]
+                if actual_fps and actual_fps > 0:
+                    cmd += ["-r", f"{actual_fps:.3f}"]
+                cmd += ["-i", str(path),
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                        "-movflags", "+faststart", "-an", str(tmp)]
+                r = subprocess.run(cmd, capture_output=True, timeout=600)
                 if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
                     tmp.replace(path)
                     print("[rec] Transcoded to H.264 for QuickTime compatibility.", flush=True)
@@ -638,6 +682,8 @@ class TrustDashboard(QMainWindow):
         if writer.isOpened():
             with self._writer_lock:
                 self._writer = writer
+                self._rec_frame_count = 0
+                self._rec_start_ns = time.time_ns()
             self._recording_path = path
             print(f"[rec] Recording → {path}  ({w}×{h} @ {fps:.1f}fps)")
         else:
@@ -650,6 +696,21 @@ class TrustDashboard(QMainWindow):
         with self._writer_lock:
             writer = self._writer
             self._writer = None
+            frame_count = getattr(self, "_rec_frame_count", 0)
+            start_ns = getattr(self, "_rec_start_ns", None)
+        stop_ns = time.time_ns()
+        # The container was stamped with a nominal fps measured before the
+        # session started; actual throughput during recording (contended by
+        # the analysis loop, overlay drawing, etc.) can run slower, which is
+        # what made played-back recordings finish sooner than the real
+        # session length. Recompute the true fps from frames actually
+        # written over the real elapsed time, and use that to correct the
+        # container's frame rate at transcode time.
+        self._rec_actual_fps = self._measured_cam_fps
+        if start_ns is not None and frame_count > 1:
+            elapsed_s = (stop_ns - start_ns) / 1e9
+            if elapsed_s > 0:
+                self._rec_actual_fps = max(1.0, min(frame_count / elapsed_s, 60.0))
         if writer is not None:
             try:
                 writer.release()
@@ -757,11 +818,8 @@ class TrustDashboard(QMainWindow):
 
     def _draw_recording_overlay(self, frame: np.ndarray, face_data: dict | None,
                                  scores: dict | None) -> np.ndarray:
-        """Draw the face mesh and blendshape emotion panel onto a recording frame."""
+        """Draw the blendshape emotion panel onto a recording frame."""
         h, w = frame.shape[:2]
-
-        # ── Face mesh ─────────────────────────────────────────────────────────
-        self._draw_face_mesh(frame, face_data)
 
         # ── Emotion definitions: label, BGR colour ────────────────────────────
         EMOTIONS = [
@@ -886,8 +944,13 @@ class TrustDashboard(QMainWindow):
 
         Tries PyObjC first; falls back to ffmpeg + system_profiler when
         PyObjC is unavailable (the fallback works reliably on macOS without
-        extra dependencies).
+        extra dependencies). macOS-only — Continuity Camera doesn't exist on
+        Windows/Linux, so this returns empty there and normal indices 0..9 are
+        just probed for a working device in `_pick_camera`.
         """
+        if sys.platform != "darwin":
+            return {}, set()
+
         # ── Method 1: PyObjC AVFoundation ────────────────────────────────────
         try:
             from AVFoundation import AVCaptureDevice, AVMediaTypeVideo
@@ -1004,7 +1067,7 @@ class TrustDashboard(QMainWindow):
         # ── Step 0: warm-up open to trigger macOS camera-permission grant ────
         _old = os.dup(2); os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
         try:
-            _w = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION); _w.release()
+            _w = cv2.VideoCapture(0, _CAM_BACKEND); _w.release()
         except Exception:
             pass
         finally:
@@ -1019,7 +1082,7 @@ class TrustDashboard(QMainWindow):
             old_err = os.dup(2)
             os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
             try:
-                cap = cv2.VideoCapture(i, cv2.CAP_AVFOUNDATION)
+                cap = cv2.VideoCapture(i, _CAM_BACKEND)
                 if cap.isOpened():
                     ret, _ = cap.read()
                     if ret:
@@ -1073,7 +1136,7 @@ class TrustDashboard(QMainWindow):
         if self._cap is not None:
             return  # already running
         idx = self._pick_camera()
-        self._cap = cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION)
+        self._cap = cv2.VideoCapture(idx, _CAM_BACKEND)
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         self._cap.set(cv2.CAP_PROP_FPS, 60)
@@ -1090,7 +1153,7 @@ class TrustDashboard(QMainWindow):
         next_idx = self._available_cameras[self._camera_idx_pos]
         if self._cap is not None:
             self._cap.release()
-        self._cap = cv2.VideoCapture(next_idx, cv2.CAP_AVFOUNDATION)
+        self._cap = cv2.VideoCapture(next_idx, _CAM_BACKEND)
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         self._cap.set(cv2.CAP_PROP_FPS, 60)
@@ -1134,6 +1197,7 @@ class TrustDashboard(QMainWindow):
                     if self._writer is not None:
                         try:
                             self._writer.write(rec_frame)
+                            self._rec_frame_count += 1
                         except Exception:
                             pass
             else:
@@ -1259,6 +1323,8 @@ class TrustDashboard(QMainWindow):
             self._cal.update_indicators(
                 face_detected=bool(face_data and face_data.get("detected")),
                 voice_samples=len(self._calibration_vocal["pitch_stability"]),
+                hrv_status=self.hrv.get_display().get("status", "disabled"),
+                hrv_samples=len(self._calibration_hrv),
             )
 
             if self._calibrating and self._calibration_started_at is not None:
@@ -1330,6 +1396,7 @@ class TrustDashboard(QMainWindow):
             scores["total"], scores["facial"], scores["vocal"],
             scores["gaze"], scores["hrv"],
         )
+        self.score_panel.set_hrv_connected(self.hrv.is_connected)
         self.score_panel.update_workload(wl_state)
 
         # Attribution strip — 6s rolling delta (~100 ticks at 60ms)
@@ -1433,6 +1500,7 @@ class TrustDashboard(QMainWindow):
         fd = face_data or {}
         vd = vocal_data or {}
         wd = wl_state   or {}
+        hd = self.hrv.get_display()
 
         row = {
             # ── Timestamps ─────────────────────────────────────────────────
@@ -1456,6 +1524,12 @@ class TrustDashboard(QMainWindow):
             "dhrv":           scores.get("dscores", {}).get("hrv",    0.0),
             "active_channels": scores.get("active_channels", []),
             "latency_ns":     (time.time_ns() - self._frame_capture_ns) if self._frame_capture_ns else 0,
+            # ── HRV (raw sensor readings from the BLE chest strap) ──────────
+            # heart_rate/rmssd_ms are None until a real device is connected and streaming;
+            # stored as 0 in the export rather than blank so downstream stats tools don't choke.
+            "hrv_connected":  self.hrv.is_connected,
+            "heart_rate_bpm": int(hd.get("heart_rate") or 0),
+            "rmssd_ms":       round(float(hd.get("rmssd_ms") or 0.0), 1),
             # ── Facial ──────────────────────────────────────────────────────
             "face_det":       bool(fd.get("detected")),
             "expression":     str(fd.get("dominant", "—")),
@@ -1542,6 +1616,7 @@ class TrustDashboard(QMainWindow):
             "score_version":       SCORE_VERSION,
             "score_config":        SCORE_CONFIG,
             "flags":               list(self._session_flags),
+            "participant":         dict(self._demographics),
         }
 
     # ════════════════════════════════════════════════════════════════════════
@@ -1571,6 +1646,7 @@ class TrustDashboard(QMainWindow):
             "n_events":         len(self._event_log),
             "score_version":    stats.get("score_version", ""),
             "active_channels":  stats.get("active_channels", []),
+            "participant":      stats.get("participant", {}),
             # Everything below is stored purely so a session card in the
             # overview list can be clicked later and show a full summary
             # (chart, phase bands, flags) without needing the original
@@ -1738,35 +1814,12 @@ class TrustDashboard(QMainWindow):
         ])
 
         # ════════════════════════════════════════════════════════════════════
-        # Sheet 2 — Facial Analysis  (metrics + blendshape AUs in one place)
+        # Sheet 2 — Facial Analysis  (metrics + blendshapes)
         # ════════════════════════════════════════════════════════════════════
         # Standard columns use the shared blue header.
-        # Blendshape AU columns are appended with a teal header so they are
+        # Blendshape columns are appended with a teal header so they are
         # visually distinct but still part of the same 1-fps sheet.
-        HDR_FILL_BS = PatternFill("solid", fgColor="0E7490")   # teal — Blendshape AUs
-        HDR_FILL_AU = PatternFill("solid", fgColor="B45309")   # amber — Action Units (FACS)
-
-        AU_META = {
-            "AU01": ("Inner Brow Raise",       "Raises the inner corners of the eyebrows. Active in sadness, fear, and worry."),
-            "AU02": ("Outer Brow Raise",       "Raises the outer corners of the eyebrows. Seen in surprise and fear."),
-            "AU04": ("Brow Lowerer",           "Pulls the brows together and down. Key marker of anger, concentration, and confusion."),
-            "AU05": ("Upper Lid Raiser",       "Widens the eye aperture. Strongly associated with surprise and fear."),
-            "AU06": ("Cheek Raiser",           "Raises the cheeks, forming crow's feet. Required component of a genuine (Duchenne) smile."),
-            "AU07": ("Lid Tightener",          "Tightens the lower eyelid. Present in anger, disgust, and focus."),
-            "AU09": ("Nose Wrinkler",          "Wrinkles the nose. Primary marker of disgust."),
-            "AU10": ("Upper Lip Raiser",       "Raises the upper lip. Present in disgust and mild contempt."),
-            "AU12": ("Lip Corner Puller",      "Pulls lip corners outward and upward. Core component of smiling."),
-            "AU14": ("Dimpler",                "Creates dimples by pulling lip corners. Seen in suppressed smiles and smirks."),
-            "AU15": ("Lip Corner Depressor",   "Pulls lip corners downward. Associated with sadness and disappointment."),
-            "AU17": ("Chin Raiser",            "Raises the chin boss. Seen in sadness, doubt, and pouting."),
-            "AU20": ("Lip Stretcher",          "Stretches lips horizontally. Common in fear and nervous tension."),
-            "AU23": ("Lip Tightener",          "Tightens the lips. Present in anger and determination."),
-            "AU25": ("Lips Part",              "Parts the lips. Accompanies many expressions; elevated in surprise, disgust, speech."),
-            "AU26": ("Jaw Drop",               "Opens the jaw. Strong indicator of surprise, shock, or open-mouth speech."),
-            "AU45": ("Blink / Eye Closure",    "Eye closure intensity. High sustained values indicate fatigue or discomfort."),
-        }
-        AU_ORDER = ["AU01","AU02","AU04","AU05","AU06","AU07","AU09","AU10",
-                    "AU12","AU14","AU15","AU17","AU20","AU23","AU25","AU26","AU45"]
+        HDR_FILL_BS = PatternFill("solid", fgColor="0E7490")   # teal — Blendshapes
 
         FACIAL_FIXED = [
             ("Timestamp",        "timestamp",    None),
@@ -1804,21 +1857,12 @@ class TrustDashboard(QMainWindow):
         # Watch panel selector.
         BS_ORDER = BLENDSHAPE_NAMES
 
-        # Action-Unit legend entries, generated from AU_META so descriptions
-        # stay in one place instead of duplicated between header and legend.
-        AU_LEGEND = [("Action Units (FACS)",
-                      "Approximate FACS Action Unit intensities (0–1), inferred from "
-                      "MediaPipe blendshape combinations — not a substitute for "
-                      "certified FACS coding.")] + [
-            (f"{code} – {AU_META[code][0]}", AU_META[code][1]) for code in AU_ORDER
-        ]
-        FULL_FACIAL_LEGEND = FACIAL_LEGEND + AU_LEGEND
+        FULL_FACIAL_LEGEND = FACIAL_LEGEND
 
         ws2 = wb.create_sheet("Facial Analysis")
         n_fixed    = len(FACIAL_FIXED)
-        n_au       = len(AU_ORDER)
         n_bs       = len(BS_ORDER)
-        total_cols = n_fixed + n_au + n_bs
+        total_cols = n_fixed + n_bs
 
         # ── header — fixed metrics (blue) ───────────────────────────────────
         for c, (hdr, _, _f) in enumerate(FACIAL_FIXED, 1):
@@ -1826,16 +1870,9 @@ class TrustDashboard(QMainWindow):
             cell.font = HDR_FONT; cell.fill = HDR_FILL
             cell.alignment = CENTER; cell.border = BORDER
 
-        # ── header — action units (amber) ───────────────────────────────────
-        for i, au_code in enumerate(AU_ORDER):
-            c    = n_fixed + 1 + i
-            cell = ws2.cell(row=1, column=c, value=f"{au_code} – {AU_META[au_code][0]}")
-            cell.font = HDR_FONT; cell.fill = HDR_FILL_AU
-            cell.alignment = CENTER; cell.border = BORDER
-
         # ── header — blendshapes (teal) ─────────────────────────────────────
         for i, bs_name in enumerate(BS_ORDER):
-            c    = n_fixed + n_au + 1 + i
+            c    = n_fixed + 1 + i
             cell = ws2.cell(row=1, column=c, value=bs_name)
             cell.font = HDR_FONT; cell.fill = HDR_FILL_BS
             cell.alignment = CENTER; cell.border = BORDER
@@ -1853,18 +1890,10 @@ class TrustDashboard(QMainWindow):
                 cell = ws2.cell(row=r_idx, column=c, value=val)
                 cell.font = BODY_FONT; cell.alignment = CENTER
                 if fill: cell.fill = fill
-            # Action Unit columns
-            au_data = row.get("aus", {})
-            for i, au_code in enumerate(AU_ORDER):
-                c    = n_fixed + 1 + i
-                val  = au_data.get(au_code, "")
-                cell = ws2.cell(row=r_idx, column=c, value=val)
-                cell.font = BODY_FONT; cell.alignment = CENTER
-                if fill: cell.fill = fill
             # Blendshape columns
             bs_data = row.get("blendshapes", {})
             for i, bs_name in enumerate(BS_ORDER):
-                c    = n_fixed + n_au + 1 + i
+                c    = n_fixed + 1 + i
                 val  = bs_data.get(bs_name, "")
                 cell = ws2.cell(row=r_idx, column=c, value=val)
                 cell.font = BODY_FONT; cell.alignment = CENTER
@@ -1879,9 +1908,7 @@ class TrustDashboard(QMainWindow):
         ws2.column_dimensions[gcl(2)].width = 12   # Elapsed
         for c in range(3, n_fixed + 1):
             ws2.column_dimensions[gcl(c)].width = 16
-        for c in range(n_fixed + 1, n_fixed + n_au + 1):
-            ws2.column_dimensions[gcl(c)].width = 22  # AU header text is longer
-        for c in range(n_fixed + n_au + 1, total_cols + 1):
+        for c in range(n_fixed + 1, total_cols + 1):
             ws2.column_dimensions[gcl(c)].width = 18  # blendshape names are longer
 
         # ════════════════════════════════════════════════════════════════════
@@ -1993,15 +2020,27 @@ class TrustDashboard(QMainWindow):
         # ════════════════════════════════════════════════════════════════════
         ws6 = wb.create_sheet("HRV")
         _write_sheet(ws6, [
-            ("Timestamp",          "timestamp", None),
-            ("Elapsed (s)",        "elapsed_s", None),
-            ("Phase",              "phase",     None),
-            ("HRV Score",          "hrv",       None),
+            ("Timestamp",          "timestamp",      None),
+            ("Elapsed (s)",        "elapsed_s",      None),
+            ("Phase",              "phase",          None),
+            ("HRV Score",          "hrv",            None),
+            ("Sensor Connected",   "hrv_connected",  _yn),
+            ("Heart Rate (bpm)",   "heart_rate_bpm", None),
+            ("RMSSD (ms)",         "rmssd_ms",       None),
         ], legend=[
-            ("HRV Score",          "Heart-rate variability composure sub-score (0–100). "
-                                   "Currently supplied by a stub analyzer returning a stable baseline (65). "
-                                   "Future integration with a wearable HRV sensor will populate "
-                                   "this column with real beat-to-beat interval data."),
+            ("HRV Score",          "Heart-rate variability composure sub-score (0–100), derived from RMSSD "
+                                   "via a literature-based mapping (20-90 range). Falls back to a fixed "
+                                   "stub value (65) whenever the sensor is disconnected or hasn't yet "
+                                   "collected enough beats for a reading — check 'Sensor Connected' and "
+                                   "'RMSSD (ms)' to tell real readings from the fallback."),
+            ("Sensor Connected",   "Whether the BLE heart-rate strap (e.g. Polar H10) was connected and "
+                                   "streaming at this sample."),
+            ("Heart Rate (bpm)",   "Instantaneous heart rate from the most recent BLE notification. "
+                                   "0 when no sensor is connected."),
+            ("RMSSD (ms)",         "Root mean square of successive R-R interval differences, over a "
+                                   "rolling 60-second window — the standard time-domain HRV metric that "
+                                   "the HRV Score is derived from. 0 until at least 4 R-R intervals have "
+                                   "been collected in the window."),
         ])
 
 
@@ -2181,8 +2220,12 @@ class TrustDashboard(QMainWindow):
         def _r1(v):
             return round(v, 1) if isinstance(v, float) else v
 
+        participant = stats.get("participant", {}) or {}
         summary_rows = [
             ("Session ID",              getattr(self, "_session_id", "")),
+            ("Participant Sex",         participant.get("sex", "—")),
+            ("Participant Age",         participant.get("age", "—")),
+            ("Participant Culture",     participant.get("culture") or "—"),
             ("Score Engine Version",    stats.get("score_version", "")),
             ("Active Channels",         ", ".join(stats.get("active_channels", [])) or "—"),
             ("Duration",                stats.get("duration_str", "")),
@@ -2249,28 +2292,6 @@ class TrustDashboard(QMainWindow):
         wb.move_sheet("Summary", offset=-wb.sheetnames.index("Summary"))
 
         wb.save(path)
-
-    # ════════════════════════════════════════════════════════════════════════
-    # Workload spike → NASA TLX dialog
-    # ════════════════════════════════════════════════════════════════════════
-    def _on_workload_spike(self):
-        """Called from the workload engine thread — hand off to the Qt main thread."""
-        if self._tlx_open or not HAS_TLX:
-            return
-        self._tlx_open = True
-        QTimer.singleShot(0, self._show_tlx_dialog)
-
-    def _show_tlx_dialog(self):
-        """Open the NASA TLX QDialog on the main thread."""
-        dlg = NasaTLX(self, trigger_ts=time.time())
-        dlg.completed.connect(self._on_tlx_complete)
-        dlg.open()   # non-blocking; fires completed signal when done
-
-    def _on_tlx_complete(self, result):
-        self._tlx_open = False
-        if result is not None:
-            print(f"[TLX] weighted={result['weighted_tlx']:.1f}  "
-                  f"raw={result['raw_tlx']:.1f}", flush=True)
 
     # ════════════════════════════════════════════════════════════════════════
     # Event logging + sync flash
@@ -2422,6 +2443,7 @@ class TrustDashboard(QMainWindow):
     # ════════════════════════════════════════════════════════════════════════
     def closeEvent(self, event):
         self._running = False
+        self.hrv.stop()
         # Flush and release writer before anything else
         with self._writer_lock:
             writer = self._writer

@@ -26,8 +26,12 @@ class GaugeWidget(QWidget):
         self._color = QColor("#60a5fa")
         self._band_label = ""
         self._band_color = "#94a3b8"
-        self.setFixedHeight(280)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        # Not setFixedHeight: paintEvent already scales the arc/text off the
+        # widget's real height, so letting it shrink under a size squeeze
+        # (small window) keeps siblings below it from overlapping instead of
+        # being pushed to a y-offset the gauge's fixed size then overruns.
+        self.setMinimumHeight(105)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding)
 
     def setScore(self, score: int, color_hex: str):
         self._score = max(0, min(100, int(score)))
@@ -139,6 +143,10 @@ class BarTrack(QWidget):
         self._value = max(0, min(100, float(v)))
         self.update()
 
+    def setStub(self, is_stub: bool):
+        self._is_stub = is_stub
+        self.update()
+
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -173,20 +181,18 @@ class ChannelBar(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(12)
 
-        lbl_color = TEXT_FAINT if is_stub else color_hex
-        lbl = QLabel(label)
-        lbl.setFixedWidth(58)
-        lbl.setFont(ui_font(10, QFont.Weight.Medium))
-        lbl.setStyleSheet(f"color: {lbl_color};")
+        self._color_hex = color_hex
+
+        self._lbl = QLabel(label)
+        self._lbl.setFixedWidth(58)
+        self._lbl.setFont(ui_font(10, QFont.Weight.Medium))
 
         self._track = BarTrack(color_hex, is_stub=is_stub)
 
-        num_text = "—" if is_stub else "50"
-        self._num = QLabel(num_text)
+        self._num = QLabel()
         self._num.setFixedWidth(32)
         self._num.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._num.setFont(mono_font(10, QFont.Weight.Medium))
-        self._num.setStyleSheet(f"color: {TEXT_FAINT if is_stub else TEXT};")
 
         w_lbl = QLabel(f"{weight_pct}%")
         w_lbl.setFixedWidth(36)
@@ -194,17 +200,31 @@ class ChannelBar(QWidget):
         w_lbl.setFont(mono_font(8))
         w_lbl.setStyleSheet(f"color: {TEXT_GHOST}; letter-spacing: 0.5px;")
 
-        row.addWidget(lbl)
+        row.addWidget(self._lbl)
         row.addWidget(self._track, 1)
         row.addWidget(self._num)
         row.addWidget(w_lbl)
         outer.addLayout(row)
 
-        if is_stub:
-            sub = QLabel("Sensor not connected")
-            sub.setFont(ui_font(8))
-            sub.setStyleSheet(f"color: {TEXT_FAINT}; padding-left: 70px;")
-            outer.addWidget(sub)
+        self._sub = QLabel("Sensor not connected")
+        self._sub.setFont(ui_font(8))
+        self._sub.setStyleSheet(f"color: {TEXT_FAINT}; padding-left: 70px;")
+        outer.addWidget(self._sub)
+
+        self._apply_stub_style()
+
+    def _apply_stub_style(self):
+        self._lbl.setStyleSheet(f"color: {TEXT_FAINT if self._is_stub else self._color_hex};")
+        self._num.setText("—" if self._is_stub else str(int(round(self._track._value))))
+        self._num.setStyleSheet(f"color: {TEXT_FAINT if self._is_stub else TEXT};")
+        self._sub.setVisible(self._is_stub)
+
+    def setStub(self, is_stub: bool):
+        if self._is_stub == is_stub:
+            return
+        self._is_stub = is_stub
+        self._track.setStub(is_stub)
+        self._apply_stub_style()
 
     def setValue(self, value: float):
         if self._is_stub:
@@ -443,7 +463,7 @@ class AttributionStrip(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(54)  # fixed height avoids layout shift
+        self.setFixedHeight(48)  # fixed height avoids layout shift
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(2)
@@ -490,8 +510,12 @@ class AttributionStrip(QWidget):
             if i < len(entries):
                 ch, label, prv, cur, pts = entries[i]
                 arrow = "▲" if pts > 0 else "▼"
+                # prv is None for metrics with no calibration baseline (e.g. alpha ratio,
+                # spectral flux) — show only the current reading rather than crashing on
+                # NoneType.__format__.
+                prv_str = f"{prv:.2f}→" if prv is not None else ""
                 lbl_widget.setText(
-                    f"  └─ {ch.capitalize()}: {label}  {prv:.2f}→{cur:.2f}  ({arrow}{abs(pts):.0f}pts)"
+                    f"  └─ {ch.capitalize()}: {label}  {prv_str}{cur:.2f}  ({arrow}{abs(pts):.0f}pts)"
                 )
             else:
                 lbl_widget.setText("")

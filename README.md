@@ -49,7 +49,6 @@ trust-dashboard/
 │   ├── trust_engine.py              # Combines all channels into the trust score
 │   ├── hrv_analyzer.py              # HRV (placeholder — see below)
 │   ├── workload_engine.py           # Pupil-dilation cognitive load detection
-│   ├── nasa_tlx.py                  # NASA Task Load Index questionnaire
 │   ├── FACE_ANALYSIS_ARCHITECTURE.md   # How the MediaPipe face pipeline works
 │   └── VOCAL_ANALYZER_EXPLAINED.md    # Plain-English walkthrough of the voice pipeline
 └── static/                          # Icons and fonts
@@ -95,7 +94,7 @@ See [`Physio_analysis/VOCAL_ANALYZER_EXPLAINED.md`](Physio_analysis/VOCAL_ANALYZ
 
 ### Cognitive load
 
-Pupil size (estimated from iris radius relative to inter-ocular distance) is tracked continuously. The workload engine computes a PCPS score `(pupil − baseline) / baseline + 1000` and maintains a 60-second rolling average as the WIV threshold. A sustained spike above that threshold for 60 seconds triggers a NASA TLX questionnaire when it resolves.
+Pupil size (estimated from iris radius relative to inter-ocular distance) is tracked continuously. The workload engine computes a PCPS score `(pupil − baseline) / baseline + 1000` and maintains a 60-second rolling average as the WIV threshold. A sustained spike above that threshold for 60 seconds is surfaced to the UI as `spike_progress`/`is_high_workload` (workload panel progress bar + Excel export columns).
 
 ### Trust score
 

@@ -43,7 +43,8 @@ TRUST_BANDS = [
     (0,  "Heightened",     "#e03e3e"),   # red
 ]
 
-HRV_IS_PLACEHOLDER = True  # set False when a real HRV sensor is connected
+HRV_IS_PLACEHOLDER = True  # initial state before any BLE connection attempt;
+                            # ScorePanel.set_hrv_connected() toggles this live once a sensor connects
 
 def trust_band(score: int):
     """Return (label, hex_color) for a 0–100 trust score."""

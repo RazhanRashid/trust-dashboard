@@ -9,9 +9,8 @@ How it works in plain English:
   3. It also tracks a rolling 60-second average of PCPS (called the WIV threshold).
   4. If PCPS stays above the threshold continuously for 60 seconds,
      that counts as a "workload spike" — the person has been under sustained strain.
-  5. The moment after the spike ends (pupil shrinks back below the threshold for
-     200 ms) the NASA TLX questionnaire is automatically triggered so the person
-     can rate how demanding that period felt.
+     `spike_progress` (0.0 → 1.0) tracks how close the current high-workload
+     period is to that 60-second mark, for display in the UI.
 
 The PCPS formula comes from Katidioti et al. (2016):
     PCPS = (pupil_now − pupil_baseline) / pupil_baseline + 1000
@@ -31,7 +30,6 @@ class WorkloadEngine:
     THRESHOLD_ADAPTER_INIT = 0.997   # Starting multiplier that converts the live average into the WIV threshold
     THRESHOLD_ADAPT_STEP   = 0.001   # Reserved for future auto-calibration; not yet used
     SPIKE_DURATION_S       = 60.0    # Seconds of continuous high workload needed before a "spike" is declared
-    LOW_WINDOW_S           = 0.200   # Seconds below the threshold needed to confirm workload has returned to normal
 
     def __init__(self):
         # The person's pupil size when they are calm and not doing anything demanding.
@@ -56,17 +54,6 @@ class WorkloadEngine:
         # Reset to None whenever workload drops back below the threshold.
         self._high_start       = None
 
-        # True once a full 60-second sustained spike has been confirmed.
-        # Stays True until the person's workload drops below the threshold for 200 ms.
-        self._spike_occurred   = False
-
-        # Wall-clock time when the low-workload recovery period started after a spike.
-        self._low_start        = None
-
-        # The function to call when a spike has ended and the NASA TLX should appear.
-        # Set from outside via set_tlx_callback().
-        self._tlx_callback     = None
-
         # ── Read-only state for the UI ────────────────────────────────────────────
         # These are updated inside the lock but read by the UI without locking
         # (a slightly stale value is acceptable for display purposes).
@@ -86,13 +73,6 @@ class WorkloadEngine:
         """
         self.baseline_pupil = baseline_pupil
 
-    def set_tlx_callback(self, cb):
-        """
-        Register the function that should be called when a spike ends.
-        The registered function will open the NASA TLX questionnaire dialog.
-        """
-        self._tlx_callback = cb
-
     def update(self, pupil_norm: float | None) -> dict:
         """
         Feed the engine one pupil measurement from the current camera frame.
@@ -111,8 +91,6 @@ class WorkloadEngine:
         # +1000 keeps the number positive even when pupils are smaller than baseline.
         # A value of 1000 means exactly at baseline. Above 1000 = dilated (more effort).
         pcps = (pupil_norm - self.baseline_pupil) / self.baseline_pupil + 1000.0
-
-        fire_tlx = False   # Will be set True if a spike just ended and we should show the TLX dialog
 
         with self._lock:   # Lock so the UI thread can't read half-updated values while we write
             # Add the new reading to the history queue with its timestamp.
@@ -138,9 +116,6 @@ class WorkloadEngine:
             self.is_high_workload = high
 
             if high:
-                # Reset the low-workload timer because we're still above the threshold.
-                self._low_start = None
-
                 # Record when this high-workload period started (only on the first high frame).
                 if self._high_start is None:
                     self._high_start = now
@@ -152,34 +127,10 @@ class WorkloadEngine:
                 # The UI uses this to show a growing progress bar.
                 self.spike_progress = min(1.0, elapsed_high / self.SPIKE_DURATION_S)
 
-                # If workload has been elevated for a full 60 seconds, declare a spike.
-                if elapsed_high >= self.SPIKE_DURATION_S:
-                    self._spike_occurred = True
-
             else:
                 # Workload dropped back below the threshold this frame.
                 self._high_start    = None    # Reset the high-workload timer
                 self.spike_progress = 0.0     # Reset the progress bar
-
-                if self._spike_occurred:
-                    # A spike was confirmed earlier and we are now in recovery.
-                    # Start timing how long workload has been below the threshold.
-                    if self._low_start is None:
-                        self._low_start = now
-
-                    # If workload has been low for the full 200 ms confirmation window,
-                    # the spike is truly over — trigger the NASA TLX questionnaire.
-                    elif now - self._low_start >= self.LOW_WINDOW_S:
-                        self._spike_occurred = False   # Clear the spike flag
-                        self._low_start      = None    # Reset the low timer
-                        fire_tlx             = True    # Signal that we should show the TLX dialog
-                else:
-                    # No spike is pending — just reset the low timer.
-                    self._low_start = None
-
-        # Fire the TLX callback outside the lock so it can safely interact with the UI.
-        if fire_tlx and self._tlx_callback:
-            self._tlx_callback()
 
         return self._snapshot()   # Return the current engine state to the caller
 
