@@ -162,7 +162,7 @@ Each session produces an `.xlsx` workbook:
 
 ## Requirements
 
-- Python 3.10
+- Python 3.14 (3.10+ should work, but 3.14 is what the app is tested on)
 - Webcam
 - Microphone (optional — voice analysis is skipped if unavailable)
 - `ffmpeg` and `ffprobe` on your PATH (used for thumbnail extraction and H.264 transcoding)
@@ -182,7 +182,11 @@ Each session produces an `.xlsx` workbook:
 git clone https://github.com/RazhanRashid/trust-dashboard.git
 cd trust-dashboard
 
-# 2. Install dependencies
+# 2. Create a virtual environment (3.14 recommended)
+python3.14 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+
+# 3. Install dependencies
 pip install -r requirements.txt
 ```
 

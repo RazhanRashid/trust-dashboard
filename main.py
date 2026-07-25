@@ -4,8 +4,8 @@ Drop-in replacement for the warm-aesthetic main.py. Same analyzer code,
 same threading model, same session persistence — only the UI layer is
 rewritten on top of PyQt6 + pyqtgraph.
 
-Run:
-    source /Users/razhanr/trust-dashboard/.venv/bin/activate
+Run (Python 3.10+, developed on 3.14):
+    source .venv/bin/activate
     pip install -r requirements.txt          # PyQt6 + pyqtgraph
     python main.py
 """

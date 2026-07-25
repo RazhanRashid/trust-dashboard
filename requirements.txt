@@ -1,12 +1,22 @@
+# Verified on Python 3.14 (mediapipe 0.10.35 / numpy 2.5.1 / opencv 4.13).
+# Nothing here caps below 3.14, and the floor stays at 3.10, but the 3.10 path
+# has not been re-tested since numpy was allowed onto 2.x.
 mediapipe>=0.10
-numpy>=1.23.5,<2.0
-opencv-python>=4.8,<4.12
+# numpy 1.x has no wheels for Python 3.13+, so the old <2.0 cap made 3.14
+# uninstallable. mediapipe 0.10.35 works fine against numpy 2.x.
+numpy>=1.23.5
+# The 3.14 wheels first appear in opencv 4.13, so the cap has to clear 4.12.
+# Held below 5.0 because that is a major release we have not tested against.
+opencv-python>=4.8,<5.0
+# mediapipe depends on opencv-contrib-python, which provides the same cv2
+# module. Pin it to the same major line — left unpinned, pip resolves it to
+# 5.0 while opencv-python stays on 4.13, and whichever installs last wins.
+opencv-contrib-python>=4.8,<5.0
 Pillow>=10.0
 sounddevice>=0.4
 matplotlib>=3.7
 PyQt6>=6.5
 pyqtgraph>=0.13
-PySide6>=6.5
 openpyxl>=3.1
 pyobjc-framework-AVFoundation>=9.0; sys_platform == 'darwin'
 opensmile>=2.4
