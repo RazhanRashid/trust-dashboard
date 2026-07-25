@@ -25,11 +25,19 @@ import threading
 import time
 from collections import deque
 
+# Catch Exception, not just ImportError. On Windows bleak pulls in the native
+# winrt-* extension modules, and a bad/missing one can surface as OSError or a
+# DLL-load error rather than ImportError — which would take the whole app down
+# on import instead of degrading to the stub score. The reason is kept so the
+# app can say *why* HRV is unavailable rather than failing mute.
 try:
     from bleak import BleakClient, BleakScanner
     _BLEAK_AVAILABLE = True
-except ImportError:
+    _BLEAK_IMPORT_ERROR: str | None = None
+except Exception as _exc:                      # noqa: BLE001 - deliberately broad
     _BLEAK_AVAILABLE = False
+    _BLEAK_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
+    print(f"[hrv] bleak unavailable — HRV disabled ({_BLEAK_IMPORT_ERROR})", flush=True)
 
 # Standard Bluetooth SIG UUIDs — same on every BLE heart-rate strap/chest belt.
 HEART_RATE_SERVICE_UUID = "0000180d-0000-1000-8000-00805f9b34fb"
@@ -103,9 +111,22 @@ class HRVAnalyzer:
     def start(self):
         """Begin scanning/connecting in a background thread. Safe to call
         even if bleak isn't installed or no sensor is available — the
-        dashboard just keeps using the stub score."""
-        if not _BLEAK_AVAILABLE or self._thread is not None:
+        dashboard just keeps using the stub score.
+
+        Every early return logs its reason. A silent no-op here is
+        indistinguishable from "scanned and found nothing", which makes the
+        difference between a missing dependency and an absent strap
+        impossible to tell apart from the dashboard alone."""
+        if not _BLEAK_AVAILABLE:
+            print(f"[hrv] not starting — bleak is not importable "
+                  f"({_BLEAK_IMPORT_ERROR}). Install it into the *same* Python "
+                  f"you launch main.py with: pip install -r requirements.txt", flush=True)
             return
+        if self._thread is not None:
+            print("[hrv] not starting — already running", flush=True)
+            return
+        print(f"[hrv] starting BLE heart-rate thread (looking for "
+              f"{self._device_name_hint!r})", flush=True)
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
@@ -316,16 +337,47 @@ class HRVAnalyzer:
 # prints live beats. Use this to tell "the strap isn't advertising" apart from
 # "the app isn't picking it up" without launching the whole dashboard.
 
+async def _report_bluetooth_radio():
+    """On Windows, print the Bluetooth adapter's power state.
+
+    Uses winrt-windows-devices-radios, which bleak already depends on, so no
+    extra install. This separates "the adapter is off or absent" from "the
+    adapter is fine and nothing is advertising" — an unfiltered scan returns
+    an empty dict in both cases, so the scan alone cannot tell them apart.
+    Best-effort: any failure here is reported, never fatal.
+    """
+    import sys
+    if sys.platform != "win32":
+        return
+    try:
+        from winrt.windows.devices.radios import Radio, RadioKind, RadioState
+        radios = await Radio.get_radios_async()
+        bt = [r for r in radios if r.kind == RadioKind.BLUETOOTH]
+        if not bt:
+            print("radio   : no Bluetooth adapter found by Windows")
+            return
+        for r in bt:
+            state = "ON" if r.state == RadioState.ON else str(r.state)
+            print(f"radio   : Bluetooth adapter {r.name!r} is {state}")
+    except Exception as exc:                   # noqa: BLE001
+        print(f"radio   : could not query adapter state ({type(exc).__name__}: {exc})")
+
+
 async def _diagnostic() -> int:
     import sys
 
     print(f"python  : {sys.version.split()[0]}")
     print(f"platform: {sys.platform}")
+    print(f"executable: {sys.executable}")
     if not _BLEAK_AVAILABLE:
-        print("\nbleak is NOT importable — install it with:  pip install -r requirements.txt")
+        print(f"\nbleak is NOT importable ({_BLEAK_IMPORT_ERROR})")
+        print("Install it into this exact interpreter:")
+        print(f"  {sys.executable} -m pip install -r requirements.txt")
         return 1
     from importlib.metadata import version
-    print(f"bleak   : {version('bleak')}\n")
+    print(f"bleak   : {version('bleak')}")
+    await _report_bluetooth_radio()
+    print()
 
     analyzer = HRVAnalyzer()
     device = await analyzer._find_device()
@@ -336,6 +388,9 @@ async def _diagnostic() -> int:
         print("  2. Is it already connected to something else (phone, Polar Flow/Beat,")
         print("     a watch)? BLE straps accept only one connection at a time.")
         print("  3. Is Bluetooth on, and does this terminal have permission to use it?")
+        print("  4. If the scan listed other devices but not the strap, the strap is")
+        print("     not advertising — that is a device/pairing problem, not the app.")
+        print("     If the scan listed NOTHING at all, suspect the adapter or drivers.")
         return 1
 
     print(f"\nConnecting to {device.name!r} ({device.address})...")
