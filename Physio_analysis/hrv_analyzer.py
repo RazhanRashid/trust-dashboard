@@ -34,6 +34,12 @@ except ImportError:
 # Standard Bluetooth SIG UUIDs — same on every BLE heart-rate strap/chest belt.
 HEART_RATE_SERVICE_UUID = "0000180d-0000-1000-8000-00805f9b34fb"
 HEART_RATE_MEASUREMENT_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
+# Some backends report 16-bit SIG UUIDs in short form rather than expanded.
+HEART_RATE_SERVICE_SHORT = "180d"
+
+# How long each scan pass runs. Windows tends to need longer than macOS before
+# a strap's advertisement is picked up, so this is deliberately not tight.
+SCAN_TIMEOUT_S = 10.0
 
 # R-R intervals older than this fall out of the RMSSD window.
 RR_WINDOW_SECONDS = 60.0
@@ -195,14 +201,62 @@ class HRVAnalyzer:
                 await self._sleep_or_stop(RECONNECT_DELAY_S)
 
     async def _find_device(self):
-        devices = await BleakScanner.discover(timeout=5.0, service_uuids=[HEART_RATE_SERVICE_UUID])
-        print(f"[hrv] devices advertising heart-rate service: {[(d.name, d.address) for d in devices]}", flush=True)
-        if not devices:
+        """Scan for a heart-rate strap and return the best match, or None.
+
+        Deliberately scans *unfiltered* and matches afterwards, rather than
+        passing service_uuids= to discover(). The two backends treat that
+        kwarg very differently:
+
+          - macOS hands it to CoreBluetooth's scanForPeripheralsWithServices,
+            so the OS itself does the filtering and it works reliably.
+          - Windows can't use its native filter (doing so would return either
+            the advertisement or the scan response, never both), so bleak
+            filters client-side on whatever service UUIDs happened to be in
+            the advertisement. A strap that only lists 0x180D in its scan
+            response — or whose first packets arrive without it — gets dropped
+            before it ever reaches us, which is why a filtered scan can come
+            back empty on Windows while finding the strap fine on a Mac.
+
+        Matching on the advertised service UUID *or* the device name recovers
+        those devices and behaves the same on both platforms.
+        """
+        found = await BleakScanner.discover(timeout=SCAN_TIMEOUT_S, return_adv=True)
+
+        if not found:
+            print("[hrv] scan found no BLE devices at all — is Bluetooth on?", flush=True)
             return None
-        for d in devices:
-            if d.name and self._device_name_hint.lower() in d.name.lower():
-                return d
-        return devices[0]
+
+        hint = self._device_name_hint.lower()
+        by_service: list = []
+        by_name: list = []
+
+        print(f"[hrv] scan found {len(found)} BLE device(s):", flush=True)
+        for device, adv in found.values():
+            uuids = {str(u).lower() for u in (adv.service_uuids or [])}
+            name = device.name or adv.local_name or "(unnamed)"
+            has_hr = HEART_RATE_SERVICE_UUID in uuids or HEART_RATE_SERVICE_SHORT in uuids
+            name_match = hint in name.lower()
+
+            marker = "  <-- heart-rate service" if has_hr else ("  <-- name match" if name_match else "")
+            print(f"[hrv]    {name!r} [{device.address}] rssi={adv.rssi}{marker}", flush=True)
+
+            if has_hr:
+                by_service.append(device)
+            elif name_match:
+                by_name.append(device)
+
+        # Prefer a device that actually advertises the heart-rate service, and
+        # among those prefer one matching the name hint (e.g. two straps in the room).
+        for device in by_service:
+            if hint in (device.name or "").lower():
+                return device
+        if by_service:
+            return by_service[0]
+        if by_name:
+            print(f"[hrv] no device advertised the heart-rate service; falling back to "
+                  f"name match {by_name[0].name!r}", flush=True)
+            return by_name[0]
+        return None
 
     async def _sleep_or_stop(self, seconds: float):
         try:
@@ -253,3 +307,66 @@ class HRVAnalyzer:
         """Linear mapping: RMSSD 0-80 ms → trust score 20-90."""
         score = 20.0 + (rmssd_ms / 80.0) * 70.0
         return int(max(0, min(100, round(score))))
+
+
+# ── Standalone diagnostic ───────────────────────────────────────────────────
+# Run with:  python -m Physio_analysis.hrv_analyzer
+#
+# Scans for BLE devices and, if a heart-rate strap is found, connects and
+# prints live beats. Use this to tell "the strap isn't advertising" apart from
+# "the app isn't picking it up" without launching the whole dashboard.
+
+async def _diagnostic() -> int:
+    import sys
+
+    print(f"python  : {sys.version.split()[0]}")
+    print(f"platform: {sys.platform}")
+    if not _BLEAK_AVAILABLE:
+        print("\nbleak is NOT importable — install it with:  pip install -r requirements.txt")
+        return 1
+    from importlib.metadata import version
+    print(f"bleak   : {version('bleak')}\n")
+
+    analyzer = HRVAnalyzer()
+    device = await analyzer._find_device()
+    if device is None:
+        print("\nNo heart-rate strap found. Things to check, in order:")
+        print("  1. Is the strap worn, with the electrodes moistened? A Polar H10")
+        print("     does not advertise at all until it detects skin contact.")
+        print("  2. Is it already connected to something else (phone, Polar Flow/Beat,")
+        print("     a watch)? BLE straps accept only one connection at a time.")
+        print("  3. Is Bluetooth on, and does this terminal have permission to use it?")
+        return 1
+
+    print(f"\nConnecting to {device.name!r} ({device.address})...")
+    async with BleakClient(device) as client:
+        print("Connected. Listening for 20 s of beats...\n")
+        done = asyncio.Event()
+        beats = 0
+
+        def _on_notify(_char, data: bytearray):
+            nonlocal beats
+            hr, rr = _parse_hr_measurement(bytes(data))
+            beats += 1
+            print(f"  HR {hr} bpm    R-R {rr or '(none reported)'}")
+            if beats >= 20:
+                done.set()
+
+        await client.start_notify(HEART_RATE_MEASUREMENT_UUID, _on_notify)
+        try:
+            await asyncio.wait_for(done.wait(), timeout=20.0)
+        except asyncio.TimeoutError:
+            pass
+        await client.stop_notify(HEART_RATE_MEASUREMENT_UUID)
+
+    if beats == 0:
+        print("Connected but received no notifications — the strap may not have "
+              "good skin contact.")
+        return 1
+    print(f"\nReceived {beats} notifications. The strap works; if the dashboard "
+          f"still shows no HRV, the problem is in the app wiring, not Bluetooth.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(_diagnostic()))
