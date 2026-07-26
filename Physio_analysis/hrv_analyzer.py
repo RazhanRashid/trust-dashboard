@@ -21,6 +21,7 @@ range), falls back to STUB_SCORE so the rest of the dashboard keeps working.
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
 import time
 from collections import deque
@@ -55,6 +56,59 @@ RR_WINDOW_SECONDS = 60.0
 MIN_RR_FOR_SCORE = 4
 # Re-scan/reconnect backoff after a dropped connection.
 RECONNECT_DELAY_S = 3.0
+# Per-attempt connect timeout. bleak's own default is 30 s, which stalls the
+# reconnect loop for a long time when a strap is advertising but refusing.
+CONNECT_TIMEOUT_S = 15.0
+
+
+def _describe_advertisement(adv) -> str:
+    """Which BLE packet types we actually received for a device (Windows only).
+
+    bleak's WinRT backend stashes the raw (advertisement, scan_response) pair
+    in ``AdvertisementData.platform_data``, and the advertisement's PDU type
+    says whether the device is accepting connections at all:
+
+      CONNECTABLE_UNDIRECTED     — normal, connectable
+      SCANNABLE_UNDIRECTED       — answers scans, refuses connections
+      NON_CONNECTABLE_UNDIRECTED — broadcast only
+
+    A strap that shows up in a scan but cannot be connected to is usually
+    advertising one of the latter two, which happens when its connection slots
+    are already taken (the H10 holds up to two). That is a device-side state,
+    not something the app can fix — but it is invisible unless we print it.
+
+    Returns "" on other platforms or when the detail isn't available.
+    """
+    try:
+        raw_adv, raw_scan = adv.platform_data[1]
+    except Exception:                          # noqa: BLE001 - shape is backend-specific
+        return ""
+
+    def _pdu_type(args) -> str:
+        try:
+            return args.advertisement_type.name
+        except Exception:                      # noqa: BLE001
+            return str(getattr(args, "advertisement_type", "?"))
+
+    parts = [f"pdu={_pdu_type(raw_adv)}" if raw_adv is not None
+             else "pdu=none-received"]
+    parts.append("scan-response=yes" if raw_scan is not None else "scan-response=no")
+    return " ".join(parts)
+
+
+def _connect_variants():
+    """(label, extra BleakClient kwargs) to try in order when opening a session.
+
+    On Windows, connecting goes through BluetoothLEDevice.FromBluetoothAddressAsync,
+    which resolves the address against the OS's own cache and returns null — surfacing
+    as BleakDeviceNotFoundError — when it cannot work out the address type on its own.
+    Stating the type explicitly is cheap and costs one extra round trip only when
+    the default has already failed.
+    """
+    yield "as discovered", {}
+    if sys.platform == "win32":
+        yield "address_type=public", {"winrt": {"address_type": "public"}}
+        yield "address_type=random", {"winrt": {"address_type": "random"}}
 
 
 def _parse_hr_measurement(data: bytes) -> tuple[int | None, list[int]]:
@@ -125,6 +179,11 @@ class HRVAnalyzer:
         if self._thread is not None:
             print("[hrv] not starting — already running", flush=True)
             return
+        try:
+            from importlib.metadata import version
+            print(f"[hrv] bleak {version('bleak')} on {sys.platform}", flush=True)
+        except Exception:                      # noqa: BLE001 - never block startup on this
+            pass
         print(f"[hrv] starting BLE heart-rate thread (looking for "
               f"{self._device_name_hint!r})", flush=True)
         self._stop_event.clear()
@@ -193,7 +252,8 @@ class HRVAnalyzer:
 
                 print(f"[hrv] found {device.name!r} ({device.address}) — connecting...", flush=True)
                 self._set_status("connecting")
-                async with BleakClient(device) as client:
+                client = await self._open_client(device)
+                try:
                     self._set_status("connected")
                     print("[hrv] connected, subscribing to heart-rate notifications", flush=True)
 
@@ -209,6 +269,11 @@ class HRVAnalyzer:
                             await client.stop_notify(HEART_RATE_MEASUREMENT_UUID)
                         except Exception:
                             pass
+                finally:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
                 print("[hrv] disconnected", flush=True)
             except Exception as exc:
                 # Connection dropped, device unreachable, adapter error, etc.
@@ -220,6 +285,74 @@ class HRVAnalyzer:
 
             if not self._stop_event.is_set():
                 await self._sleep_or_stop(RECONNECT_DELAY_S)
+
+    async def _open_client(self, device):
+        """Connect to *device*, trying each variant until one works.
+
+        Raises the last error if they all fail, after printing what the
+        failure most likely means — a strap that scans but won't connect is
+        otherwise just a repeating error line with no way in.
+        """
+        last_error: Exception | None = None
+        for label, kwargs in _connect_variants():
+            client = BleakClient(device, timeout=CONNECT_TIMEOUT_S, **kwargs)
+            try:
+                await client.connect()
+            except Exception as exc:           # noqa: BLE001
+                last_error = exc
+                print(f"[hrv] connect failed ({label}): {exc!r}", flush=True)
+                continue
+            if label != "as discovered":
+                print(f"[hrv] connected using {label}", flush=True)
+            return client
+
+        await self._explain_connect_failure(device)
+        assert last_error is not None
+        raise last_error
+
+    async def _explain_connect_failure(self, device):
+        """Print what to check when every connect attempt failed.
+
+        Only useful on Windows: macOS hands back a CoreBluetooth peripheral
+        that either connects or reports a real error, whereas Windows fails
+        the same way ("not found") whether the strap is busy, bonded stale, or
+        genuinely gone. Best-effort — never raises.
+        """
+        if sys.platform != "win32":
+            return
+        print("[hrv] the strap is advertising but Windows will not open a connection "
+              "to it. In order of likelihood:", flush=True)
+        print("[hrv]   1. Its connection slots are taken. An H10 holds two BLE links "
+              "at once; a phone running Polar Flow/Beat, a watch, or a bike computer "
+              "each occupy one. Close/disconnect them and the strap frees up.", flush=True)
+        print("[hrv]   2. Windows holds a stale bond. Settings > Bluetooth & devices, "
+              "find the strap, Remove device. Pairing is not needed — the dashboard "
+              "connects to an unpaired strap.", flush=True)
+        print("[hrv]   3. The adapter is busy or wedged. Toggle Bluetooth off/on.", flush=True)
+
+        try:
+            from winrt.windows.devices.bluetooth import (BluetoothConnectionStatus,
+                                                         BluetoothLEDevice)
+            from winrt.windows.devices.enumeration import DeviceInformation
+        except Exception as exc:               # noqa: BLE001
+            print(f"[hrv]   (cannot check Windows' paired-device list: "
+                  f"{type(exc).__name__}: {exc})", flush=True)
+            return
+
+        for label, selector in (
+            ("paired", BluetoothLEDevice.get_device_selector_from_pairing_state(True)),
+            ("connected", BluetoothLEDevice.get_device_selector_from_connection_status(
+                BluetoothConnectionStatus.CONNECTED)),
+        ):
+            try:
+                infos = await DeviceInformation.find_all_async_aqs_filter(selector)
+                names = sorted(i.name for i in infos if i.name)
+            except Exception as exc:           # noqa: BLE001
+                print(f"[hrv]   ({label} device list unavailable: "
+                      f"{type(exc).__name__}: {exc})", flush=True)
+                continue
+            print(f"[hrv]   Windows {label} BLE devices: "
+                  f"{', '.join(names) if names else '(none)'}", flush=True)
 
     async def _find_device(self):
         """Scan for a heart-rate strap and return the best match, or None.
@@ -259,7 +392,11 @@ class HRVAnalyzer:
             name_match = hint in name.lower()
 
             marker = "  <-- heart-rate service" if has_hr else ("  <-- name match" if name_match else "")
-            print(f"[hrv]    {name!r} [{device.address}] rssi={adv.rssi}{marker}", flush=True)
+            # Only for candidates: printing PDU types for 20 unrelated beacons
+            # buries the one line that matters.
+            detail = f"  {_describe_advertisement(adv)}" if (has_hr or name_match) else ""
+            print(f"[hrv]    {name!r} [{device.address}] rssi={adv.rssi}{marker}{detail}",
+                  flush=True)
 
             if has_hr:
                 by_service.append(device)
@@ -394,10 +531,16 @@ async def _diagnostic() -> int:
         return 1
 
     print(f"\nConnecting to {device.name!r} ({device.address})...")
-    async with BleakClient(device) as client:
+    # Same escalation and post-mortem the dashboard uses, so the two agree.
+    try:
+        client = await analyzer._open_client(device)
+    except Exception as exc:                   # noqa: BLE001
+        print(f"\nCould not connect: {exc!r}")
+        return 1
+    beats = 0
+    try:
         print("Connected. Listening for 20 s of beats...\n")
         done = asyncio.Event()
-        beats = 0
 
         def _on_notify(_char, data: bytearray):
             nonlocal beats
@@ -413,6 +556,11 @@ async def _diagnostic() -> int:
         except asyncio.TimeoutError:
             pass
         await client.stop_notify(HEART_RATE_MEASUREMENT_UUID)
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
 
     if beats == 0:
         print("Connected but received no notifications — the strap may not have "
