@@ -27,6 +27,14 @@ from widgets import (GaugeWidget, BarTrack, ChannelBar, StatusDot,
                       MetricBox, PanelHead, WaveformWidget, SpectrumWidget,
                       AttributionStrip, BaselineQualityDot)
 
+# Height of a PanelHead strip — must match widgets.PanelHead's setFixedHeight.
+PANEL_HEAD_H = 42
+# Slack added on top of a panel body's measured minimum when declaring the
+# panel's own minimum height. Font metrics vary by platform (Inter on the
+# design's Mac, Segoe UI on Windows), and a body sized to the pixel clips its
+# last row on whichever machine rounds the other way.
+BODY_HEADROOM = 24
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Top strip — header
@@ -422,8 +430,14 @@ class ScorePanel(QFrame):
         body_widget = QWidget()
         body_widget.setStyleSheet(f"background: {PANEL};")
         body_l = QVBoxLayout(body_widget)
-        body_l.setContentsMargins(22, 10, 22, 14)
-        body_l.setSpacing(6)
+        body_l.setContentsMargins(22, 10, 22, 10)
+        # 4px not 6px between the eight stacked rows. The body's required
+        # height sat within a few px of the viewport it gets, which is close
+        # enough that a font with slightly different metrics — Segoe UI on
+        # Windows rather than the design's Inter — pushed it over and the
+        # bottom channel bar disappeared behind a scrollbar. Tightening the
+        # gaps buys back real headroom; see setMinimumHeight below.
+        body_l.setSpacing(4)
 
         # Gauge — no stretch above; gauge starts just below the header
         self.gauge = GaugeWidget()
@@ -518,6 +532,17 @@ class ScorePanel(QFrame):
         scroll.setStyleSheet(f"QScrollArea {{ background: {PANEL}; border: none; }}")
         scroll.viewport().setStyleSheet(f"background: {PANEL};")
         v.addWidget(scroll)
+
+        # Ask for enough height to show the body outright. Without this the
+        # panel row is sized by whichever sibling happens to be tallest — the
+        # camera panel — and this panel fits only by luck. A QScrollArea's
+        # minimumSizeHint is deliberately tiny, so nothing else propagates the
+        # real requirement upward. The scroll area still does its job as the
+        # graceful fallback when the window is genuinely too small; it just
+        # stops being the normal case.
+        self.setMinimumHeight(
+            PANEL_HEAD_H + body_widget.minimumSizeHint().height() + BODY_HEADROOM
+        )
 
     def update_scores(self, total: int, facial: int, vocal: int, gaze: int, hrv: int):
         label, color = trust_band(int(total))
