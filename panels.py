@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from PyQt6.QtCore import Qt, QSize, pyqtSignal
-from PyQt6.QtGui import QFont, QImage, QPixmap, QColor
+from PyQt6.QtGui import QFont, QFontMetrics, QImage, QPixmap, QColor
 from PyQt6.QtWidgets import (QWidget, QFrame, QLabel, QPushButton, QVBoxLayout,
                               QHBoxLayout, QGridLayout, QSizePolicy, QListWidget,
                               QListWidgetItem, QComboBox, QScrollArea)
@@ -461,15 +461,26 @@ class ScorePanel(QFrame):
         hdr = QHBoxLayout()
         hdr.setContentsMargins(sp(0), sp(0), sp(0), sp(0))
         hdr.setSpacing(sp(12))
+        # Width is sp(design) OR what the text actually measures, whichever is
+        # larger. Type stops shrinking once it hits the legibility floor while
+        # sp() keeps shrinking the box, so a width that fits at scale 1.0 does
+        # not automatically fit further down — this is what rendered "SCORE" as
+        # "CORE". Letter-spacing is applied via QSS and isn't in the metric, so
+        # allow a pixel per character for it.
+        def _label_width(text: str, design_px: int, font) -> int:
+            measured = QFontMetrics(font).horizontalAdvance(text) + len(text)
+            return max(sp(design_px), measured)
+
+        hdr_font = ui_font(7, QFont.Weight.DemiBold)
         hdr_score = QLabel("SCORE")
-        hdr_score.setFixedWidth(sp(32))
+        hdr_score.setFixedWidth(_label_width("SCORE", 32, hdr_font))
         hdr_score.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        hdr_score.setFont(ui_font(7, QFont.Weight.DemiBold))
+        hdr_score.setFont(hdr_font)
         hdr_score.setStyleSheet(f"color: {TEXT_GHOST}; letter-spacing: 1px;")
         hdr_wt = QLabel("WT")
-        hdr_wt.setFixedWidth(sp(36))
+        hdr_wt.setFixedWidth(_label_width("WT", 36, hdr_font))
         hdr_wt.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        hdr_wt.setFont(ui_font(7, QFont.Weight.DemiBold))
+        hdr_wt.setFont(hdr_font)
         hdr_wt.setStyleSheet(f"color: {TEXT_GHOST}; letter-spacing: 1px;")
         hdr.addStretch(1)
         hdr.addWidget(hdr_score)

@@ -12,7 +12,8 @@ from PyQt6.QtWidgets import (QWidget, QLabel, QFrame, QHBoxLayout, QVBoxLayout,
 
 from theme import (LINE, LINE_SOFT, TEXT, TEXT_DIM, TEXT_FAINT, TEXT_GHOST,
                     PANEL, PANEL_2, C_FACIAL, C_VOCAL, C_GAZE, C_HRV,
-                    ui_font, mono_font, trust_band, head_qss, BG_DEEP, sp)
+                    ui_font, mono_font, trust_band, head_qss, BG_DEEP, sp,
+                    MONO_FAMILIES)
 
 
 # ─── Custom-painted gauge ───────────────────────────────────────────────────
@@ -59,12 +60,12 @@ class GaugeWidget(QWidget):
         p.setBrush(QColor(PANEL))
         p.drawRect(0, 0, w, h)
 
-        thickness = 16
-        margin = 18
-        diameter = min(w - margin * 2, (h - 20) * 2)
+        thickness = sp(16)
+        margin = sp(18)
+        diameter = min(w - margin * 2, (h - sp(20)) * 2)
         radius = diameter / 2
         cx = w / 2
-        cy = h - 14
+        cy = h - sp(14)
         arc_rect = QRectF(cx - radius, cy - radius, diameter, diameter)
 
         # Background arc (full top half)
@@ -78,38 +79,51 @@ class GaugeWidget(QWidget):
                       Qt.PenCapStyle.RoundCap))
         p.drawArc(arc_rect, 180 * 16, int(active_span * 16))
 
-        # Big number — scale font to arc radius so it never overflows. Sized in
-        # pixels for the same reason as theme.ui_font: the radius it is derived
-        # from is a pixel measurement, so the font has to be one too or the
-        # numeral overflows the arc on any display Qt reports above 72 DPI.
-        num_px = max(36, round(radius * 0.38))
-        num_font = mono_font(num_px, QFont.Weight.DemiBold)
+        # Big number — strictly proportional to the arc radius, with no floor.
+        #
+        # This used to be max(36, radius * 0.38) fed through mono_font(), which
+        # was wrong twice over. The 36px floor meant that once the widget got
+        # short the numeral stopped shrinking while the arc kept shrinking, so
+        # the digits outgrew the rect they are drawn into and came out sliced
+        # across the top and bottom. And mono_font() re-applies UI_SCALE, but
+        # radius is taken from the widget's real geometry and is already scaled
+        # — so the size was being scaled a second time.
+        #
+        # Building the font directly keeps it exactly proportional: the numeral
+        # is always 0.38 of the radius, whatever the radius happens to be.
+        num_font = QFont()
+        num_font.setFamilies(MONO_FAMILIES)
+        num_font.setPixelSize(max(1, round(radius * 0.38)))
+        num_font.setWeight(QFont.Weight.DemiBold)
+        num_font.setStyleHint(QFont.StyleHint.TypeWriter)
         num_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 94)
         p.setFont(num_font)
         p.setPen(self._color)
-        num_rect = QRectF(0, cy - radius * 0.90, w, radius * 0.60)
+        # 0.60 of the radius was a hair under the glyph height at some radii,
+        # which clipped descenders even when the font was sized correctly.
+        num_rect = QRectF(0, cy - radius * 0.92, w, radius * 0.66)
         p.drawText(num_rect, Qt.AlignmentFlag.AlignCenter, str(self._score))
 
         # Band label (e.g. "ACTIVATED") snug below the numeral
-        num_bottom = cy - radius * 0.90 + radius * 0.60
+        num_bottom = cy - radius * 0.92 + radius * 0.66
         if self._band_label:
             band_font = ui_font(11, QFont.Weight.DemiBold)
             band_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 120)
             p.setFont(band_font)
             p.setPen(QColor(self._band_color))
-            band_rect = QRectF(0, num_bottom, w, 22)
+            band_rect = QRectF(0, num_bottom, w, sp(22))
             p.drawText(band_rect, Qt.AlignmentFlag.AlignCenter,
                        self._band_label.upper())
-            sub_top = num_bottom + 22
+            sub_top = num_bottom + sp(22)
         else:
-            sub_top = num_bottom + 2
+            sub_top = num_bottom + sp(2)
 
         # "/ 100" subtitle
         sub_font = mono_font(8, QFont.Weight.Medium)
         sub_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 130)
         p.setFont(sub_font)
         p.setPen(QColor(TEXT_GHOST))
-        sub_rect = QRectF(0, sub_top, w, 18)
+        sub_rect = QRectF(0, sub_top, w, sp(18))
         p.drawText(sub_rect, Qt.AlignmentFlag.AlignCenter, "/ 100")
 
         # Baseline tick — small notch on the arc at the calibrated score
@@ -356,6 +370,24 @@ class MetricBox(QFrame):
         v.addWidget(self._label)
         v.addWidget(self._value)
         v.addWidget(self._delta)
+
+        # Claim the height the two rows actually need, measured from the fonts
+        # rather than assumed from a design constant.
+        #
+        # Nothing here is fixed-height, so when the panel above it was short the
+        # grid squeezed these tiles below their content and Qt let the value row
+        # ride up over the label — the "PITCH STABILITY / 45%" collision. The
+        # rows can't shrink (they're single-line labels), so the tile has to
+        # refuse to. Measured, because the font size depends on UI_SCALE and the
+        # metrics depend on which family actually resolved, which differs
+        # between Inter here and Segoe UI on Windows.
+        from PyQt6.QtGui import QFontMetrics
+        chrome = sp(6) * 2 + sp(1) * 2          # top/bottom margins + row spacing
+        self.setMinimumHeight(
+            QFontMetrics(self._label.font()).height()
+            + QFontMetrics(self._value.font()).height()
+            + chrome
+        )
 
     def setValue(self, text: str):
         self._value.setText(text)
