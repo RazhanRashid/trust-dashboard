@@ -287,7 +287,7 @@ class CalibrationOverlay(QWidget):
         skip.linkActivated.connect(lambda _: self.skip_clicked.emit())
 
         foot.addWidget(self._start_btn)
-        foot.addSpacing(20)
+        foot.addSpacing(sp(20))
         foot.addWidget(skip)
         foot.addStretch()
         v.addLayout(foot)
@@ -408,7 +408,28 @@ class SessionSummary(QWidget):
         super().__init__(parent)
         self.setStyleSheet(f"background: {BG};")
 
-        v = QVBoxLayout(self)
+        # This screen stacks a header, three cards, a chart and a button row,
+        # and unlike the overview and the composure panel it had no scroll
+        # area. On a window shorter than that stack, Qt has nowhere to put the
+        # excess and compresses Fixed-size children past their own minimums —
+        # which is why the big numeral landed inside the thumbnail and the
+        # buttons fell out through the bottom of the card. Same fix as
+        # OverviewScreen: scroll rather than overlap.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        _scroll = QScrollArea()
+        _scroll.setWidgetResizable(True)
+        _scroll.setFrameShape(QFrame.Shape.NoFrame)
+        _scroll.setStyleSheet(f"QScrollArea {{ background: {BG}; border: none; }}")
+        _scroll.viewport().setStyleSheet(f"background: {BG};")
+        _content = QWidget()
+        _content.setStyleSheet(f"background: {BG};")
+        _scroll.setWidget(_content)
+        outer.addWidget(_scroll)
+
+        v = QVBoxLayout(_content)
         v.setContentsMargins(sp(40), sp(32), sp(40), sp(32))
         v.setSpacing(sp(18))
 
@@ -446,7 +467,7 @@ class SessionSummary(QWidget):
         # Thumbnail (hidden until populate() loads a real image)
         self._thumb_lbl = QLabel()
         self._thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._thumb_lbl.setFixedSize(240, 135)
+        self._thumb_lbl.setFixedSize(sp(240), sp(135))
         self._thumb_lbl.setStyleSheet(f"""
             QLabel {{
                 background: {BG_DEEP};
@@ -463,7 +484,7 @@ class SessionSummary(QWidget):
         thumb_wrap.addWidget(self._thumb_lbl)
         thumb_wrap.addStretch()
         c1_l.addLayout(thumb_wrap)
-        c1_l.addSpacing(12)
+        c1_l.addSpacing(sp(12))
 
         self._big_num = QLabel("—")
         self._big_num.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -475,13 +496,13 @@ class SessionSummary(QWidget):
         self._big_label.setStyleSheet(f"color: {TEXT_FAINT}; letter-spacing: 1px; background: transparent;")
         c1_l.addWidget(self._big_num)
         c1_l.addWidget(self._big_label)
-        c1_l.addSpacing(2)
+        c1_l.addSpacing(sp(2))
         hint = QLabel("session average")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hint.setFont(ui_font(9))
         hint.setStyleSheet(f"color: {TEXT_GHOST}; background: transparent;")
         c1_l.addWidget(hint)
-        c1_l.addSpacing(8)
+        c1_l.addSpacing(sp(8))
 
         # Play + Delete buttons (hidden by default)
         media_row = QHBoxLayout()
@@ -515,7 +536,7 @@ class SessionSummary(QWidget):
 
         media_row.addStretch()
         media_row.addWidget(self._play_btn)
-        media_row.addSpacing(24)
+        media_row.addSpacing(sp(24))
         media_row.addWidget(self._del_btn)
         media_row.addStretch()
         c1_l.addLayout(media_row)
@@ -526,7 +547,7 @@ class SessionSummary(QWidget):
         c2 = self._make_card()
         c2_l = c2.layout()
         c2_l.addWidget(self._tile_title("CHANNEL BREAKDOWN"))
-        c2_l.addSpacing(8)
+        c2_l.addSpacing(sp(8))
         self._sb = {}
         for key, label, color in [("facial", "Facial", C_FACIAL),
                                     ("vocal",  "Vocal",  C_VOCAL),
@@ -567,7 +588,7 @@ class SessionSummary(QWidget):
         c3 = self._make_card()
         c3_l = c3.layout()
         c3_l.addWidget(self._tile_title("SESSION INFO"))
-        c3_l.addSpacing(8)
+        c3_l.addSpacing(sp(8))
         self._stats = {}
         for key, label in [("peak",     "Peak composure"),
                             ("low",      "Lowest composure")]:
@@ -598,7 +619,7 @@ class SessionSummary(QWidget):
         chart_card = self._make_card()
         chart_l = chart_card.layout()
         chart_l.addWidget(self._tile_title("COMPOSURE OVER SESSION"))
-        chart_l.addSpacing(4)
+        chart_l.addSpacing(sp(4))
         pg.setConfigOption("background", PANEL)
         self._chart = pg.PlotWidget()
         self._chart.setBackground(PANEL)
@@ -672,7 +693,7 @@ class SessionSummary(QWidget):
         flags_card = self._make_card()
         flags_l = flags_card.layout()
         flags_l.addWidget(self._tile_title("NOTABLE EVENTS"))
-        flags_l.addSpacing(4)
+        flags_l.addSpacing(sp(4))
         self._flags_holder = QWidget()
         self._flags_holder.setStyleSheet("background: transparent;")
         self._flags_holder_l = QHBoxLayout(self._flags_holder)
@@ -1540,7 +1561,7 @@ class OverviewScreen(QWidget):
                         y = (pix.height() - 48) // 2
                         pix = pix.copy(x, y, 48, 48)
                     thumb_lbl = QLabel()
-                    thumb_lbl.setFixedSize(48, 48)
+                    thumb_lbl.setFixedSize(sp(48), sp(48))
                     thumb_lbl.setPixmap(_rounded_pixmap(pix, 6))
                     thumb_lbl.setStyleSheet("border: none; margin-left: 12px;")
                     h.addWidget(thumb_lbl)

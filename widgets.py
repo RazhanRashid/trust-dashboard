@@ -365,7 +365,13 @@ class MetricBox(QFrame):
         self._delta = QLabel("")
         self._delta.setFont(mono_font(8))
         self._delta.setStyleSheet(f"color: {TEXT_GHOST};")
-        self._delta.hide()
+        # Deliberately NOT hidden. The delta line is empty until a reading
+        # arrives, but it keeps its row from the start so the tile's height is
+        # constant. Hiding it made the tile 41px at construction and 52px the
+        # instant a delta appeared — a growth spurt that lands after the parent
+        # grid has already been sized, so the extra row pushed the label out of
+        # the top of the box. That was the clipped "EYE OPENNESS" / "PITCH
+        # STABILITY" text: only tiles that report a delta ever showed it.
 
         v.addWidget(self._label)
         v.addWidget(self._value)
@@ -397,10 +403,10 @@ class MetricBox(QFrame):
         color = {"good": "#2da46a", "bad": "#cd4734", "neutral": TEXT_FAINT}.get(direction, TEXT_FAINT)
         self._delta.setText(text)
         self._delta.setStyleSheet(f"color: {color};")
-        self._delta.setVisible(bool(text))
+        # Text only — never toggle visibility, or the tile changes height mid-session.
 
     def clearDelta(self):
-        self._delta.hide()
+        self._delta.setText("")   # keeps the reserved row; see __init__
 
 
 # ─── Panel header ───────────────────────────────────────────────────────────

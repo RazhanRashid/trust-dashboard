@@ -289,7 +289,7 @@ class CameraPanel(QFrame):
         cam_head_h.addWidget(cam_title)
         cam_head_h.addStretch()
         cam_head_h.addWidget(self._switch_btn)
-        cam_head_h.addSpacing(8)
+        cam_head_h.addSpacing(sp(8))
         cam_head_h.addWidget(self._cam_label)
         v.addWidget(cam_head)
 
@@ -641,7 +641,7 @@ class VoicePanel(QFrame):
         head_h.addWidget(title_lbl)
         head_h.addStretch()
         head_h.addWidget(self._spec_btn)
-        head_h.addSpacing(8)
+        head_h.addSpacing(sp(8))
         head_h.addWidget(id_lbl)
         v.addWidget(head_frame)
 

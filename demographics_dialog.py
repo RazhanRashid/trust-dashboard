@@ -35,7 +35,7 @@ class DemographicsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Participant Information")
-        self.setFixedSize(440, 420)
+        self.setFixedSize(sp(440), sp(420))
         self.setStyleSheet(f"background: {BG};")
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self._finished = False   # guards against emitting `completed` twice
