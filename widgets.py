@@ -78,10 +78,12 @@ class GaugeWidget(QWidget):
                       Qt.PenCapStyle.RoundCap))
         p.drawArc(arc_rect, 180 * 16, int(active_span * 16))
 
-        # Big number — scale font to arc radius so it never overflows.
-        num_pt = max(36.0, radius * 0.38)
-        num_font = mono_font(88, QFont.Weight.DemiBold)
-        num_font.setPointSizeF(num_pt)
+        # Big number — scale font to arc radius so it never overflows. Sized in
+        # pixels for the same reason as theme.ui_font: the radius it is derived
+        # from is a pixel measurement, so the font has to be one too or the
+        # numeral overflows the arc on any display Qt reports above 72 DPI.
+        num_px = max(36, round(radius * 0.38))
+        num_font = mono_font(num_px, QFont.Weight.DemiBold)
         num_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 94)
         p.setFont(num_font)
         p.setPen(self._color)

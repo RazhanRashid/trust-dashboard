@@ -454,7 +454,7 @@ class SessionSummary(QWidget):
                 border-radius: 8px;
                 color: {TEXT_GHOST};
                 font-family: 'JetBrains Mono', monospace;
-                font-size: 9pt;
+                font-size: 9px;
             }}
         """)
         self._thumb_lbl.setText("no face captured")
@@ -610,7 +610,7 @@ class SessionSummary(QWidget):
         self._chart.getAxis("bottom").setTextPen(pg.mkPen(TEXT_GHOST))
         self._chart.getAxis("bottom").setStyle(tickLength=-4, showValues=True)
         self._chart.getAxis("bottom").setLabel(
-            "Time (s)", **{"color": TEXT_GHOST, "font-size": "9pt"})
+            "Time (s)", **{"color": TEXT_GHOST, "font-size": "9px"})
         self._chart.getAxis("left").setPen(pg.mkPen(LINE_SOFT))
         self._chart.getAxis("left").setTextPen(pg.mkPen(TEXT_GHOST))
         self._chart.getAxis("left").setStyle(tickLength=-4, showValues=True)

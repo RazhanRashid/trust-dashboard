@@ -59,21 +59,38 @@ def trust_band(score: int):
 UI_FAMILIES   = ["Inter", "SF Pro Display", "Segoe UI", "Helvetica Neue", "Arial"]
 MONO_FAMILIES = ["JetBrains Mono", "SF Mono", "Menlo", "Consolas", "Courier New"]
 
+# Sizes here are PIXELS, not points, and the difference is load-bearing.
+#
+# Qt reports a logical DPI of 72 on macOS but 96 on Windows, so the same point
+# size renders 96/72 = 1.33x larger there. Every panel in this app is laid out
+# in hard-coded pixels (setFixedHeight and friends), and those don't grow to
+# match — so on Windows the type outgrew its boxes and rows overlapped and
+# clipped, while macOS looked fine. Pixel sizing removes the DPI term: 1 px is
+# 1 px on both, so text and layout stay in proportion.
+#
+# This is not the same as ignoring HiDPI. Qt6 scales the whole UI by the
+# screen's devicePixelRatio, which magnifies pixel-sized fonts and pixel-sized
+# layout together — a 150% display still gets 150% type. What it no longer
+# does is inflate one and not the other.
+#
+# Because 1 pt == 1 px at 72 DPI, these numbers render identically to the old
+# point sizes on macOS; only Windows changes.
+
 
 def ui_font(size: int, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
-    """Inter (or fallback) at the given pt size."""
+    """Inter (or fallback) at the given pixel size."""
     f = QFont()
     f.setFamilies(UI_FAMILIES)
-    f.setPointSize(size)
+    f.setPixelSize(size)
     f.setWeight(weight)
     return f
 
 
 def mono_font(size: int, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
-    """JetBrains Mono (or fallback) at the given pt size, tabular numerics."""
+    """JetBrains Mono (or fallback) at the given pixel size, tabular numerics."""
     f = QFont()
     f.setFamilies(MONO_FAMILIES)
-    f.setPointSize(size)
+    f.setPixelSize(size)
     f.setWeight(weight)
     f.setStyleHint(QFont.StyleHint.TypeWriter)
     return f

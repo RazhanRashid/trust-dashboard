@@ -1121,7 +1121,7 @@ class FlagSidebar(QFrame):
             QListWidget {{
                 background: {PANEL};
                 border: none;
-                font-size: 9pt;
+                font-size: 9px;
             }}
         """)
         self._list.hide()
