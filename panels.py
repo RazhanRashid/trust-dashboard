@@ -22,7 +22,7 @@ from theme import (BG, BG_DEEP, PANEL, PANEL_2, LINE, LINE_SOFT,
                     C_FACIAL, C_VOCAL, C_GAZE, C_HRV, C_WORKLOAD,
                     ACCENT, DANGER,
                     ui_font, mono_font, trust_band, panel_qss, head_qss,
-                    HRV_IS_PLACEHOLDER, TRUST_BANDS)
+                    HRV_IS_PLACEHOLDER, TRUST_BANDS, sp)
 from widgets import (GaugeWidget, BarTrack, ChannelBar, StatusDot,
                       MetricBox, PanelHead, WaveformWidget, SpectrumWidget,
                       AttributionStrip, BaselineQualityDot)
@@ -54,17 +54,17 @@ class TopStrip(QFrame):
                 border-bottom: 1px solid {LINE};
             }}
         """)
-        self.setFixedHeight(60)
+        self.setFixedHeight(sp(60))
 
         h = QHBoxLayout(self)
-        h.setContentsMargins(22, 0, 22, 0)
-        h.setSpacing(20)
+        h.setContentsMargins(sp(22), sp(0), sp(22), sp(0))
+        h.setSpacing(sp(20))
 
         # Logo
         logo_wrap = QHBoxLayout()
-        logo_wrap.setSpacing(10)
+        logo_wrap.setSpacing(sp(10))
         mark = QFrame()
-        mark.setFixedSize(QSize(22, 22))
+        mark.setFixedSize(QSize(sp(22), sp(22)))
         mark.setStyleSheet(f"""
             QFrame {{
                 background: {ACCENT};
@@ -83,18 +83,18 @@ class TopStrip(QFrame):
 
         # Subject + session info
         meta_wrap = QHBoxLayout()
-        meta_wrap.setSpacing(18)
+        meta_wrap.setSpacing(sp(18))
         meta_wrap.addLayout(self._pair("SUBJECT", "LOCAL"))
         meta_wrap.addWidget(self._sep())
 
         rec_dot = QFrame()
-        rec_dot.setFixedSize(QSize(8, 8))
+        rec_dot.setFixedSize(QSize(sp(8), sp(8)))
         rec_dot.setStyleSheet(f"background: {DANGER}; border-radius: 4px;")
         rec_label = QLabel("REC")
         rec_label.setFont(ui_font(9, QFont.Weight.Bold))
         rec_label.setStyleSheet(f"color: {DANGER}; letter-spacing: 1.2px; background: transparent;")
         rec_row = QHBoxLayout()
-        rec_row.setSpacing(6)
+        rec_row.setSpacing(sp(6))
         rec_row.addWidget(rec_dot)
         rec_row.addWidget(rec_label)
         meta_wrap.addLayout(rec_row)
@@ -108,7 +108,7 @@ class TopStrip(QFrame):
                            (self.dot_gaze, "GAZE"),
                            (self.dot_voice, "VOICE")]:
             row = QHBoxLayout()
-            row.setSpacing(6)
+            row.setSpacing(sp(6))
             lbl = QLabel(label)
             lbl.setFont(ui_font(8, QFont.Weight.Bold))
             lbl.setStyleSheet(f"color: {TEXT_FAINT}; letter-spacing: 1.0px; background: transparent;")
@@ -121,13 +121,13 @@ class TopStrip(QFrame):
 
         # Phase indicator + advance control (researcher marks phases manually)
         self._phase_dot = QFrame()
-        self._phase_dot.setFixedSize(QSize(8, 8))
+        self._phase_dot.setFixedSize(QSize(sp(8), sp(8)))
         self._phase_dot.setStyleSheet(f"background: {TEXT_GHOST}; border-radius: 4px;")
         self._phase_label = QLabel("NO PHASE")
         self._phase_label.setFont(ui_font(9, QFont.Weight.Bold))
         self._phase_label.setStyleSheet(f"color: {TEXT_FAINT}; letter-spacing: 1.0px; background: transparent;")
         phase_row = QHBoxLayout()
-        phase_row.setSpacing(6)
+        phase_row.setSpacing(sp(6))
         phase_row.addWidget(self._phase_dot)
         phase_row.addWidget(self._phase_label)
         h.addLayout(phase_row)
@@ -199,7 +199,7 @@ class TopStrip(QFrame):
 
     def _pair(self, key: str, val: str):
         row = QHBoxLayout()
-        row.setSpacing(7)
+        row.setSpacing(sp(7))
         k = QLabel(key)
         k.setFont(ui_font(8, QFont.Weight.DemiBold))
         k.setStyleSheet(f"color: {TEXT_FAINT}; letter-spacing: 1.0px; background: transparent;")
@@ -214,7 +214,7 @@ class TopStrip(QFrame):
         s = QFrame()
         # QFrame VLine uses the palette's midlight — override with background-color
         # (the 'color' property doesn't drive the line colour reliably on macOS)
-        s.setFixedSize(QSize(1, 16))
+        s.setFixedSize(QSize(sp(1), sp(16)))
         s.setStyleSheet(f"background-color: {LINE}; border: none;")
         return s
 
@@ -256,16 +256,16 @@ class CameraPanel(QFrame):
         self.setStyleSheet(panel_qss("camPanel"))
 
         v = QVBoxLayout(self)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(0)
+        v.setContentsMargins(sp(0), sp(0), sp(0), sp(0))
+        v.setSpacing(sp(0))
 
         # Custom head with switch camera icon button
         cam_head = QFrame()
         cam_head.setObjectName("panelHead")
         cam_head.setStyleSheet(head_qss())
-        cam_head.setFixedHeight(42)
+        cam_head.setFixedHeight(sp(42))
         cam_head_h = QHBoxLayout(cam_head)
-        cam_head_h.setContentsMargins(22, 0, 22, 0)
+        cam_head_h.setContentsMargins(sp(22), sp(0), sp(22), sp(0))
         cam_title = QLabel("CAMERA · REFERENCE")
         cam_title.setFont(ui_font(8, QFont.Weight.DemiBold))
         cam_title.setStyleSheet(f"color: {TEXT_FAINT}; letter-spacing: 1.3px; background: transparent;")
@@ -273,7 +273,7 @@ class CameraPanel(QFrame):
         self._cam_label.setFont(mono_font(8))
         self._cam_label.setStyleSheet(f"color: {TEXT_GHOST}; background: transparent;")
         self._switch_btn = QPushButton("⇄")
-        self._switch_btn.setFixedSize(QSize(24, 24))
+        self._switch_btn.setFixedSize(QSize(sp(24), sp(24)))
         self._switch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._switch_btn.setToolTip("Switch camera")
         self._switch_btn.setStyleSheet(f"""
@@ -295,12 +295,12 @@ class CameraPanel(QFrame):
 
         body = QWidget()
         body_l = QVBoxLayout(body)
-        body_l.setContentsMargins(20, 16, 20, 18)
-        body_l.setSpacing(14)
+        body_l.setContentsMargins(sp(20), sp(16), sp(20), sp(18))
+        body_l.setSpacing(sp(14))
 
         # Video feed
         self._video = QLabel()
-        self._video.setFixedHeight(200)
+        self._video.setFixedHeight(sp(200))
         self._video.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._video.setStyleSheet(f"""
             QLabel {{
@@ -315,7 +315,7 @@ class CameraPanel(QFrame):
 
         # 2×2 metric grid (face metrics)
         grid = QGridLayout()
-        grid.setSpacing(8)
+        grid.setSpacing(sp(8))
         self._metrics = {
             "expr":     MetricBox("Expression"),
             "ear":      MetricBox("Eye Openness"),
@@ -415,8 +415,8 @@ class ScorePanel(QFrame):
         self.setStyleSheet(panel_qss("scorePanel"))
 
         v = QVBoxLayout(self)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(0)
+        v.setContentsMargins(sp(0), sp(0), sp(0), sp(0))
+        v.setSpacing(sp(0))
 
         v.addWidget(PanelHead("Composure index", "α 0.20 · ema"))
 
@@ -430,14 +430,14 @@ class ScorePanel(QFrame):
         body_widget = QWidget()
         body_widget.setStyleSheet(f"background: {PANEL};")
         body_l = QVBoxLayout(body_widget)
-        body_l.setContentsMargins(22, 10, 22, 10)
+        body_l.setContentsMargins(sp(22), sp(10), sp(22), sp(10))
         # 4px not 6px between the eight stacked rows. The body's required
         # height sat within a few px of the viewport it gets, which is close
         # enough that a font with slightly different metrics — Segoe UI on
         # Windows rather than the design's Inter — pushed it over and the
         # bottom channel bar disappeared behind a scrollbar. Tightening the
         # gaps buys back real headroom; see setMinimumHeight below.
-        body_l.setSpacing(4)
+        body_l.setSpacing(sp(4))
 
         # Gauge — no stretch above; gauge starts just below the header
         self.gauge = GaugeWidget()
@@ -459,15 +459,15 @@ class ScorePanel(QFrame):
 
         # Column header row for the channel bars
         hdr = QHBoxLayout()
-        hdr.setContentsMargins(0, 0, 0, 0)
-        hdr.setSpacing(12)
+        hdr.setContentsMargins(sp(0), sp(0), sp(0), sp(0))
+        hdr.setSpacing(sp(12))
         hdr_score = QLabel("SCORE")
-        hdr_score.setFixedWidth(32)
+        hdr_score.setFixedWidth(sp(32))
         hdr_score.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         hdr_score.setFont(ui_font(7, QFont.Weight.DemiBold))
         hdr_score.setStyleSheet(f"color: {TEXT_GHOST}; letter-spacing: 1px;")
         hdr_wt = QLabel("WT")
-        hdr_wt.setFixedWidth(36)
+        hdr_wt.setFixedWidth(sp(36))
         hdr_wt.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         hdr_wt.setFont(ui_font(7, QFont.Weight.DemiBold))
         hdr_wt.setStyleSheet(f"color: {TEXT_GHOST}; letter-spacing: 1px;")
@@ -478,7 +478,7 @@ class ScorePanel(QFrame):
 
         # Channel bars
         bars = QVBoxLayout()
-        bars.setSpacing(4)
+        bars.setSpacing(sp(4))
         self.bar_facial = ChannelBar("Facial", C_FACIAL, 25)
         self.bar_vocal  = ChannelBar("Vocal",  C_VOCAL,  25)
         self.bar_gaze   = ChannelBar("Gaze",   C_GAZE,   25)
@@ -489,7 +489,7 @@ class ScorePanel(QFrame):
 
         # Divider
         sep = QFrame()
-        sep.setFixedHeight(1)
+        sep.setFixedHeight(sp(1))
         sep.setStyleSheet(f"background-color: {LINE_SOFT}; border: none;")
         body_l.addWidget(sep)
 
@@ -500,14 +500,14 @@ class ScorePanel(QFrame):
         body_l.addWidget(wl_title)
 
         wl_row = QHBoxLayout()
-        wl_row.setSpacing(12)
+        wl_row.setSpacing(sp(12))
         spike_lbl = QLabel("Spike")
-        spike_lbl.setFixedWidth(58)
+        spike_lbl.setFixedWidth(sp(58))
         spike_lbl.setFont(ui_font(10, QFont.Weight.Medium))
         spike_lbl.setStyleSheet(f"color: {C_WORKLOAD};")
         self._wl_track = BarTrack(C_WORKLOAD)
         self._wl_num = QLabel("0%")
-        self._wl_num.setFixedWidth(40)
+        self._wl_num.setFixedWidth(sp(40))
         self._wl_num.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._wl_num.setFont(mono_font(10, QFont.Weight.Medium))
         self._wl_num.setStyleSheet(f"color: {TEXT};")
@@ -541,7 +541,9 @@ class ScorePanel(QFrame):
         # graceful fallback when the window is genuinely too small; it just
         # stops being the normal case.
         self.setMinimumHeight(
-            PANEL_HEAD_H + body_widget.minimumSizeHint().height() + BODY_HEADROOM
+            # minimumSizeHint() is already in device pixels — its children were
+            # built through sp() — so only the two design constants get scaled.
+            sp(PANEL_HEAD_H) + body_widget.minimumSizeHint().height() + sp(BODY_HEADROOM)
         )
 
     def update_scores(self, total: int, facial: int, vocal: int, gaze: int, hrv: int):
@@ -593,16 +595,16 @@ class VoicePanel(QFrame):
         self.setStyleSheet(panel_qss("voicePanel"))
 
         v = QVBoxLayout(self)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(0)
+        v.setContentsMargins(sp(0), sp(0), sp(0), sp(0))
+        v.setSpacing(sp(0))
 
         # Head with spectrum toggle
         head_frame = QFrame()
         head_frame.setObjectName("panelHead")
         head_frame.setStyleSheet(head_qss())
-        head_frame.setFixedHeight(42)
+        head_frame.setFixedHeight(sp(42))
         head_h = QHBoxLayout(head_frame)
-        head_h.setContentsMargins(22, 0, 22, 0)
+        head_h.setContentsMargins(sp(22), sp(0), sp(22), sp(0))
         title_lbl = QLabel("VOICE ANALYSIS")
         title_lbl.setFont(ui_font(8, QFont.Weight.DemiBold))
         title_lbl.setStyleSheet(f"color: {TEXT_FAINT}; letter-spacing: 1.3px; background: transparent;")
@@ -633,8 +635,8 @@ class VoicePanel(QFrame):
         v.addWidget(head_frame)
 
         body_l = QVBoxLayout()
-        body_l.setContentsMargins(20, 16, 20, 18)
-        body_l.setSpacing(10)
+        body_l.setContentsMargins(sp(20), sp(16), sp(20), sp(18))
+        body_l.setSpacing(sp(10))
 
         # Waveform
         self._wave = WaveformWidget()
@@ -648,7 +650,7 @@ class VoicePanel(QFrame):
         # Metric grid expanded from 2×2 to 3×2 to surface the two most interpretable
         # eGeMAPS voice-quality features alongside the original four.
         grid = QGridLayout()
-        grid.setSpacing(8)
+        grid.setSpacing(sp(8))
         self._metrics = {
             "pitch":  MetricBox("Pitch Stability"),   # Inverse CV of F0 history; 100 % = rock-steady pitch
             "energy": MetricBox("Voice Energy"),       # Perceptual loudness normalised to conversational volume
@@ -741,16 +743,16 @@ class HistoryChart(QFrame):
         self._full_xs: list[float] = []
 
         v = QVBoxLayout(self)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(0)
+        v.setContentsMargins(sp(0), sp(0), sp(0), sp(0))
+        v.setSpacing(sp(0))
 
         # Header: title on left, live/snap button on right
         head_frame = QFrame()
         head_frame.setObjectName("panelHead")
         head_frame.setStyleSheet(head_qss())
-        head_frame.setFixedHeight(42)
+        head_frame.setFixedHeight(sp(42))
         head_h = QHBoxLayout(head_frame)
-        head_h.setContentsMargins(22, 0, 22, 0)
+        head_h.setContentsMargins(sp(22), sp(0), sp(22), sp(0))
         head_title = QLabel("COMPOSURE HISTORY")
         head_title.setFont(ui_font(8, QFont.Weight.DemiBold))
         head_title.setStyleSheet(f"color: {TEXT_FAINT}; letter-spacing: 1.3px; background: transparent;")
@@ -771,25 +773,25 @@ class HistoryChart(QFrame):
         v.addWidget(head_frame)
 
         body_l = QVBoxLayout()
-        body_l.setContentsMargins(20, 12, 20, 18)
-        body_l.setSpacing(6)
+        body_l.setContentsMargins(sp(20), sp(12), sp(20), sp(18))
+        body_l.setSpacing(sp(6))
 
         # Legend row
         legend = QHBoxLayout()
-        legend.setSpacing(20)
+        legend.setSpacing(sp(20))
         for name, color in [("Composure", ACCENT),
                              ("Facial", C_FACIAL),
                              ("Vocal", C_VOCAL),
                              ("Gaze", C_GAZE),
                              ("HRV", C_HRV)]:
             sw = QFrame()
-            sw.setFixedSize(QSize(14, 3))
+            sw.setFixedSize(QSize(sp(14), sp(3)))
             sw.setStyleSheet(f"background: {color}; border-radius: 2px;")
             lbl = QLabel(name)
             lbl.setFont(ui_font(9, QFont.Weight.Medium))
             lbl.setStyleSheet(f"color: {TEXT_DIM};")
             row = QHBoxLayout()
-            row.setSpacing(6)
+            row.setSpacing(sp(6))
             row.addWidget(sw)
             row.addWidget(lbl)
             legend.addLayout(row)
@@ -988,29 +990,29 @@ class BlendshapeWatch(QFrame):
         super().__init__(parent)
         self.setObjectName("bsPanel")
         self.setStyleSheet(panel_qss("bsPanel"))
-        self.setFixedHeight(130)
+        self.setFixedHeight(sp(130))
 
         self._xs: list[float] = []
         self._ys: list[float] = []
 
         v = QVBoxLayout(self)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(0)
+        v.setContentsMargins(sp(0), sp(0), sp(0), sp(0))
+        v.setSpacing(sp(0))
 
         # Header: title on left, blendshape selector on right
         head_frame = QFrame()
         head_frame.setObjectName("panelHead")
         head_frame.setStyleSheet(head_qss())
-        head_frame.setFixedHeight(42)
+        head_frame.setFixedHeight(sp(42))
         head_h = QHBoxLayout(head_frame)
-        head_h.setContentsMargins(22, 0, 22, 0)
+        head_h.setContentsMargins(sp(22), sp(0), sp(22), sp(0))
         head_title = QLabel("BLENDSHAPE WATCH")
         head_title.setFont(ui_font(8, QFont.Weight.DemiBold))
         head_title.setStyleSheet(f"color: {TEXT_FAINT}; letter-spacing: 1.3px; background: transparent;")
         self._combo = QComboBox()
         self._combo.addItems(blendshape_names)
         self._combo.setFont(mono_font(9))
-        self._combo.setFixedWidth(200)
+        self._combo.setFixedWidth(sp(200))
         self._combo.setCursor(Qt.CursorShape.PointingHandCursor)
         self._combo.setStyleSheet(f"""
             QComboBox {{
@@ -1034,14 +1036,14 @@ class BlendshapeWatch(QFrame):
         v.addWidget(head_frame)
 
         body_l = QHBoxLayout()
-        body_l.setContentsMargins(20, 12, 20, 14)
-        body_l.setSpacing(16)
+        body_l.setContentsMargins(sp(20), sp(12), sp(20), sp(14))
+        body_l.setSpacing(sp(16))
 
         # Big numeric readout for the selected blendshape's current score
         self._value_lbl = QLabel("—")
         self._value_lbl.setFont(mono_font(26, QFont.Weight.DemiBold))
         self._value_lbl.setStyleSheet(f"color: {ACCENT};")
-        self._value_lbl.setFixedWidth(84)
+        self._value_lbl.setFixedWidth(sp(84))
         self._value_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         body_l.addWidget(self._value_lbl)
 
@@ -1124,8 +1126,8 @@ class FlagSidebar(QFrame):
         self._expanded = False
 
         v = QVBoxLayout(self)
-        v.setContentsMargins(0, 6, 0, 6)
-        v.setSpacing(4)
+        v.setContentsMargins(sp(0), sp(6), sp(0), sp(6))
+        v.setSpacing(sp(4))
 
         self._toggle = QPushButton("▶")
         self._toggle.setToolTip("Behavioural flags")
@@ -1189,9 +1191,9 @@ class Footer(QFrame):
                 border-top: 1px solid {LINE};
             }}
         """)
-        self.setFixedHeight(36)
+        self.setFixedHeight(sp(36))
         h = QHBoxLayout(self)
-        h.setContentsMargins(22, 0, 22, 0)
+        h.setContentsMargins(sp(22), sp(0), sp(22), sp(0))
 
         left = QLabel("v0.9 · local · no telemetry leaves device")
         left.setFont(mono_font(8))

@@ -77,20 +77,66 @@ MONO_FAMILIES = ["JetBrains Mono", "SF Mono", "Menlo", "Consolas", "Courier New"
 # point sizes on macOS; only Windows changes.
 
 
+# ─── Adaptive scale ────────────────────────────────────────────────────────
+# Every dimension in this app is a pixel number picked against one screen. On
+# a shorter one the stage needs more vertical space than exists and panels
+# clip. Windows makes this routine: at 125% or 150% display scaling Qt divides
+# the logical window by that factor, so a 1080p laptop presents 801 or 667
+# logical pixels to a layout that wants ~870.
+#
+# So measure the screen once at startup and scale the design to fit. sp()
+# converts a design pixel to a device pixel; fonts scale by the same factor so
+# type and boxes stay in proportion. Scale is capped at 1.0 — a big display
+# gets the design at its intended size, never inflated — and floored so the
+# UI cannot shrink into illegibility on something tiny.
+DESIGN_HEIGHT = 980      # the window height this layout was drawn against
+_CHROME_H     = 40       # title bar + frame that availableGeometry doesn't remove
+# 0.65 not 0.70: at 150% Windows scaling a 1080p screen leaves a 648px window,
+# and 0.70 needs exactly 648 — no margin at all. 0.65 leaves ~40px.
+MIN_UI_SCALE  = 0.65
+MAX_UI_SCALE  = 1.00
+
+UI_SCALE = 1.0           # replaced by init_ui_scale() before any widget is built
+
+
+def init_ui_scale(app) -> float:
+    """Measure the primary screen and set the global UI scale. Call once, from
+    main(), before constructing any widget — sizes are read at construction."""
+    global UI_SCALE
+    try:
+        screen = app.primaryScreen()
+        usable = screen.availableGeometry().height() - _CHROME_H
+        UI_SCALE = max(MIN_UI_SCALE, min(MAX_UI_SCALE, usable / DESIGN_HEIGHT))
+    except Exception:
+        UI_SCALE = 1.0   # never let a display query stop the app from starting
+    return UI_SCALE
+
+
+def sp(px: float) -> int:
+    """Scale a design pixel to this device.
+
+    Zero stays zero — a flush margin must stay flush. Anything else floors at
+    1 so a hairline rule stays a visible rule instead of vanishing.
+    """
+    if px <= 0:
+        return 0
+    return max(1, round(px * UI_SCALE))
+
+
 def ui_font(size: int, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
-    """Inter (or fallback) at the given pixel size."""
+    """Inter (or fallback) at the given design pixel size, scaled to the device."""
     f = QFont()
     f.setFamilies(UI_FAMILIES)
-    f.setPixelSize(size)
+    f.setPixelSize(max(8, round(size * UI_SCALE)))   # 8px is the legibility floor
     f.setWeight(weight)
     return f
 
 
 def mono_font(size: int, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
-    """JetBrains Mono (or fallback) at the given pixel size, tabular numerics."""
+    """JetBrains Mono (or fallback) at the given design pixel size, scaled."""
     f = QFont()
     f.setFamilies(MONO_FAMILIES)
-    f.setPixelSize(size)
+    f.setPixelSize(max(8, round(size * UI_SCALE)))
     f.setWeight(weight)
     f.setStyleHint(QFont.StyleHint.TypeWriter)
     return f

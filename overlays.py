@@ -27,7 +27,7 @@ from PyQt6.QtGui import QDesktopServices
 from theme import (BG, BG_DEEP, PANEL, PANEL_2, LINE, LINE_SOFT,
                     TEXT, TEXT_DIM, TEXT_FAINT, TEXT_GHOST,
                     C_FACIAL, C_VOCAL, C_GAZE, C_HRV, ACCENT, DANGER,
-                    ui_font, mono_font, trust_band, panel_qss, TRUST_BANDS)
+                    ui_font, mono_font, trust_band, panel_qss, TRUST_BANDS, sp)
 from widgets import BarTrack, ChannelBar, MetricBox, PanelHead
 
 
@@ -41,7 +41,7 @@ class CountdownArc(QWidget):
         super().__init__(parent)
         self._progress = 0.0      # 0 → 1
         self._remaining = 30
-        self.setFixedSize(QSize(180, 180))
+        self.setFixedSize(QSize(sp(180), sp(180)))
 
     def setProgress(self, progress: float, remaining_sec: int):
         self._progress = max(0.0, min(1.0, float(progress)))
@@ -109,8 +109,8 @@ class CalibrationOverlay(QWidget):
         self._intro_visible = True
 
         v = QVBoxLayout(self)
-        v.setContentsMargins(60, 50, 60, 50)
-        v.setSpacing(28)
+        v.setContentsMargins(sp(60), sp(50), sp(60), sp(50))
+        v.setSpacing(sp(28))
 
         # Title
         title = QLabel("Calibration")
@@ -124,22 +124,22 @@ class CalibrationOverlay(QWidget):
         sub.setStyleSheet(f"color: {TEXT_FAINT};")
 
         head = QVBoxLayout()
-        head.setSpacing(8)
+        head.setSpacing(sp(8))
         head.addWidget(title)
         head.addWidget(sub)
         v.addLayout(head)
 
         # Two-column body
         body = QHBoxLayout()
-        body.setSpacing(20)
+        body.setSpacing(sp(20))
 
         # ── Left: camera preview card ──
         cam_card = QFrame()
         cam_card.setObjectName("calCam")
         cam_card.setStyleSheet(panel_qss("calCam"))
         cam_l = QVBoxLayout(cam_card)
-        cam_l.setContentsMargins(22, 18, 22, 22)
-        cam_l.setSpacing(12)
+        cam_l.setContentsMargins(sp(22), sp(18), sp(22), sp(22))
+        cam_l.setSpacing(sp(12))
 
         cam_title = QLabel("LIVE PREVIEW")
         cam_title.setFont(ui_font(8, QFont.Weight.DemiBold))
@@ -147,7 +147,7 @@ class CalibrationOverlay(QWidget):
         cam_l.addWidget(cam_title)
 
         self._video = QLabel()
-        self._video.setMinimumHeight(280)
+        self._video.setMinimumHeight(sp(280))
         self._video.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._video.setStyleSheet(f"""
             QLabel {{
@@ -174,8 +174,8 @@ class CalibrationOverlay(QWidget):
         stat_card.setObjectName("calStat")
         stat_card.setStyleSheet(panel_qss("calStat"))
         stat_l = QVBoxLayout(stat_card)
-        stat_l.setContentsMargins(22, 18, 22, 22)
-        stat_l.setSpacing(14)
+        stat_l.setContentsMargins(sp(22), sp(18), sp(22), sp(22))
+        stat_l.setSpacing(sp(14))
 
         stat_title = QLabel("CALIBRATING")
         stat_title.setFont(ui_font(8, QFont.Weight.DemiBold))
@@ -192,7 +192,7 @@ class CalibrationOverlay(QWidget):
 
         # Progress bar
         prog_wrap = QVBoxLayout()
-        prog_wrap.setSpacing(6)
+        prog_wrap.setSpacing(sp(6))
         prog_label = QLabel("Progress")
         prog_label.setFont(ui_font(9))
         prog_label.setStyleSheet(f"color: {TEXT_FAINT};")
@@ -204,7 +204,7 @@ class CalibrationOverlay(QWidget):
         # Divider
         sep = QFrame()
         sep.setStyleSheet(f"background-color: {LINE_SOFT}; border: none;")
-        sep.setFixedHeight(1)
+        sep.setFixedHeight(sp(1))
         stat_l.addWidget(sep)
 
         # Face + Voice indicators
@@ -213,10 +213,10 @@ class CalibrationOverlay(QWidget):
         self._face_lbl.setFont(ui_font(10))
         self._face_lbl.setStyleSheet(f"color: {TEXT_FAINT};")
         face_row = QHBoxLayout()
-        face_row.setSpacing(10)
+        face_row.setSpacing(sp(10))
         face_row.addWidget(self._face_dot)
         face_name = QLabel("Face")
-        face_name.setFixedWidth(48)
+        face_name.setFixedWidth(sp(48))
         face_name.setFont(ui_font(10, QFont.Weight.DemiBold))
         face_name.setStyleSheet(f"color: {TEXT};")
         face_row.addWidget(face_name)
@@ -229,10 +229,10 @@ class CalibrationOverlay(QWidget):
         self._voice_lbl.setFont(ui_font(10))
         self._voice_lbl.setStyleSheet(f"color: {TEXT_FAINT};")
         voice_row = QHBoxLayout()
-        voice_row.setSpacing(10)
+        voice_row.setSpacing(sp(10))
         voice_row.addWidget(self._voice_dot)
         voice_name = QLabel("Voice")
-        voice_name.setFixedWidth(48)
+        voice_name.setFixedWidth(sp(48))
         voice_name.setFont(ui_font(10, QFont.Weight.DemiBold))
         voice_name.setStyleSheet(f"color: {TEXT};")
         voice_row.addWidget(voice_name)
@@ -245,10 +245,10 @@ class CalibrationOverlay(QWidget):
         self._hrv_lbl.setFont(ui_font(10))
         self._hrv_lbl.setStyleSheet(f"color: {TEXT_FAINT};")
         hrv_row = QHBoxLayout()
-        hrv_row.setSpacing(10)
+        hrv_row.setSpacing(sp(10))
         hrv_row.addWidget(self._hrv_dot)
         hrv_name = QLabel("HRV")
-        hrv_name.setFixedWidth(48)
+        hrv_name.setFixedWidth(sp(48))
         hrv_name.setFont(ui_font(10, QFont.Weight.DemiBold))
         hrv_name.setStyleSheet(f"color: {TEXT};")
         hrv_row.addWidget(hrv_name)
@@ -294,7 +294,7 @@ class CalibrationOverlay(QWidget):
 
     def _make_dot(self) -> QFrame:
         dot = QFrame()
-        dot.setFixedSize(QSize(10, 10))
+        dot.setFixedSize(QSize(sp(10), sp(10)))
         dot.setStyleSheet(f"background: {TEXT_GHOST}; border-radius: 5px;")
         return dot
 
@@ -409,18 +409,18 @@ class SessionSummary(QWidget):
         self.setStyleSheet(f"background: {BG};")
 
         v = QVBoxLayout(self)
-        v.setContentsMargins(40, 32, 40, 32)
-        v.setSpacing(18)
+        v.setContentsMargins(sp(40), sp(32), sp(40), sp(32))
+        v.setSpacing(sp(18))
 
         # Header
         head = QFrame()
         head.setObjectName("sumHead")
         head.setStyleSheet(panel_qss("sumHead"))
         head_l = QHBoxLayout(head)
-        head_l.setContentsMargins(24, 20, 24, 20)
+        head_l.setContentsMargins(sp(24), sp(20), sp(24), sp(20))
 
         title_col = QVBoxLayout()
-        title_col.setSpacing(4)
+        title_col.setSpacing(sp(4))
         title = QLabel("Session complete")
         title.setFont(ui_font(18, QFont.Weight.Bold))
         title.setStyleSheet(f"color: {TEXT}; background: transparent;")
@@ -435,7 +435,7 @@ class SessionSummary(QWidget):
 
         # Three cards in a row
         cards_row = QHBoxLayout()
-        cards_row.setSpacing(16)
+        cards_row.setSpacing(sp(16))
 
         # Card 1 — Overall composure + thumbnail
         c1 = self._make_card()
@@ -485,7 +485,7 @@ class SessionSummary(QWidget):
 
         # Play + Delete buttons (hidden by default)
         media_row = QHBoxLayout()
-        media_row.setSpacing(0)
+        media_row.setSpacing(sp(0))
 
         self._play_btn = QPushButton("▶  Play recording")
         self._play_btn.setFont(ui_font(9, QFont.Weight.Medium))
@@ -536,16 +536,16 @@ class SessionSummary(QWidget):
             lbl_color = TEXT_FAINT if is_hrv else color
             num_color = TEXT_FAINT if is_hrv else TEXT
             outer_v = QVBoxLayout()
-            outer_v.setSpacing(2)
+            outer_v.setSpacing(sp(2))
             row = QHBoxLayout()
-            row.setSpacing(12)
+            row.setSpacing(sp(12))
             lbl = QLabel(label)
-            lbl.setFixedWidth(58)
+            lbl.setFixedWidth(sp(58))
             lbl.setFont(ui_font(10, QFont.Weight.Medium))
             lbl.setStyleSheet(f"color: {lbl_color}; background: transparent;")
             track = BarTrack(color, is_stub=is_hrv)
             num = QLabel("—")
-            num.setFixedWidth(32)
+            num.setFixedWidth(sp(32))
             num.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             num.setFont(mono_font(10, QFont.Weight.Medium))
             num.setStyleSheet(f"color: {num_color}; background: transparent;")
@@ -572,7 +572,7 @@ class SessionSummary(QWidget):
         for key, label in [("peak",     "Peak composure"),
                             ("low",      "Lowest composure")]:
             row = QHBoxLayout()
-            row.setSpacing(8)
+            row.setSpacing(sp(8))
             k = QLabel(label)
             k.setFont(ui_font(10))
             k.setStyleSheet(f"color: {TEXT_FAINT}; background: transparent;")
@@ -584,7 +584,7 @@ class SessionSummary(QWidget):
             row.addStretch()
             row.addWidget(v_lbl)
             sep = QFrame()
-            sep.setFixedHeight(1)
+            sep.setFixedHeight(sp(1))
             sep.setStyleSheet(f"background-color: {LINE_SOFT}; border: none;")
             c3_l.addLayout(row)
             c3_l.addWidget(sep)
@@ -618,7 +618,7 @@ class SessionSummary(QWidget):
         self._chart.setMouseEnabled(x=False, y=False)
         self._chart.setMenuEnabled(False)
         self._chart.hideButtons()
-        self._chart.setFixedHeight(180)
+        self._chart.setFixedHeight(sp(180))
 
         # Composure-band background zones
         prev_top = 100
@@ -663,8 +663,8 @@ class SessionSummary(QWidget):
         self._phase_legend_holder = QWidget()
         self._phase_legend_holder.setStyleSheet("background: transparent;")
         self._phase_legend_l = QHBoxLayout(self._phase_legend_holder)
-        self._phase_legend_l.setContentsMargins(0, 6, 0, 0)
-        self._phase_legend_l.setSpacing(14)
+        self._phase_legend_l.setContentsMargins(sp(0), sp(6), sp(0), sp(0))
+        self._phase_legend_l.setSpacing(sp(14))
         chart_l.addWidget(self._phase_legend_holder)
         v.addWidget(chart_card)
 
@@ -676,8 +676,8 @@ class SessionSummary(QWidget):
         self._flags_holder = QWidget()
         self._flags_holder.setStyleSheet("background: transparent;")
         self._flags_holder_l = QHBoxLayout(self._flags_holder)
-        self._flags_holder_l.setContentsMargins(0, 0, 0, 0)
-        self._flags_holder_l.setSpacing(8)
+        self._flags_holder_l.setContentsMargins(sp(0), sp(0), sp(0), sp(0))
+        self._flags_holder_l.setSpacing(sp(8))
         flags_l.addWidget(self._flags_holder)
         v.addWidget(flags_card)
 
@@ -719,8 +719,8 @@ class SessionSummary(QWidget):
         f.setObjectName("sumCard")
         f.setStyleSheet(panel_qss("sumCard"))
         l = QVBoxLayout(f)
-        l.setContentsMargins(22, 18, 22, 22)
-        l.setSpacing(10)
+        l.setContentsMargins(sp(22), sp(18), sp(22), sp(22))
+        l.setSpacing(sp(10))
         return f
 
     def _tile_title(self, text: str) -> QLabel:
@@ -925,8 +925,8 @@ class SessionSummary(QWidget):
             pair = QWidget()
             pair.setStyleSheet("background: transparent;")
             pair_l = QHBoxLayout(pair)
-            pair_l.setContentsMargins(0, 0, 0, 0)
-            pair_l.setSpacing(5)
+            pair_l.setContentsMargins(sp(0), sp(0), sp(0), sp(0))
+            pair_l.setSpacing(sp(5))
             pair_l.addWidget(dot)
             pair_l.addWidget(text)
             self._phase_legend_l.addWidget(pair)
@@ -1031,8 +1031,8 @@ class OverviewScreen(QWidget):
         self.setStyleSheet(f"background: {BG};")
 
         v = QVBoxLayout(self)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(0)
+        v.setContentsMargins(sp(0), sp(0), sp(0), sp(0))
+        v.setSpacing(sp(0))
 
         # ── Header band ───────────────────────────────────────────────────────
         header = QFrame()
@@ -1043,12 +1043,12 @@ class OverviewScreen(QWidget):
                 border-bottom: 1px solid {LINE};
             }}
         """)
-        header.setFixedHeight(72)
+        header.setFixedHeight(sp(72))
         h = QHBoxLayout(header)
-        h.setContentsMargins(28, 0, 28, 0)
+        h.setContentsMargins(sp(28), sp(0), sp(28), sp(0))
 
         title_col = QVBoxLayout()
-        title_col.setSpacing(2)
+        title_col.setSpacing(sp(2))
         t = QLabel("Trust Level Dashboard")
         t.setFont(ui_font(17, QFont.Weight.Bold))
         t.setStyleSheet(f"color: {TEXT}; letter-spacing: -0.2px; background: transparent;")
@@ -1083,8 +1083,8 @@ class OverviewScreen(QWidget):
         analytics_wrap = QWidget()
         analytics_wrap.setStyleSheet(f"background: {BG_DEEP}; border-bottom: 1px solid {LINE};")
         av = QVBoxLayout(analytics_wrap)
-        av.setContentsMargins(28, 12, 28, 14)
-        av.setSpacing(10)
+        av.setContentsMargins(sp(28), sp(12), sp(28), sp(14))
+        av.setSpacing(sp(10))
 
         if recent:
             ys = [float(s.get("trust_total", 50)) for s in recent]
@@ -1092,14 +1092,14 @@ class OverviewScreen(QWidget):
 
             # ── 4-up stat strip ───────────────────────────────────────────────
             stat_row = QHBoxLayout()
-            stat_row.setSpacing(0)
+            stat_row.setSpacing(sp(0))
 
             def _stat_box(value_text, value_color, top_label, bottom_text, bottom_color=None):
                 box = QWidget()
                 box.setStyleSheet("background: transparent;")
                 bl = QVBoxLayout(box)
-                bl.setContentsMargins(0, 0, 0, 0)
-                bl.setSpacing(1)
+                bl.setContentsMargins(sp(0), sp(0), sp(0), sp(0))
+                bl.setSpacing(sp(1))
                 cap = QLabel(top_label.upper())
                 cap.setFont(ui_font(7, QFont.Weight.DemiBold))
                 cap.setStyleSheet(f"color: {TEXT_FAINT}; letter-spacing: 1.2px;")
@@ -1141,7 +1141,7 @@ class OverviewScreen(QWidget):
                 str(latest_score), latest_color,
                 "Latest", prev_delta_text,
             ))
-            _stat_divider = lambda: (lambda w: (w.setFixedWidth(1), w.setStyleSheet(f"background: {LINE_SOFT}; margin: 4px 18px;"), w)[-1])(QFrame())
+            _stat_divider = lambda: (lambda w: (w.setFixedWidth(sp(1)), w.setStyleSheet(f"background: {LINE_SOFT}; margin: 4px 18px;"), w)[-1])(QFrame())
             stat_row.addWidget(_stat_divider())
             stat_row.addWidget(_stat_box(
                 f"{avg_score:.0f}", avg_color,
@@ -1171,7 +1171,7 @@ class OverviewScreen(QWidget):
             pg.setConfigOption("background", BG_DEEP)
             trend_plot = pg.PlotWidget()
             trend_plot.setBackground(BG_DEEP)
-            trend_plot.setFixedHeight(160)
+            trend_plot.setFixedHeight(sp(160))
             trend_plot.setMouseEnabled(x=False, y=False)
             trend_plot.setMenuEnabled(False)
             trend_plot.hideButtons()
@@ -1298,8 +1298,8 @@ class OverviewScreen(QWidget):
 
             # ── Band legend ───────────────────────────────────────────────────
             legend_row = QHBoxLayout()
-            legend_row.setSpacing(16)
-            legend_row.setContentsMargins(0, 2, 0, 0)
+            legend_row.setSpacing(sp(16))
+            legend_row.setContentsMargins(sp(0), sp(2), sp(0), sp(0))
 
             # Legend entries: TRUST_BANDS is already high→low
             legend_entries = []
@@ -1313,7 +1313,7 @@ class OverviewScreen(QWidget):
 
             for b_label, b_color, lo, hi in legend_entries:
                 entry = QHBoxLayout()
-                entry.setSpacing(5)
+                entry.setSpacing(sp(5))
                 dot_lbl = QLabel("●")
                 dot_lbl.setFont(ui_font(9))
                 dot_lbl.setStyleSheet(f"color: {b_color}; background: transparent;")
@@ -1360,8 +1360,8 @@ class OverviewScreen(QWidget):
         inner = QWidget()
         inner.setStyleSheet(f"background: {BG};")
         inner_l = QVBoxLayout(inner)
-        inner_l.setContentsMargins(24, 0, 24, 24)
-        inner_l.setSpacing(8)
+        inner_l.setContentsMargins(sp(24), sp(0), sp(24), sp(24))
+        inner_l.setSpacing(sp(8))
 
         if not sessions:
             empty = QLabel("No sessions recorded yet.\nPress  ▶ Start Session  to begin.")
@@ -1413,12 +1413,12 @@ class OverviewScreen(QWidget):
         card.clicked.connect(lambda: self.session_clicked.emit(self._with_abs_paths(sess)))
 
         h = QHBoxLayout(card)
-        h.setContentsMargins(16, 12, 16, 12)
-        h.setSpacing(0)
+        h.setContentsMargins(sp(16), sp(12), sp(16), sp(12))
+        h.setSpacing(sp(0))
 
         # ── Left: score anchor ────────────────────────────────────────────────
         left_col = QVBoxLayout()
-        left_col.setSpacing(4)
+        left_col.setSpacing(sp(4))
         left_col.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         score_lbl = QLabel(str(total))
@@ -1439,7 +1439,7 @@ class OverviewScreen(QWidget):
             border-radius: 8px;
             padding: 2px 8px;
         """)
-        chip.setMaximumWidth(160)
+        chip.setMaximumWidth(sp(160))
         left_col.addWidget(chip)
 
         # Delta vs previous session
@@ -1458,21 +1458,21 @@ class OverviewScreen(QWidget):
         left_col.addWidget(delta_lbl)
 
         left_wrap = QWidget()
-        left_wrap.setFixedWidth(130)
+        left_wrap.setFixedWidth(sp(130))
         left_wrap.setLayout(left_col)
         left_wrap.setStyleSheet("background: transparent;")
         h.addWidget(left_wrap)
 
         # Thin divider
         sep1 = QFrame()
-        sep1.setFixedWidth(1)
+        sep1.setFixedWidth(sp(1))
         sep1.setStyleSheet(f"background-color: {LINE_SOFT}; border: none; margin: 4px 14px;")
         h.addWidget(sep1)
 
         # ── Middle: meta + channel bars ───────────────────────────────────────
         mid_col = QVBoxLayout()
-        mid_col.setSpacing(6)
-        mid_col.setContentsMargins(14, 0, 14, 0)
+        mid_col.setSpacing(sp(6))
+        mid_col.setContentsMargins(sp(14), sp(0), sp(14), sp(0))
 
         date_lbl = QLabel(sess.get("date", "—"))
         date_lbl.setFont(ui_font(11, QFont.Weight.DemiBold))
@@ -1494,9 +1494,9 @@ class OverviewScreen(QWidget):
         ]:
             val = int(sess.get(ch_key, 50))
             row = QHBoxLayout()
-            row.setSpacing(8)
+            row.setSpacing(sp(8))
             lbl = QLabel(ch_label)
-            lbl.setFixedWidth(44)
+            lbl.setFixedWidth(sp(44))
             lbl.setFont(ui_font(8))
             lbl.setStyleSheet(f"color: {TEXT_FAINT};")
 
@@ -1504,14 +1504,14 @@ class OverviewScreen(QWidget):
             track_wrap = QWidget()
             track_wrap.setStyleSheet("background: transparent;")
             tw_l = QHBoxLayout(track_wrap)
-            tw_l.setContentsMargins(0, 0, 0, 0)
-            tw_l.setSpacing(0)
+            tw_l.setContentsMargins(sp(0), sp(0), sp(0), sp(0))
+            tw_l.setSpacing(sp(0))
             track = _BarTrackWithTick(ch_color)
             track.setValue(val)
             tw_l.addWidget(track)
 
             num = QLabel(str(val))
-            num.setFixedWidth(26)
+            num.setFixedWidth(sp(26))
             num.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             num.setFont(mono_font(8, QFont.Weight.Medium))
             num.setStyleSheet(f"color: {TEXT};")

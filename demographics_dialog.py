@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFrame, QLabel,
                               QComboBox, QLineEdit, QSpinBox, QPushButton)
 
 from theme import (BG, PANEL, LINE_SOFT, TEXT, TEXT_DIM, TEXT_FAINT, ACCENT,
-                    ui_font, panel_qss)
+                    ui_font, panel_qss, sp)
 
 SEX_OPTIONS = ["Select…", "Female", "Male", "Non-binary", "Prefer not to say"]
 
@@ -43,8 +43,8 @@ class DemographicsDialog(QDialog):
                                  # then triggers closeEvent as well)
 
         v = QVBoxLayout(self)
-        v.setContentsMargins(32, 28, 32, 24)
-        v.setSpacing(18)
+        v.setContentsMargins(sp(32), sp(28), sp(32), sp(24))
+        v.setSpacing(sp(18))
 
         title = QLabel("Before we begin")
         title.setFont(ui_font(17, QFont.Weight.Bold))
@@ -60,8 +60,8 @@ class DemographicsDialog(QDialog):
         card.setObjectName("demoCard")
         card.setStyleSheet(panel_qss("demoCard"))
         cl = QVBoxLayout(card)
-        cl.setContentsMargins(20, 20, 20, 20)
-        cl.setSpacing(16)
+        cl.setContentsMargins(sp(20), sp(20), sp(20), sp(20))
+        cl.setSpacing(sp(16))
 
         combo_qss = f"""
             QComboBox {{

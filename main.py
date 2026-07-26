@@ -54,7 +54,8 @@ from Physio_analysis.hrv_analyzer     import HRVAnalyzer
 # ── UI modules ───────────────────────────────────────────────────────────────
 from theme import (BG, BG_DEEP, PANEL, LINE, LINE_SOFT, TEXT, TEXT_FAINT, TEXT_GHOST,
                     ACCENT, DANGER, C_WORKLOAD,
-                    ui_font, load_packaged_fonts, trust_band, TRUST_BANDS)
+                    ui_font, load_packaged_fonts, trust_band, TRUST_BANDS,
+                    init_ui_scale, sp)
 from panels import (TopStrip, CameraPanel, ScorePanel, VoicePanel, HistoryChart,
                      Footer, FlagSidebar, BlendshapeWatch)
 from overlays import OverviewScreen, CalibrationOverlay, SessionSummary
@@ -110,8 +111,10 @@ class TrustDashboard(QMainWindow):
         super().__init__()
         self.setWindowTitle("Trust Level Dashboard")
         self.setStyleSheet(f"background: {BG};")
-        self.resize(1400, 980)
-        self.setMinimumSize(1200, 880)
+        # Scaled like everything else, so the minimum can't demand more room
+        # than the screen the design was just scaled down to fit.
+        self.resize(sp(1400), sp(980))
+        self.setMinimumSize(sp(1200), sp(880))
 
         # ── Analyzers (same instances as before) ─────────────────────────────
         self.face     = FaceAnalyzer()
@@ -246,8 +249,8 @@ class TrustDashboard(QMainWindow):
         root = QWidget()
         root.setStyleSheet(f"background: {BG};")
         rl = QVBoxLayout(root)
-        rl.setContentsMargins(0, 0, 0, 0)
-        rl.setSpacing(0)
+        rl.setContentsMargins(sp(0), sp(0), sp(0), sp(0))
+        rl.setSpacing(sp(0))
 
         # Top strip
         self.top = TopStrip()
@@ -259,26 +262,26 @@ class TrustDashboard(QMainWindow):
         stage = QWidget()
         stage.setStyleSheet(f"background: {BG};")
         sl = QVBoxLayout(stage)
-        sl.setContentsMargins(20, 18, 20, 18)
-        sl.setSpacing(14)
+        sl.setContentsMargins(sp(20), sp(18), sp(20), sp(18))
+        sl.setSpacing(sp(14))
 
         # Row 1: camera | score | voice
         row1 = QHBoxLayout()
-        row1.setSpacing(14)
+        row1.setSpacing(sp(14))
 
         self.cam_panel = CameraPanel()
         self.cam_panel.switch_camera_clicked.connect(self._switch_camera)
-        self.cam_panel.setFixedWidth(300)
+        self.cam_panel.setFixedWidth(sp(300))
 
         self.score_panel = ScorePanel()
-        self.score_panel.setFixedWidth(520)
+        self.score_panel.setFixedWidth(sp(520))
 
         self.voice_panel = VoicePanel()
-        self.voice_panel.setMaximumWidth(380)
+        self.voice_panel.setMaximumWidth(sp(380))
 
         # Cap height so panels don't over-stretch on tall windows
         for _p in (self.cam_panel, self.score_panel, self.voice_panel):
-            _p.setMaximumHeight(600)
+            _p.setMaximumHeight(sp(600))
 
         row1.addWidget(self.cam_panel)
         row1.addWidget(self.score_panel)
@@ -294,14 +297,14 @@ class TrustDashboard(QMainWindow):
 
         # Row 2: history chart full-width
         self.history_chart = HistoryChart()
-        self.history_chart.setMinimumHeight(220)
+        self.history_chart.setMinimumHeight(sp(220))
         sl.addWidget(self.history_chart, 1)
 
         # Wrap stage + flag sidebar in a middle HBox
         self.flag_sidebar = FlagSidebar()
         middle = QHBoxLayout()
-        middle.setContentsMargins(0, 0, 0, 0)
-        middle.setSpacing(0)
+        middle.setContentsMargins(sp(0), sp(0), sp(0), sp(0))
+        middle.setSpacing(sp(0))
         middle.addWidget(stage, 1)
         middle.addWidget(self.flag_sidebar)
         rl.addLayout(middle, 1)
@@ -2472,6 +2475,14 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Trust")
     app.setOrganizationName("Trust")
+
+    # Measure the screen and scale the design to fit it. Must run before any
+    # widget is constructed — sizes are read once, at construction.
+    scale = init_ui_scale(app)
+    geo = app.primaryScreen().availableGeometry()
+    print(f"[ui] screen {geo.width()}x{geo.height()} logical px, "
+          f"devicePixelRatio {app.primaryScreen().devicePixelRatio():.2f}, "
+          f"UI scale {scale:.2f}", flush=True)
 
     # Ship Inter / JetBrainsMono .ttf files in a fonts/ folder for pixel parity
     # with the design preview. Falls back to system fonts if not present.

@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (QWidget, QLabel, QFrame, QHBoxLayout, QVBoxLayout,
 
 from theme import (LINE, LINE_SOFT, TEXT, TEXT_DIM, TEXT_FAINT, TEXT_GHOST,
                     PANEL, PANEL_2, C_FACIAL, C_VOCAL, C_GAZE, C_HRV,
-                    ui_font, mono_font, trust_band, head_qss, BG_DEEP)
+                    ui_font, mono_font, trust_band, head_qss, BG_DEEP, sp)
 
 
 # ─── Custom-painted gauge ───────────────────────────────────────────────────
@@ -30,7 +30,7 @@ class GaugeWidget(QWidget):
         # widget's real height, so letting it shrink under a size squeeze
         # (small window) keeps siblings below it from overlapping instead of
         # being pushed to a y-offset the gauge's fixed size then overruns.
-        self.setMinimumHeight(105)
+        self.setMinimumHeight(sp(105))
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding)
 
     def setScore(self, score: int, color_hex: str):
@@ -137,8 +137,8 @@ class BarTrack(QWidget):
         self._color = QColor(color_hex)
         self._value = 50
         self._is_stub = is_stub
-        self.setFixedHeight(7)
-        self.setMinimumWidth(80)
+        self.setFixedHeight(sp(7))
+        self.setMinimumWidth(sp(80))
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def setValue(self, v: float):
@@ -176,28 +176,28 @@ class ChannelBar(QWidget):
         self._is_stub = is_stub
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(2)
+        outer.setContentsMargins(sp(0), sp(0), sp(0), sp(0))
+        outer.setSpacing(sp(2))
 
         row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(12)
+        row.setContentsMargins(sp(0), sp(0), sp(0), sp(0))
+        row.setSpacing(sp(12))
 
         self._color_hex = color_hex
 
         self._lbl = QLabel(label)
-        self._lbl.setFixedWidth(58)
+        self._lbl.setFixedWidth(sp(58))
         self._lbl.setFont(ui_font(10, QFont.Weight.Medium))
 
         self._track = BarTrack(color_hex, is_stub=is_stub)
 
         self._num = QLabel()
-        self._num.setFixedWidth(32)
+        self._num.setFixedWidth(sp(32))
         self._num.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._num.setFont(mono_font(10, QFont.Weight.Medium))
 
         w_lbl = QLabel(f"{weight_pct}%")
-        w_lbl.setFixedWidth(36)
+        w_lbl.setFixedWidth(sp(36))
         w_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         w_lbl.setFont(mono_font(8))
         w_lbl.setStyleSheet(f"color: {TEXT_GHOST}; letter-spacing: 0.5px;")
@@ -242,7 +242,7 @@ class TrustBadge(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumHeight(34)
+        self.setMinimumHeight(sp(34))
         self.setFont(mono_font(14, QFont.Weight.DemiBold))
         self.setBand("Calibrating…", TEXT_DIM)
 
@@ -269,7 +269,7 @@ class BaselineQualityDot(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._color = QColor(TEXT_GHOST)
-        self.setFixedSize(QSize(11, 11))
+        self.setFixedSize(QSize(sp(11), sp(11)))
 
     def set_quality(self, pct: float):
         if pct >= 90:
@@ -306,7 +306,7 @@ class StatusDot(QWidget):
     def __init__(self, state: str = "loading", parent=None):
         super().__init__(parent)
         self._state = state
-        self.setFixedSize(QSize(14, 14))
+        self.setFixedSize(QSize(sp(14), sp(14)))
 
     def setState(self, state: str):
         if state != self._state:
@@ -337,8 +337,8 @@ class MetricBox(QFrame):
         """)
 
         v = QVBoxLayout(self)
-        v.setContentsMargins(10, 6, 10, 6)
-        v.setSpacing(1)
+        v.setContentsMargins(sp(10), sp(6), sp(10), sp(6))
+        v.setSpacing(sp(1))
 
         self._label = QLabel(label.upper())
         self._label.setFont(ui_font(8, QFont.Weight.DemiBold))
@@ -379,10 +379,10 @@ class PanelHead(QFrame):
         super().__init__(parent)
         self.setObjectName("panelHead")
         self.setStyleSheet(head_qss())
-        self.setFixedHeight(42)
+        self.setFixedHeight(sp(42))
 
         h = QHBoxLayout(self)
-        h.setContentsMargins(22, 0, 22, 0)
+        h.setContentsMargins(sp(22), sp(0), sp(22), sp(0))
 
         self._title = QLabel(title.upper())
         self._title.setFont(ui_font(8, QFont.Weight.DemiBold))
@@ -408,7 +408,7 @@ class WaveformWidget(QWidget):
         super().__init__(parent)
         self._samples = []
         self._speaking = False
-        self.setMinimumHeight(56)
+        self.setMinimumHeight(sp(56))
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def setSamples(self, samples):
@@ -465,10 +465,10 @@ class AttributionStrip(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(48)  # fixed height avoids layout shift
+        self.setFixedHeight(sp(48))  # fixed height avoids layout shift
         v = QVBoxLayout(self)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(2)
+        v.setContentsMargins(sp(0), sp(0), sp(0), sp(0))
+        v.setSpacing(sp(2))
 
         self._headline = QLabel("")
         self._headline.setFont(mono_font(10, QFont.Weight.Medium))
@@ -530,7 +530,7 @@ class SpectrumWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._bins = []
-        self.setMinimumHeight(44)
+        self.setMinimumHeight(sp(44))
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def setBins(self, bins):
