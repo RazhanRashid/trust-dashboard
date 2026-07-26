@@ -97,19 +97,48 @@ MIN_UI_SCALE  = 0.65
 MAX_UI_SCALE  = 1.00
 
 UI_SCALE = 1.0           # replaced by init_ui_scale() before any widget is built
+UI_DPR   = 1.0           # devicePixelRatio of the screen we measured
+
+# Smallest type we're willing to put on screen, in PHYSICAL pixels. The floor
+# has to be physical, not logical: Qt magnifies logical pixels by the screen's
+# devicePixelRatio, so on a 150%-scaled Windows display a 5px logical glyph is
+# already ~8px to the eye. Holding a flat 8 *logical* px floor there buys no
+# legibility and costs layout — see _font_px.
+MIN_FONT_PHYSICAL_PX = 8
 
 
 def init_ui_scale(app) -> float:
     """Measure the primary screen and set the global UI scale. Call once, from
     main(), before constructing any widget — sizes are read at construction."""
-    global UI_SCALE
+    global UI_SCALE, UI_DPR
     try:
         screen = app.primaryScreen()
         usable = screen.availableGeometry().height() - _CHROME_H
         UI_SCALE = max(MIN_UI_SCALE, min(MAX_UI_SCALE, usable / DESIGN_HEIGHT))
+        UI_DPR = float(screen.devicePixelRatio()) or 1.0
     except Exception:
         UI_SCALE = 1.0   # never let a display query stop the app from starting
+        UI_DPR = 1.0
     return UI_SCALE
+
+
+def _font_px(size: int) -> int:
+    """Scale a design font size, floored in physical rather than logical pixels.
+
+    sp() shrinks boxes with no lower bound worth speaking of, so a font floor
+    expressed in logical pixels stops tracking its container as soon as it
+    binds. The app's small type is 7-11 design px: with a flat 8 logical px
+    floor, every one of those collapses onto 8px below roughly scale 0.9 and
+    then stays there while the boxes keep shrinking — 8px of text in a box
+    sized for 5.4px at scale 0.68, which is what pushed labels out of their
+    containers on Windows.
+
+    Dividing the floor by devicePixelRatio makes it bind only when the glyph
+    would genuinely be too small to read on that physical display, so type and
+    layout shrink together everywhere else.
+    """
+    floor = max(1, round(MIN_FONT_PHYSICAL_PX / UI_DPR))
+    return max(floor, round(size * UI_SCALE))
 
 
 def sp(px: float) -> int:
@@ -127,7 +156,7 @@ def ui_font(size: int, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
     """Inter (or fallback) at the given design pixel size, scaled to the device."""
     f = QFont()
     f.setFamilies(UI_FAMILIES)
-    f.setPixelSize(max(8, round(size * UI_SCALE)))   # 8px is the legibility floor
+    f.setPixelSize(_font_px(size))
     f.setWeight(weight)
     return f
 
@@ -136,7 +165,7 @@ def mono_font(size: int, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
     """JetBrains Mono (or fallback) at the given design pixel size, scaled."""
     f = QFont()
     f.setFamilies(MONO_FAMILIES)
-    f.setPixelSize(max(8, round(size * UI_SCALE)))
+    f.setPixelSize(_font_px(size))
     f.setWeight(weight)
     f.setStyleHint(QFont.StyleHint.TypeWriter)
     return f
