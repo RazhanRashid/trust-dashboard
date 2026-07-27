@@ -61,12 +61,23 @@ _PHONE_NAME_HINTS   = ("iphone", "ipad", "continuity", "desk view")
 
 _TIMEOUT_S = 6
 
+# Windows spawns a visible console window for every child process unless told
+# not to. Without this the scan flashes several black boxes over the dashboard,
+# and in a PyInstaller windowed build they linger. No effect on other platforms.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-def _run(cmd: list[str], **kw) -> str:
-    """Run a command and return stdout, or "" if anything at all goes wrong."""
+
+def _run(cmd: list[str], want_stderr: bool = False) -> str:
+    """Run a command and return its output, or "" if anything goes wrong.
+
+    *want_stderr* is for ffmpeg's device listings, which it writes to stderr
+    and then exits non-zero — a normal result, not a failure.
+    """
     try:
-        out = subprocess.run(cmd, capture_output=True, timeout=_TIMEOUT_S, **kw)
-        return (out.stdout or b"").decode(errors="replace")
+        out = subprocess.run(cmd, capture_output=True, timeout=_TIMEOUT_S,
+                             creationflags=_NO_WINDOW)
+        stream = out.stderr if want_stderr else out.stdout
+        return (stream or b"").decode(errors="replace")
     except Exception:
         return ""
 
@@ -196,13 +207,8 @@ def _macos_devices() -> dict[int, tuple[str, str]]:
 
 def _macos_devices_via_ffmpeg() -> dict[int, tuple[str, str]]:
     """Fallback when PyObjC is missing: names only, transport inferred later."""
-    try:
-        out = subprocess.run(
-            ["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
-            stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=_TIMEOUT_S)
-        text = out.stderr.decode(errors="replace")
-    except Exception:
-        return {}
+    text = _run(["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+                want_stderr=True)
     devices: dict[int, tuple[str, str]] = {}
     in_video = False
     for line in text.splitlines():
@@ -222,73 +228,107 @@ def _macos_devices_via_ffmpeg() -> dict[int, tuple[str, str]]:
 # ═══════════════════════════════════════════════════════════════════════════
 # Windows
 # ═══════════════════════════════════════════════════════════════════════════
-def _windows_devices() -> dict[int, tuple[str, str]]:
-    """DirectShow order from ffmpeg, transport from the PnP instance IDs.
+def _parse_pnp_cameras(raw: str) -> list[tuple[str, str]]:
+    """[(name, transport)] from Get-PnpDevice JSON, in the order reported.
 
-    A device's PnP InstanceId carries its bus: USB\\..., BTHENUM\\... for a
-    Bluetooth-paired device, ROOT\\ or SWD\\ for a software one. What it does
-    *not* distinguish is a laptop's built-in camera from a plugged-in webcam —
-    both sit on a USB bus — so that one falls back to the device name.
+    A device's PnP InstanceId carries its bus: ``USB\\...``, ``BTHENUM\\...``
+    for a Bluetooth-paired device, ``ROOT\\`` or ``SWD\\`` for a software one.
+    What it does *not* distinguish is a laptop's built-in camera from a plugged
+    in webcam — an internal webcam sits on an internal USB hub and enumerates
+    exactly like an external one — so that distinction falls back to the name.
     """
-    # Transport by name, from PnP.
-    ps = ("Get-PnpDevice -Class Camera,Image -PresentOnly | "
-          "Select-Object FriendlyName,InstanceId | ConvertTo-Json -Compress")
-    raw = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps])
-    by_name: dict[str, str] = {}
+    out: list[tuple[str, str]] = []
     try:
         parsed = json.loads(raw) if raw.strip() else []
-        if isinstance(parsed, dict):
-            parsed = [parsed]
-        for entry in parsed:
-            name = (entry.get("FriendlyName") or "").strip()
-            inst = (entry.get("InstanceId") or "").upper()
-            if not name:
-                continue
-            if inst.startswith(("BTHENUM", "BTH\\", "BTHLE")):
-                transport = BLUETOOTH
-            elif inst.startswith(("ROOT", "SWD")):
-                transport = VIRTUAL
-            elif inst.startswith("USB"):
-                transport = _name_transport_hint(name) or USB
-            else:
-                transport = _name_transport_hint(name) or UNKNOWN
-            by_name[name.lower()] = transport
-    except Exception as exc:
-        print(f"[camera] Get-PnpDevice failed ({exc})", flush=True)
-
-    # DirectShow enumeration order — the order OpenCV's indices follow.
-    try:
-        out = subprocess.run(
-            ["ffmpeg", "-f", "dshow", "-list_devices", "true", "-i", "dummy"],
-            stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=_TIMEOUT_S)
-        text = out.stderr.decode(errors="replace")
     except Exception:
-        text = ""
+        return out
+    if isinstance(parsed, dict):        # PowerShell emits a bare object for one result
+        parsed = [parsed]
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            continue
+        name = (entry.get("FriendlyName") or "").strip()
+        inst = (entry.get("InstanceId") or "").upper()
+        if not name:
+            continue
+        if inst.startswith(("BTHENUM", "BTH\\", "BTHLE")):
+            transport = BLUETOOTH
+        elif inst.startswith(("ROOT", "SWD")):
+            transport = VIRTUAL
+        elif inst.startswith("USB"):
+            transport = _name_transport_hint(name) or USB
+        else:
+            transport = _name_transport_hint(name) or UNKNOWN
+        out.append((name, transport))
+    return out
 
-    devices: dict[int, tuple[str, str]] = {}
-    idx = 0
+
+def _parse_dshow_names(text: str) -> list[str]:
+    """Video device names from ffmpeg's DirectShow listing, in enumeration order.
+
+    That order is what OpenCV's CAP_DSHOW indices follow — both walk the same
+    system device enumerator — which is the only reason a name can be attached
+    to an index at all on Windows.
+    """
+    names: list[str] = []
     in_video = False
     for line in text.splitlines():
         if "DirectShow video devices" in line:
             in_video = True
             continue
         if "DirectShow audio devices" in line:
-            in_video = False
-            continue
-        if in_video:
+            break
+        if in_video and "Alternative name" not in line:
             m = re.search(r'"([^"]+)"', line)
-            if m and "Alternative name" not in line:
-                name = m.group(1)
-                transport = by_name.get(name.lower())
-                if transport is None:
-                    # PnP names and DirectShow names do not always match
-                    # character for character; fall back to a loose match.
-                    transport = next((t for n, t in by_name.items()
-                                      if n in name.lower() or name.lower() in n),
-                                     _name_transport_hint(name) or UNKNOWN)
-                devices[idx] = (name, transport)
-                idx += 1
-    return devices
+            if m:
+                names.append(m.group(1))
+    return names
+
+
+def _match_transport(name: str, by_name: dict[str, str]) -> str:
+    """Transport for a DirectShow name, matched against the PnP list."""
+    lc = name.lower()
+    if lc in by_name:
+        return by_name[lc]
+    # PnP and DirectShow names do not always match character for character
+    # ("Integrated Camera" vs "Integrated Camera (1bcf:2cd1)") — fall back to a
+    # containment match, then to the name itself.
+    for pnp_name, transport in by_name.items():
+        if pnp_name in lc or lc in pnp_name:
+            return transport
+    return _name_transport_hint(name) or UNKNOWN
+
+
+def _windows_devices() -> dict[int, tuple[str, str]]:
+    """Name and transport per index, from PnP plus DirectShow ordering.
+
+    Two sources, because each supplies half the answer: PnP knows what every
+    camera *is* but not which OpenCV index it will be, and ffmpeg's DirectShow
+    listing knows the order but not the bus. Where ffmpeg is unavailable the
+    PnP order is used instead — a guess, but a labelled camera the researcher
+    can confirm in the preview beats an unnamed one.
+    """
+    ps = ("Get-PnpDevice -Class Camera,Image -PresentOnly -Status OK | "
+          "Select-Object FriendlyName,InstanceId | ConvertTo-Json -Compress")
+    pnp = _parse_pnp_cameras(
+        _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps]))
+    by_name = {name.lower(): transport for name, transport in pnp}
+
+    dshow_names = _parse_dshow_names(
+        _run(["ffmpeg", "-f", "dshow", "-list_devices", "true", "-i", "dummy"],
+             want_stderr=True))
+
+    if dshow_names:
+        return {i: (name, _match_transport(name, by_name))
+                for i, name in enumerate(dshow_names)}
+
+    if pnp:
+        print("[camera] ffmpeg not available for DirectShow ordering — falling "
+              "back to PnP order, so names may not line up with indices "
+              "(the preview will show which camera is which)", flush=True)
+        return {i: (name, transport) for i, (name, transport) in enumerate(pnp)}
+
+    return {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -365,20 +405,28 @@ def _try_open(index: int, backend: int) -> bool:
                 pass
 
 
-def probe_indices(backend: int, max_index: int = 8, attempts: int = 2) -> list[int]:
+def probe_indices(backend: int, indices=None, retry=frozenset(),
+                  max_index: int = 8) -> list[int]:
     """Indices that open *and* hand back a frame.
 
-    Each index gets more than one attempt. A camera that was released moments
-    ago — by the permission warm-up, by the previous session, by the picker's
-    own preview — is often still busy for a beat afterwards, and a single failed
-    open would report the user's built-in webcam as broken when it is merely
-    settling. The retry costs a fraction of a second on a device that is
-    genuinely absent.
+    *indices* is what to probe; *retry* is the subset worth a second attempt.
+    Both matter for how long this takes. A failed DirectShow open on Windows
+    blocks for a second or more, so blind-probing eight indices with retries
+    would stall the picker for the best part of a minute — the caller passes a
+    range bounded by what the OS actually reported instead.
+
+    An index the OS did list gets two attempts, because a camera released
+    moments ago (by the permission warm-up, the previous session, or the
+    picker's own preview) is often still busy for a beat, and one failed open
+    would report the user's own webcam as broken when it is merely settling.
+    Speculative indices get one attempt: nothing is expected there anyway.
 
     OpenCV prints a wall of driver noise on every failed open, so stderr is
     redirected for the duration — without this a normal scan buries the app's
     own logging.
     """
+    if indices is None:
+        indices = range(max_index)
     working: list[int] = []
     saved_err = None
     devnull = None
@@ -389,8 +437,9 @@ def probe_indices(backend: int, max_index: int = 8, attempts: int = 2) -> list[i
     except Exception:
         saved_err = None
     try:
-        for i in range(max_index):
-            for attempt in range(max(1, attempts)):
+        for i in indices:
+            attempts = 2 if i in retry else 1
+            for attempt in range(attempts):
                 if _try_open(i, backend):
                     working.append(i)
                     break
@@ -428,7 +477,16 @@ def scan_cameras(backend: int, max_index: int = 8) -> list[dict]:
         too. Better an unlabelled working camera than a missing one.
     """
     os_devices = os_camera_devices()
-    working = probe_indices(backend, max_index)
+
+    if os_devices:
+        # Probe what the OS reported, plus two spares in case its ordering and
+        # OpenCV's disagree. Probing the full range regardless is what makes a
+        # Windows scan crawl: every empty index costs a blocked DirectShow open.
+        ceiling = min(max_index, max(os_devices) + 3)
+        candidates = range(ceiling)
+    else:
+        candidates = range(max_index)
+    working = probe_indices(backend, candidates, retry=set(os_devices))
 
     cameras: list[dict] = []
     for idx in sorted(set(os_devices) | set(working)):

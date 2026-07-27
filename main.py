@@ -25,6 +25,24 @@ from pathlib import Path
 
 logging.getLogger("root").setLevel(logging.ERROR)
 
+
+# A PyInstaller windowed build (console=False, which trust_dashboard.spec uses)
+# starts with no standard streams at all on Windows, and print() to a None
+# stream raises. This app logs from several background threads — camera scan,
+# HRV, recording — so an unguarded print there does not produce a stray error
+# message, it kills that thread. The camera scan in particular would come back
+# empty and report "no camera found" on a machine with a working webcam.
+class _NullStream:
+    def write(self, *_args):  return 0
+    def flush(self):          pass
+    def isatty(self):         return False
+
+
+if sys.stdout is None:
+    sys.stdout = _NullStream()
+if sys.stderr is None:
+    sys.stderr = _NullStream()
+
 import cv2
 import numpy as np
 import sounddevice as sd

@@ -127,11 +127,22 @@ Before calibration the app scans the machine and lists every camera it finds, ea
 
 Selecting one opens a live preview, which is the only reliable way to tell two plugged-in webcams apart. **Rescan** picks up a camera attached after launch. The choice is remembered and preselected next time, and the camera panel's ⇄ button reopens the picker mid-session.
 
-Two questions have to be answered separately, because no single API answers both. *Which devices deliver frames* is only knowable by opening each one and reading a frame — OpenCV has no device list. *What each device is* comes from the platform: AVFoundation device types cross-referenced against the USB and Bluetooth trees on macOS, PnP instance IDs (`USB\`, `BTHENUM\`, `ROOT\`) on Windows, sysfs on Linux.
+Two questions have to be answered separately, because no single API answers both. *Which devices deliver frames* is only knowable by opening each one and reading a frame — OpenCV has no device list. *What each device is* comes from the platform:
 
-The two lists are unioned rather than intersected. A camera the OS lists but that will not open is still offered, marked *listed, but would not open* — the usual cause is another app holding it or camera permission not yet granted, both of which the researcher can fix. A working index the OS never named is offered too.
+| | Device names + order | Connection type |
+|---|---|---|
+| **macOS** | AVFoundation device list (PyObjC), or `ffmpeg -f avfoundation` if PyObjC is missing | AVFoundation device type, refined against `system_profiler` USB and Bluetooth trees |
+| **Windows** | `ffmpeg -f dshow -list_devices`, which enumerates in the same order OpenCV's `CAP_DSHOW` indices follow | `Get-PnpDevice` instance IDs: `USB\`, `BTHENUM\` for Bluetooth, `ROOT\`/`SWD\` for virtual |
+| **Linux** | sysfs (`/sys/class/video4linux`) | the `device` symlink target |
 
-One caveat worth knowing: a laptop's built-in camera sits on an internal USB bus, so on Windows and Linux the transport alone cannot distinguish it from a plugged-in webcam, and the device name is used to tell them apart. If the badge is wrong, the device name beside it is still correct — and the preview settles it either way.
+The two lists are unioned rather than intersected. A camera the OS lists but that will not open is still offered, marked *listed, but would not open* — the usual cause is another app holding it or camera permission not yet granted, both of which the researcher can fix. A working index the OS never named is offered too, as `Camera N`.
+
+Two caveats worth knowing:
+
+- **A laptop's built-in camera sits on an internal USB bus**, so on Windows and Linux the transport alone cannot distinguish it from a plugged-in webcam. The device name is used instead (`Integrated`, `Built-in`, `FaceTime`, …). macOS has no such ambiguity — AVFoundation reports the device type directly.
+- **On Windows, ffmpeg is what maps a name to an index.** Without it the PnP order is used instead, which usually matches but is not guaranteed; the picker logs that it has fallen back.
+
+If a badge or a name is wrong, the preview still shows which physical camera an entry is — that is what it is for.
 
 The chosen camera is recorded in the export (Summary sheet). Facial and gaze readings are not comparable across a laptop camera and an external one at a different height and field of view, so the device travels with the session.
 
@@ -322,6 +333,9 @@ The app also broadcasts a passive live tick stream on `ws://127.0.0.1:8765` for 
 The app runs natively on Windows; two platform differences are handled in code:
 
 - **Camera backend** — DirectShow (`cv2.CAP_DSHOW`) on Windows, AVFoundation on macOS. Device identification follows: PnP instance IDs on Windows, AVFoundation device types on macOS. Continuity Camera exists only on macOS and is not looked for elsewhere.
+- **Camera scanning speed** — a failed DirectShow open blocks for a second or more, so the scan probes only the range the OS reported (plus two spares) rather than a fixed 0–7. Blind-probing every index is what makes a Windows camera scan crawl.
+- **Console windows** — every subprocess the scanner runs (`powershell`, `ffmpeg`) is launched with `CREATE_NO_WINDOW`. Without it Windows flashes a black console box for each one, and in a packaged build they linger.
+- **No standard streams** — `trust_dashboard.spec` builds with `console=False`, so a packaged app starts with `sys.stdout` and `sys.stderr` set to `None` and any `print()` raises. Since the camera scan, HRV, and recording all log from background threads, that would not print a stray error — it would kill the thread, and the camera scan would report no cameras on a machine with a working webcam. `main.py` substitutes null streams at import when they are missing.
 - **BLE scanning** — the scan is deliberately unfiltered. bleak's WinRT backend cannot use the native service-UUID filter and falls back to filtering client-side on advertised UUIDs, which silently drops any strap that lists `0x180D` only in its scan response. The code scans unfiltered and matches afterwards on service UUID or name. **Do not "fix" this by re-adding a `service_uuids` filter** — the same code then finds the strap on macOS and nothing on Windows.
 
 ### Building a standalone .exe
