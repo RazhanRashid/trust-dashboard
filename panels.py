@@ -400,9 +400,19 @@ class CameraPanel(QFrame):
                 self._metrics[k].setValue("—")
                 self._metrics[k].clearDelta()
 
-    def set_camera_info(self, index: int, total: int):
-        self._switch_btn.setEnabled(total > 1)
+    def set_camera_info(self, index: int, total: int, name: str = "",
+                        label: str = ""):
+        # The switch button now opens the camera picker rather than blindly
+        # cycling, so it stays enabled even with a single camera — the picker
+        # is also how a newly plugged-in webcam gets found mid-session.
+        self._switch_btn.setEnabled(True)
         self._cam_label.setText(f"CAM_{index:02d}")
+        tip = "Choose camera"
+        if name:
+            tip = f"{name}" + (f" · {label}" if label else "")
+            tip += "\nClick to choose a different camera"
+        self._switch_btn.setToolTip(tip)
+        self._cam_label.setToolTip(tip)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

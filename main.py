@@ -60,6 +60,8 @@ from panels import (TopStrip, CameraPanel, ScorePanel, VoicePanel, HistoryChart,
                      Footer, FlagSidebar, BlendshapeWatch)
 from overlays import OverviewScreen, CalibrationOverlay, SessionSummary
 from demographics_dialog import DemographicsDialog
+from camera_dialog import CameraDialog
+import camera_scanner
 
 try:
     import websockets
@@ -132,6 +134,10 @@ class TrustDashboard(QMainWindow):
         self._sample_rate   = 44100
         self._running       = True
         self._cap = None
+        # Guards the capture handle itself. The camera loop blocks inside
+        # cap.read(); without this a swap could release the device out from
+        # under a read in progress, which is a crash rather than a dropped frame.
+        self._cap_lock = threading.Lock()
         self._measured_cam_fps: float = 30.0   # set for real in _start_camera / _switch_camera
 
         # ── Session / history state ─────────────────────────────────────────
@@ -163,12 +169,22 @@ class TrustDashboard(QMainWindow):
         self._calibration_seconds = 30
         self._calibration_pupil:  list[float] = []
         self._calibration_face = {"eye_ar": [], "blink_rate": [], "gaze_deviation": []}
+        # Resting expression / Action Unit / Duchenne readings, keyed by name.
+        # These are what make the facial channel personal: a face that registers
+        # a permanent trace of sadness or a habitually furrowed brow scores from
+        # there rather than being penalised for sitting still.
+        self._calibration_expr: dict = {}
+        self._calibration_aus:  dict = {}
+        self._calibration_duchenne: list[float] = []
         # pitch_stability / energy_level / tremor_index are the original three vocal calibration buffers.
         # hnr_db, alpha_ratio, and jitter were added when eGeMAPS support was introduced so that
         # the VoicePanel can show "vs calibration" deltas for the two new metric boxes (HNR and Jitter).
+        # spectral_flux was added when vocal scoring became baseline-relative.
         self._calibration_vocal = {"pitch_stability": [], "energy_level": [], "tremor_index": [],
-                                   "hnr_db": [], "alpha_ratio": [], "jitter": []}
+                                   "hnr_db": [], "alpha_ratio": [], "jitter": [],
+                                   "spectral_flux": []}
         self._calibration_hrv: list[float] = []
+        self._calibration_rmssd: list[float] = []
         self._calibration_baseline: dict = {}
 
         # ── Behavioural flag state ──────────────────────────────────────────
@@ -197,6 +213,12 @@ class TrustDashboard(QMainWindow):
         self._available_cameras: list[int] = []
         self._camera_idx_pos = 0
         self._cam_ok = False
+        # Everything known about the camera in use, from the last scan:
+        # {"index", "name", "transport", "label"}. Recorded in the export so a
+        # session can be traced back to the lens it was captured through.
+        self._camera_info: dict = {}
+        self._cam_dialog = None
+        self._cam_threads_started = False
         self._mic_ok = False
 
         # ── Data directories ─────────────────────────────────────────────────
@@ -392,18 +414,39 @@ class TrustDashboard(QMainWindow):
         if result is None:
             return
         self._demographics = result
+        # Confirm the camera before calibration rather than after: a baseline
+        # recorded through the wrong lens is a wasted 30 seconds and, worse, a
+        # wrong baseline for the whole session.
+        self._open_camera_picker(
+            on_chosen=lambda info: self._begin_session_setup(info["index"]),
+            on_cancelled=self._back_to_overview,
+        )
+
+    def _begin_session_setup(self, camera_index: int):
+        """Camera confirmed — open calibration and bring the sensors up."""
         self._show_calibration()
         # Start camera + audio in background so the calibration preview
         # already has a live feed when the user clicks Start Calibration.
-        self._start_camera()
+        self._start_camera(camera_index)
         self._start_audio()
         self.hrv.start()  # scans/connects to a BLE HR strap (e.g. Polar H10) in the background
 
     def _begin_calibration(self):
         """User clicked Start Calibration inside the overlay."""
+        # Clear every buffer first. These persist on the window, so without this
+        # a second session in the same run would average its baseline together
+        # with the previous participant's readings.
+        self._calibration_pupil = []
+        self._calibration_face = {k: [] for k in self._calibration_face}
+        self._calibration_vocal = {k: [] for k in self._calibration_vocal}
+        self._calibration_expr = {}
+        self._calibration_aus = {}
+        self._calibration_duchenne = []
+        self._calibration_hrv = []
+        self._calibration_rmssd = []
+
         self._calibration_started_at = time.time()
         self._calibrating = True
-        self.trust.start_calibration()
         self._session_ended = False
         self._cal_frames_total = 0
         self._cal_frames_face  = 0
@@ -422,7 +465,18 @@ class TrustDashboard(QMainWindow):
             p = face_data.get("pupil_norm")
             if p is not None:
                 self._calibration_pupil.append(float(p))
-        if vocal_data:
+            # The resting face itself: every emotion and Action Unit MediaPipe
+            # reports while the person sits relaxed. Collected per key so a
+            # partial frame never drops a signal that other frames did have.
+            for key, val in (face_data.get("expressions") or {}).items():
+                self._calibration_expr.setdefault(key, []).append(float(val))
+            for key, val in (face_data.get("aus") or {}).items():
+                self._calibration_aus.setdefault(key, []).append(float(val))
+            self._calibration_duchenne.append(float(face_data.get("duchenne", 0.0)))
+        # Voice samples are only meaningful while the person is actually
+        # speaking. Averaging in silent frames would drag the resting loudness
+        # toward zero and make every later utterance look like shouting.
+        if vocal_data and vocal_data.get("is_speaking"):
             self._calibration_vocal["pitch_stability"].append(float(vocal_data.get("pitch_stability", 0.5)))
             self._calibration_vocal["energy_level"].append(float(vocal_data.get("energy_level", 0.0)))
             self._calibration_vocal["tremor_index"].append(float(vocal_data.get("tremor_index", 0.0)))
@@ -435,12 +489,15 @@ class TrustDashboard(QMainWindow):
                 self._calibration_vocal["alpha_ratio"].append(float(vocal_data["alpha_ratio"]))
             if vocal_data.get("jitter", 0.0) != 0.0:
                 self._calibration_vocal["jitter"].append(float(vocal_data["jitter"]))
+            if vocal_data.get("spectral_flux", 0.0) > 0.0:
+                self._calibration_vocal["spectral_flux"].append(float(vocal_data["spectral_flux"]))
         # Only count a beat once the analyzer has a real RMSSD reading — while
         # "connected" but still filling its rolling R-R window it reports the
         # stub score, which must not pollute the HRV baseline.
         hrv_display = self.hrv.get_display()
         if hrv_display.get("rmssd_ms") is not None:
             self._calibration_hrv.append(float(hrv_display["score"]))
+            self._calibration_rmssd.append(float(hrv_display["rmssd_ms"]))
 
     @staticmethod
     def _mean_or(values, fallback):
@@ -463,19 +520,43 @@ class TrustDashboard(QMainWindow):
             # None means no RMSSD-backed reading arrived during the window (no strap worn/
             # connected) — same "no data" convention as the eGeMAPS voice fields above.
             "hrv_score":              self._mean_or(self._calibration_hrv, None),
+            "hrv_rmssd_ms":           self._mean_or(self._calibration_rmssd, None),
         }
-        # Wire up per-user calibration: finalise the 30-s window, save the
-        # per-channel baseline, then hand it to the fresh live engine.
-        if self.trust._calibrating:
-            self.trust.finish_calibration()
-        _cal_baseline = self.trust.baseline.copy()
-        if self._calibration_hrv:
-            # The trust engine's own calibration hook (_calib_scores) never fires for HRV
-            # because trust.update() isn't called while the calibration screen is showing —
-            # so the resting HRV baseline has to be computed and set here instead.
-            _cal_baseline["hrv"] = sum(self._calibration_hrv) / len(self._calibration_hrv)
+        # ── Hand the measured resting readings to the analysers ─────────────
+        #
+        # Everything below uses None to mean "this signal was never captured"
+        # (no face detected, nobody spoke, no strap worn), which leaves that one
+        # signal on its population default while the rest still personalise.
+        #
+        # RMSSD goes to the HRV analyser rather than the trust engine, because
+        # that channel is scored from R-R intervals inside the analyser.
+        resting_rmssd = self._mean_or(self._calibration_rmssd, None)
+        self.hrv.set_baseline_rmssd(resting_rmssd)
+
+        measured = {
+            "eye_ar":          self._mean_or(self._calibration_face["eye_ar"], None),
+            "blink_rate":      self._mean_or(self._calibration_face["blink_rate"], None),
+            "gaze_deviation":  self._mean_or(self._calibration_face["gaze_deviation"], None),
+            "pitch_stability": self._mean_or(self._calibration_vocal["pitch_stability"], None),
+            "energy_level":    self._mean_or(self._calibration_vocal["energy_level"], None),
+            "tremor_index":    self._mean_or(self._calibration_vocal["tremor_index"], None),
+            "alpha_ratio":     self._mean_or(self._calibration_vocal["alpha_ratio"], None),
+            "spectral_flux":   self._mean_or(self._calibration_vocal["spectral_flux"], None),
+            "duchenne":        self._mean_or(self._calibration_duchenne, None),
+            "expressions":     {k: self._mean_or(v, None)
+                                for k, v in self._calibration_expr.items()},
+            "aus":             {k: self._mean_or(v, None)
+                                for k, v in self._calibration_aus.items()},
+        }
+        # Resting HRV score: 50 once a real RMSSD baseline exists, because the
+        # analyser now centres this user's resting RMSSD there. Without one the
+        # analyser reports its constant stub, so that constant *is* the resting
+        # value and subtracting it keeps the channel neutral instead of letting
+        # a fixed 65 quietly lift every total by a quarter of the difference.
+        hrv_resting = 50.0 if resting_rmssd else float(self.hrv.get_score())
+
         self.trust = TrustEngine()
-        self.trust.baseline = _cal_baseline
+        self.trust.apply_calibration(measured, hrv_resting=hrv_resting)
         self._history = {k: [] for k in ("total", "facial", "vocal", "gaze", "hrv")}
         self._history_t = []
         self._phase_index = -1
@@ -512,36 +593,20 @@ class TrustDashboard(QMainWindow):
         except Exception:
             pass
 
-        # Compute a baseline composure score from calibration samples, then
-        # reset the engine so live scores start fresh from the neutral 50.
-        self._baseline_total: int | None = None
-        if self._calibration_face["eye_ar"]:
-            probe_engine = TrustEngine()
-            face_probe = {
-                "detected": True,
-                "expressions": {"happy": 0, "neutral": 1, "surprised": 0,
-                                 "fearful": 0, "angry": 0, "disgusted": 0, "sad": 0},
-                "aus": {},
-                "duchenne": 0,
-                "eye_ar":         self._calibration_baseline["face_eye_ar"],
-                "blink_rate":     self._calibration_baseline["face_blink_rate"],
-                "gaze_deviation": self._calibration_baseline["face_gaze_deviation"],
-            }
-            vocal_probe = {
-                "is_speaking":     True,
-                "pitch_stability": self._calibration_baseline["voice_pitch_stability"],
-                "energy_level":    self._calibration_baseline["voice_energy_level"],
-                "tremor_index":    self._calibration_baseline["voice_tremor_index"],
-                "alpha_ratio":     self._calibration_baseline.get("voice_alpha_ratio") or 0.0,
-                "spectral_flux":   0.0,
-                "hnr_db":          self._calibration_baseline.get("voice_hnr_db") or 0.0,
-                "jitter":          self._calibration_baseline.get("voice_jitter") or 0.0,
-            }
-            for _ in range(20):
-                probe_engine.update(face_probe, vocal_probe)
-            result = probe_engine.update(face_probe, vocal_probe)
-            self._baseline_total = int(result["total"])
-            self.score_panel.gauge.setBaseline(self._baseline_total)
+        # Mark the gauge with this user's resting score. Pushing the engine's own
+        # resting sample back through the live engine measures it the same way
+        # every live frame is measured, rather than asserting a number — it lands
+        # on 50 whenever calibration worked, so a marker sitting anywhere else is
+        # a visible sign that something in the window did not take.
+        probe_engine = TrustEngine()
+        probe_engine.input_baseline = self.trust.input_baseline
+        probe_engine.baseline = dict(self.trust.baseline)
+        face_probe, vocal_probe = self.trust.resting_samples()
+        for _ in range(20):
+            probe_engine.update(face_probe, vocal_probe, hrv_resting)
+        result = probe_engine.update(face_probe, vocal_probe, hrv_resting)
+        self._baseline_total = int(result["total"])
+        self.score_panel.gauge.setBaseline(self._baseline_total)
 
         if self._cal_frames_total > 0:
             self._baseline_coverage = 100.0 * self._cal_frames_face / self._cal_frames_total
@@ -663,13 +728,15 @@ class TrustDashboard(QMainWindow):
     def _start_recording(self):
         """Open a VideoWriter for the current session. Called from the main
         thread after calibration; must run while self._cap is already open."""
-        if self._cap is None or not self._cap.isOpened():
-            print("[rec] No camera — recording disabled")
-            return
+        with self._cap_lock:
+            cap = self._cap
+            if cap is None or not cap.isOpened():
+                print("[rec] No camera — recording disabled")
+                return
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self._recordings_dir.mkdir(exist_ok=True)
         path = self._recordings_dir / f"{self._session_id}.mp4"
-        w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         if w < 1 or h < 1:
             w, h = 1280, 720
         # Use the empirically-measured delivery rate (set in _start_camera /
@@ -938,112 +1005,6 @@ class TrustDashboard(QMainWindow):
     # ════════════════════════════════════════════════════════════════════════
     # Camera + analysis threads
     # ════════════════════════════════════════════════════════════════════════
-    @staticmethod
-    def _avf_camera_names() -> tuple[dict[int, str], set[int]]:
-        """Return (names, phone_indices).
-
-        names        — {avf_index: display_name}
-        phone_indices — indices that are Continuity / iPhone cameras.
-
-        Tries PyObjC first; falls back to ffmpeg + system_profiler when
-        PyObjC is unavailable (the fallback works reliably on macOS without
-        extra dependencies). macOS-only — Continuity Camera doesn't exist on
-        Windows/Linux, so this returns empty there and normal indices 0..9 are
-        just probed for a working device in `_pick_camera`.
-        """
-        if sys.platform != "darwin":
-            return {}, set()
-
-        # ── Method 1: PyObjC AVFoundation ────────────────────────────────────
-        try:
-            from AVFoundation import AVCaptureDevice, AVMediaTypeVideo
-            devices = AVCaptureDevice.devicesWithMediaType_(AVMediaTypeVideo)
-            names: dict[int, str] = {}
-            phone_indices: set[int] = set()
-            for i, d in enumerate(devices):
-                name = str(d.localizedName())
-                names[i] = name
-                is_phone = False
-                try:
-                    if "continuity" in str(d.deviceType()).lower():
-                        is_phone = True
-                except Exception:
-                    pass
-                try:
-                    if d.isContinuityCamera():
-                        is_phone = True
-                except Exception:
-                    pass
-                name_lc = name.lower()
-                if any(kw in name_lc for kw in ("iphone", "ipad", "continuity", "desk view")):
-                    is_phone = True
-                if is_phone:
-                    phone_indices.add(i)
-            print(f"[camera] AVFoundation devices : {names}")
-            print(f"[camera] Phone/continuity indices: {phone_indices}")
-            return names, phone_indices
-        except Exception as e:
-            print(f"[camera] PyObjC unavailable ({e}), falling back to ffmpeg + system_profiler")
-
-        # ── Method 2: ffmpeg device list + system_profiler model-id ──────────
-        # system_profiler reports the hardware model-id (e.g. "iPhone17,4") which
-        # is a reliable signal for Continuity Cameras regardless of display name.
-        names: dict[int, str] = {}
-        phone_indices: set[int] = set()
-        try:
-            import subprocess, re as _re
-
-            # Step A: discover which camera names belong to iPhones/iPads.
-            phone_names: set[str] = set()
-            try:
-                sp_raw = subprocess.check_output(
-                    ["system_profiler", "SPCameraDataType", "-json"],
-                    stderr=subprocess.DEVNULL, timeout=5
-                )
-                sp_data = json.loads(sp_raw)
-                for cam in sp_data.get("SPCameraDataType", []):
-                    model = cam.get("spcamera_model-id", "")
-                    cam_name = cam.get("_name", "")
-                    if model.startswith(("iPhone", "iPad")):
-                        phone_names.add(cam_name)
-                        print(f"[camera] system_profiler: {cam_name!r} is a phone ({model})")
-            except Exception as sp_err:
-                print(f"[camera] system_profiler failed: {sp_err}")
-
-            # Step B: map AVFoundation video indices to names via ffmpeg.
-            result = subprocess.run(
-                ["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
-                stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=5
-            )
-            output = result.stderr.decode(errors="replace")
-            in_video = False
-            for line in output.splitlines():
-                if "AVFoundation video devices" in line:
-                    in_video = True
-                    continue
-                if "AVFoundation audio devices" in line:
-                    in_video = False
-                    continue
-                if in_video:
-                    m = _re.search(r'\[(\d+)\]\s+(.+)', line)
-                    if m:
-                        idx = int(m.group(1))
-                        cam_name = m.group(2).strip()
-                        names[idx] = cam_name
-                        # name-based keyword check as belt-and-suspenders
-                        name_lc = cam_name.lower()
-                        if (cam_name in phone_names or
-                                any(kw in name_lc for kw in
-                                    ("iphone", "ipad", "continuity", "desk view"))):
-                            phone_indices.add(idx)
-
-            print(f"[camera] ffmpeg devices      : {names}")
-            print(f"[camera] Phone/continuity indices: {phone_indices}")
-        except Exception as fb_err:
-            print(f"[camera] Fallback detection failed: {fb_err}")
-
-        return names, phone_indices
-
     # ── Camera preference persistence ────────────────────────────────────────
     # Saves the last-used camera index to a small JSON file so the same camera
     # is selected automatically on the next launch.
@@ -1066,56 +1027,75 @@ class TrustDashboard(QMainWindow):
         except Exception:
             pass
 
-    def _pick_camera(self) -> int:
-        # ── Step 0: warm-up open to trigger macOS camera-permission grant ────
-        _old = os.dup(2); os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
+    @staticmethod
+    def _warm_up_camera_permission():
+        """Open index 0 once so macOS raises its camera-permission prompt.
+
+        Without this the first real open happens inside the picker's worker
+        thread, where the prompt is easy to miss and every probe fails until it
+        is answered. Harmless no-op on Windows and Linux. stderr is muted
+        because a denied open prints a wall of driver noise.
+
+        Note the settle pause at the end: this warm-up opens and releases
+        index 0, and the scan that follows immediately reopens it. AVFoundation
+        does not hand the device straight back, so without the pause the
+        machine's built-in camera reports itself as unopenable — the one device
+        the researcher is most likely to want.
+        """
+        old_err = None
         try:
-            _w = cv2.VideoCapture(0, _CAM_BACKEND); _w.release()
+            old_err = os.dup(2)
+            os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
+        except Exception:
+            old_err = None
+        try:
+            cap = cv2.VideoCapture(0, _CAM_BACKEND)
+            cap.release()
         except Exception:
             pass
         finally:
-            os.dup2(_old, 2); os.close(_old)
+            if old_err is not None:
+                try:
+                    os.dup2(old_err, 2); os.close(old_err)
+                except Exception:
+                    pass
+        time.sleep(0.4)
 
-        # ── Step 1: authoritative device list from AVFoundation ─────────────
-        camera_names, phone_indices = self._avf_camera_names()
+    def _scan_cameras(self) -> list[dict]:
+        """Full device scan; also refreshes _available_cameras."""
+        self._warm_up_camera_permission()
+        cameras = camera_scanner.scan_cameras(_CAM_BACKEND)
+        self._available_cameras = [c["index"] for c in cameras] or [0]
+        return cameras
 
-        # ── Step 2: scan all indices; validate with a frame ─────────────────
-        available: list[int] = []
-        for i in range(10):
-            old_err = os.dup(2)
-            os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
-            try:
-                cap = cv2.VideoCapture(i, _CAM_BACKEND)
-                if cap.isOpened():
-                    ret, _ = cap.read()
-                    if ret:
-                        available.append(i)
-                        print(f"[camera] Index {i} ({camera_names.get(i, '?')}) → OK")
-                cap.release()
-            except Exception:
-                pass
-            finally:
-                os.dup2(old_err, 2)
-                os.close(old_err)
+    def _pick_camera(self) -> int:
+        """Choose a camera without asking — used only as a fallback.
 
-        self._available_cameras = available if available else [0]
-        print(f"[camera] Available cameras: {self._available_cameras}")
+        The picker dialog is the normal path. This runs when the dialog is
+        bypassed (a remembered camera that is still attached, or a scan that
+        found nothing), and prefers the remembered index, then the first
+        camera the scanner ranked, which is built-in before wired before
+        wireless.
+        """
+        cameras = self._scan_cameras()
 
-        # ── Step 3: restore last-used camera if it is still available ───────
         saved = self._load_camera_pref()
-        if saved is not None and saved in self._available_cameras:
-            print(f"[camera] Restored preferred index {saved} ({camera_names.get(saved, '?')})")
+        if saved is not None and any(c["index"] == saved for c in cameras):
+            chosen = next(c for c in cameras if c["index"] == saved)
+            print(f"[camera] Restored preferred index {saved} ({chosen['name']!r})")
+            self._camera_info = chosen
             return saved
 
-        # ── Step 4: default — prefer built-in / USB; phone is last resort ───
-        for i in self._available_cameras:
-            if i not in phone_indices:
-                print(f"[camera] Selected index {i} ({camera_names.get(i, '?')}) — built-in/USB camera")
-                return i
+        if cameras:
+            chosen = cameras[0]
+            print(f"[camera] Selected index {chosen['index']} "
+                  f"({chosen['name']!r}) — {chosen['label']}")
+            self._camera_info = chosen
+            return chosen["index"]
 
-        chosen = self._available_cameras[0]
-        print(f"[camera] Selected index {chosen} ({camera_names.get(chosen, '?')}) — phone camera (no built-in found)")
-        return chosen
+        print("[camera] No camera found — falling back to index 0")
+        self._camera_info = {}
+        return 0
 
     def _measure_cam_fps(self, n_frames: int = 20) -> float:
         """Actually clock how fast self._cap delivers frames, rather than
@@ -1128,43 +1108,123 @@ class TrustDashboard(QMainWindow):
         n_ok = 0
         t0 = time.time()
         for _ in range(n_frames):
-            ok, _ = self._cap.read()
+            with self._cap_lock:
+                cap = self._cap
+                ok, _ = cap.read() if cap is not None else (False, None)
             if ok:
                 n_ok += 1
         elapsed = time.time() - t0
         measured = (n_ok / elapsed) if elapsed > 0 and n_ok > 0 else 30.0
         return max(10.0, min(measured, 60.0))
 
-    def _start_camera(self):
-        if self._cap is not None:
-            return  # already running
-        idx = self._pick_camera()
-        self._cap = cv2.VideoCapture(idx, _CAM_BACKEND)
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        self._cap.set(cv2.CAP_PROP_FPS, 60)
+    def _open_capture(self, index: int):
+        """Point the capture at *index*, replacing whatever was open.
+
+        Held under _cap_lock so the camera loop can never read from a device
+        that is being released underneath it.
+        """
+        with self._cap_lock:
+            if self._cap is not None:
+                try:
+                    self._cap.release()
+                except Exception:
+                    pass
+            cap = cv2.VideoCapture(index, _CAM_BACKEND)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            cap.set(cv2.CAP_PROP_FPS, 60)
+            self._cap = cap
+        self._cam_ok = False
         self._measured_cam_fps = self._measure_cam_fps()
-        print(f"[cam] requested 60fps @1280x720 — measured {self._measured_cam_fps:.1f}fps actual delivery")
-        self.cam_panel.set_camera_info(idx, len(self._available_cameras))
+
+    def _release_capture(self):
+        """Free the camera so another process — the picker's preview — can open it."""
+        with self._cap_lock:
+            if self._cap is not None:
+                try:
+                    self._cap.release()
+                except Exception:
+                    pass
+                self._cap = None
+        self._cam_ok = False
+
+    def _apply_camera_choice(self, info: dict):
+        """Open the chosen camera and reflect it in the UI + saved preference."""
+        idx = int(info.get("index", 0))
+        self._camera_info = dict(info)
+        self._open_capture(idx)
+        print(f"[cam] using index {idx} ({info.get('name', '?')} — "
+              f"{info.get('label', '?')}), measured "
+              f"{self._measured_cam_fps:.1f}fps actual delivery")
+        self.cam_panel.set_camera_info(idx, len(self._available_cameras),
+                                       info.get("name", ""), info.get("label", ""))
+        self._save_camera_pref(idx)
+
+    def _start_camera(self, index: int | None = None):
+        """Start the capture and its two worker threads.
+
+        *index* comes from the picker, which has usually opened the device
+        already — in that case this only starts the threads. Without one it
+        falls back to _pick_camera(), the path taken when the picker is skipped.
+
+        Guarded on the threads rather than on the capture handle: the handle is
+        legitimately None while the picker holds the device, and starting a
+        second pair of loops would double every frame.
+        """
+        if self._cam_threads_started:
+            return
+        if self._cap is None:
+            if index is None:
+                index = self._pick_camera()
+            info = self._camera_info or {"index": index, "name": f"Camera {index}",
+                                         "transport": camera_scanner.UNKNOWN,
+                                         "label": ""}
+            self._apply_camera_choice({**info, "index": index})
+        self._cam_threads_started = True
         threading.Thread(target=self._camera_loop,   daemon=True).start()
         threading.Thread(target=self._analysis_loop, daemon=True).start()
 
+    def _open_camera_picker(self, on_chosen=None, on_cancelled=None):
+        """Show the camera picker.
+
+        The dialog previews devices by opening them itself, and on Windows a
+        DirectShow device cannot be opened twice — so the live capture is
+        released first and only reopened once a choice comes back. The camera
+        loop tolerates the gap.
+        """
+        was_running = self._cap is not None
+        self._release_capture()
+
+        def _done(result):
+            self._cam_dialog = None
+            if result is None:
+                # Cancelled: put back whatever was running before.
+                if was_running:
+                    self._apply_camera_choice(
+                        self._camera_info or {"index": self._load_camera_pref() or 0})
+                if on_cancelled is not None:
+                    on_cancelled()
+                return
+            self._apply_camera_choice(result)
+            if on_chosen is not None:
+                on_chosen(result)
+
+        self._cam_dialog = CameraDialog(
+            backend=_CAM_BACKEND,
+            preferred_index=(self._camera_info.get("index")
+                             if self._camera_info else self._load_camera_pref()),
+            parent=self)
+        self._cam_dialog.completed.connect(_done)
+        self._cam_dialog.open()
+
     def _switch_camera(self):
-        if len(self._available_cameras) <= 1:
-            return
-        self._camera_idx_pos = (self._camera_idx_pos + 1) % len(self._available_cameras)
-        next_idx = self._available_cameras[self._camera_idx_pos]
-        if self._cap is not None:
-            self._cap.release()
-        self._cap = cv2.VideoCapture(next_idx, _CAM_BACKEND)
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        self._cap.set(cv2.CAP_PROP_FPS, 60)
-        self._measured_cam_fps = self._measure_cam_fps()
-        print(f"[cam] switched camera — measured {self._measured_cam_fps:.1f}fps actual delivery")
-        self._cam_ok = False
-        self.cam_panel.set_camera_info(next_idx, len(self._available_cameras))
-        self._save_camera_pref(next_idx)   # remember for next launch
+        """Camera panel button — reopen the picker mid-session.
+
+        Previously this cycled blindly to the next index, which gave no way to
+        tell what you were switching to and could not see a webcam plugged in
+        after launch.
+        """
+        self._open_camera_picker()
 
     def _on_blendshape_changed(self, name: str):
         """User picked a different blendshape in the BlendshapeWatch dropdown.
@@ -1174,7 +1234,12 @@ class TrustDashboard(QMainWindow):
 
     def _camera_loop(self):
         while self._running:
-            ok, frame = self._cap.read()
+            # The capture is None while the picker has the device, and can be
+            # swapped for a different one at any moment; both are handled by
+            # reading under the lock and treating "no device" as a dropped frame.
+            with self._cap_lock:
+                cap = self._cap
+                ok, frame = cap.read() if cap is not None else (False, None)
             if ok and frame is not None and frame.mean() > 1.0:
                 _cap_ns = time.time_ns()
                 with self._lock:
@@ -1620,6 +1685,11 @@ class TrustDashboard(QMainWindow):
             "score_config":        SCORE_CONFIG,
             "flags":               list(self._session_flags),
             "participant":         dict(self._demographics),
+            # Which lens this was captured through. Facial and gaze readings are
+            # not comparable across a laptop camera and an external one at a
+            # different height and field of view, so the device travels with the
+            # session rather than being lost at the end of it.
+            "camera":              dict(self._camera_info),
         }
 
     # ════════════════════════════════════════════════════════════════════════
@@ -2142,6 +2212,15 @@ class TrustDashboard(QMainWindow):
                 else:
                     cfg_rows.append((full_key, str(v)))
         _flatten_cfg(SCORE_CONFIG)
+        # The config above is the same for every session; what actually varies
+        # per participant is the baseline measured during their calibration
+        # window, so record it here — without it a session's numbers cannot be
+        # reproduced or compared against another participant's.
+        _flatten_cfg(self.trust.input_baseline, "measured_baseline")
+        cfg_rows.append(("measured_baseline.rmssd_ms",
+                         str(self.hrv.get_display().get("baseline_rmssd"))))
+        for ch, val in self.trust.baseline.items():
+            cfg_rows.append((f"measured_baseline.resting_score.{ch}", str(round(val, 2))))
         for c, hdr in enumerate(["Parameter", "Value"], 1):
             cell = ws_cfg.cell(row=1, column=c, value=hdr)
             cell.font = HDR_FONT; cell.fill = HDR_FILL
@@ -2224,12 +2303,16 @@ class TrustDashboard(QMainWindow):
             return round(v, 1) if isinstance(v, float) else v
 
         participant = stats.get("participant", {}) or {}
+        camera = stats.get("camera", {}) or {}
         summary_rows = [
             ("Session ID",              getattr(self, "_session_id", "")),
             ("Participant Sex",         participant.get("sex", "—")),
             ("Participant Age",         participant.get("age", "—")),
             ("Participant Culture",     participant.get("culture") or "—"),
             ("Score Engine Version",    stats.get("score_version", "")),
+            ("Camera",                  (camera.get("name") or "—")),
+            ("Camera Connection",       (camera.get("label")
+                                         or camera.get("transport") or "—")),
             ("Active Channels",         ", ".join(stats.get("active_channels", [])) or "—"),
             ("Duration",                stats.get("duration_str", "")),
             ("Samples Recorded",        stats.get("n_samples", 0)),
@@ -2457,8 +2540,7 @@ class TrustDashboard(QMainWindow):
             except Exception:
                 pass
         try:
-            if self._cap is not None:
-                self._cap.release()
+            self._release_capture()
         except Exception:
             pass
         try:

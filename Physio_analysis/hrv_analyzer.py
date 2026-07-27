@@ -11,8 +11,9 @@ Runs a background thread with its own asyncio event loop that:
   3. Maintains a rolling window of R-R intervals and computes RMSSD
      (root mean square of successive differences) — the standard
      short-window time-domain HRV metric.
-  4. Maps RMSSD to a 0-100 trust sub-score using literature-derived
-     bands (see _rmssd_to_score).
+  4. Maps RMSSD to a 0-100 trust sub-score. Once calibration has measured
+     this user's resting RMSSD, the mapping is relative to that value; until
+     then it falls back to literature-derived bands (see _rmssd_to_score).
 
 If no sensor is connected (bleak missing, Bluetooth off, device out of
 range), falls back to STUB_SCORE so the rest of the dashboard keeps working.
@@ -21,6 +22,7 @@ range), falls back to STUB_SCORE so the rest of the dashboard keeps working.
 from __future__ import annotations
 
 import asyncio
+import math
 import sys
 import threading
 import time
@@ -59,6 +61,12 @@ RECONNECT_DELAY_S = 3.0
 # Per-attempt connect timeout. bleak's own default is 30 s, which stalls the
 # reconnect loop for a long time when a strap is advertising but refusing.
 CONNECT_TIMEOUT_S = 15.0
+
+# Points added or removed per doubling of RMSSD away from the calibrated
+# resting value. Resting RMSSD is heavily individual — a healthy adult may sit
+# anywhere from 15 ms to 100 ms — so once it has been measured the score is
+# read as a ratio: resting scores 50, double resting scores 75, half scores 25.
+RMSSD_DOUBLING_PTS = 25.0
 
 
 def _describe_advertisement(adv) -> str:
@@ -155,6 +163,10 @@ class HRVAnalyzer:
         self._latest_rmssd: float | None = None
         self._latest_score: int = self.STUB_SCORE
         self._status: str = "disabled" if not _BLEAK_AVAILABLE else "disconnected"
+        # This user's resting RMSSD, measured during calibration. None means
+        # uncalibrated — no strap worn, or none of the calibration window
+        # produced a real R-R reading — and the literature bands are used.
+        self._baseline_rmssd: float | None = None
 
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -209,6 +221,34 @@ class HRVAnalyzer:
 
     # ── Public read API (called from the Qt main thread every tick) ────────
 
+    def set_baseline_rmssd(self, rmssd_ms: float | None) -> None:
+        """Adopt this user's resting RMSSD, measured during calibration.
+
+        From here on the score is read relative to it, so their own resting
+        state maps to 50 rather than to wherever the population bands happen to
+        put them. Passing None (nothing measured) leaves the bands in place.
+        Any score already computed is re-derived so the switch is immediate.
+        """
+        with self._lock:
+            self._baseline_rmssd = (
+                float(rmssd_ms) if rmssd_ms is not None and rmssd_ms > 0 else None
+            )
+            if self._latest_rmssd is not None:
+                self._latest_score = self._rmssd_to_score(self._latest_rmssd)
+            else:
+                self._latest_score = self._fallback_score
+        print(f"[hrv] resting RMSSD baseline set to {self._baseline_rmssd}", flush=True)
+
+    @property
+    def _fallback_score(self) -> int:
+        """Score to report while connected but without a usable RMSSD window.
+
+        Once a resting baseline exists, "no reading" has to read as neutral 50 —
+        the trust engine has been told this channel rests at 50, so handing it
+        the uncalibrated stub would show up as a phantom lift.
+        """
+        return 50 if self._baseline_rmssd else self.STUB_SCORE
+
     def get_score(self) -> int:
         """Return a 0-100 trust score derived from HRV."""
         with self._lock:
@@ -217,10 +257,11 @@ class HRVAnalyzer:
     def get_display(self) -> dict:
         with self._lock:
             return {
-                "rmssd_ms":   self._latest_rmssd,
-                "heart_rate": self._latest_hr,
-                "score":      self._latest_score,
-                "status":     self._status,
+                "rmssd_ms":       self._latest_rmssd,
+                "heart_rate":     self._latest_hr,
+                "score":          self._latest_score,
+                "status":         self._status,
+                "baseline_rmssd": self._baseline_rmssd,
             }
 
     @property
@@ -280,7 +321,7 @@ class HRVAnalyzer:
                 # Fall back to stub score and retry rather than crashing the thread.
                 print(f"[hrv] error: {exc!r}", flush=True)
                 with self._lock:
-                    self._latest_score = self.STUB_SCORE
+                    self._latest_score = self._fallback_score
                 self._set_status("error")
 
             if not self._stop_event.is_set():
@@ -447,7 +488,7 @@ class HRVAnalyzer:
             rmssd = self._compute_rmssd([rr for _, rr in self._rr_buffer])
             self._latest_rmssd = rmssd
             self._latest_score = (
-                self._rmssd_to_score(rmssd) if rmssd is not None else self.STUB_SCORE
+                self._rmssd_to_score(rmssd) if rmssd is not None else self._fallback_score
             )
 
     @staticmethod
@@ -460,10 +501,27 @@ class HRVAnalyzer:
 
     # ── Helper for RMSSD → trust score ──────────────────────────────────────
 
-    @staticmethod
-    def _rmssd_to_score(rmssd_ms: float) -> int:
-        """Linear mapping: RMSSD 0-80 ms → trust score 20-90."""
-        score = 20.0 + (rmssd_ms / 80.0) * 70.0
+    def _rmssd_to_score(self, rmssd_ms: float) -> int:
+        """Map an RMSSD reading to a 0-100 trust score.
+
+        Calibrated: relative to this user's own resting RMSSD, on a log scale
+        because RMSSD is roughly log-normally distributed — each doubling away
+        from rest is worth the same number of points in either direction.
+        Resting → 50, twice resting → 75, half resting → 25.
+
+        Uncalibrated (no strap during calibration): the original literature
+        band, a linear 0-80 ms → 20-90 mapping across the population range.
+
+        Caller must hold self._lock, or be a caller that never races the
+        baseline (both current callers hold it).
+        """
+        if rmssd_ms <= 0:
+            return 0
+        base = self._baseline_rmssd
+        if base:
+            score = 50.0 + RMSSD_DOUBLING_PTS * math.log2(rmssd_ms / base)
+        else:
+            score = 20.0 + (rmssd_ms / 80.0) * 70.0
         return int(max(0, min(100, round(score))))
 
 
