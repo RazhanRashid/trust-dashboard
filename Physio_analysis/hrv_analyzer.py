@@ -161,6 +161,12 @@ class HRVAnalyzer:
         self._rr_buffer: deque[tuple[float, int]] = deque()  # (received_at, rr_ms)
         self._latest_hr: int | None = None
         self._latest_rmssd: float | None = None
+        # Wall-clock time of the most recent notification, and the most recent
+        # R-R interval in it. Neither feeds the score — they exist so a reader
+        # can tell a live number from a stale one, since _latest_hr keeps
+        # returning the last beat forever after the strap stops sending.
+        self._last_beat_at: float | None = None
+        self._last_rr_ms: int | None = None
         self._latest_score: int = self.STUB_SCORE
         self._status: str = "disabled" if not _BLEAK_AVAILABLE else "disconnected"
         # This user's resting RMSSD, measured during calibration. None means
@@ -262,6 +268,8 @@ class HRVAnalyzer:
                 "score":          self._latest_score,
                 "status":         self._status,
                 "baseline_rmssd": self._baseline_rmssd,
+                "last_beat_at":   self._last_beat_at,
+                "last_rr_ms":     self._last_rr_ms,
             }
 
     @property
@@ -477,8 +485,11 @@ class HRVAnalyzer:
         heart_rate, rr_intervals_ms = _parse_hr_measurement(data)
         now = time.time()
         with self._lock:
+            self._last_beat_at = now
             if heart_rate is not None:
                 self._latest_hr = heart_rate
+            if rr_intervals_ms:
+                self._last_rr_ms = rr_intervals_ms[-1]
             for rr in rr_intervals_ms:
                 self._rr_buffer.append((now, rr))
             cutoff = now - RR_WINDOW_SECONDS

@@ -68,6 +68,8 @@ from Physio_analysis.vocal_analyzer   import VocalAnalyzer
 from Physio_analysis.trust_engine     import TrustEngine, SCORE_CONFIG, SCORE_VERSION
 from Physio_analysis.workload_engine  import WorkloadEngine
 from Physio_analysis.hrv_analyzer     import HRVAnalyzer
+from bpm_monitor import BpmMonitor   # TEMPORARY — live BPM readout, see bpm_monitor.py
+from baseline_dialog import BaselineDialog
 
 # ── UI modules ───────────────────────────────────────────────────────────────
 from theme import (BG, BG_DEEP, PANEL, LINE, LINE_SOFT, TEXT, TEXT_FAINT, TEXT_GHOST,
@@ -118,6 +120,15 @@ BLENDSHAPE_NAMES = [
     "mouthUpperUpLeft","mouthUpperUpRight",
     "noseSneerLeft",   "noseSneerRight",
 ]
+
+
+def _opt_mul(value, factor):
+    """Scale a baseline into display units, passing None through untouched.
+
+    None means "this signal was never captured", which has to survive the unit
+    conversion — 0.0 would be a real, wrong reading rather than an absence.
+    """
+    return None if value is None else float(value) * factor
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -261,6 +272,9 @@ class TrustDashboard(QMainWindow):
         # ── Build the UI ────────────────────────────────────────────────────
         self._build_ui()
         self._show_overview()
+
+        # TEMPORARY — live BPM readout for checking the strap against a watch.
+        self._bpm_monitor = BpmMonitor(self)
 
         # ── Main UI tick (60 ms — comfortable for eye, plenty fast for data)
         self._tick = QTimer(self)
@@ -448,6 +462,10 @@ class TrustDashboard(QMainWindow):
         self._start_camera(camera_index)
         self._start_audio()
         self.hrv.start()  # scans/connects to a BLE HR strap (e.g. Polar H10) in the background
+        # TEMPORARY — pop the BPM readout as soon as the strap is being looked
+        # for, so there is something to compare against a watch from the start.
+        self._bpm_monitor.place_near(self)
+        self._bpm_monitor.show()
 
     def _begin_calibration(self):
         """User clicked Start Calibration inside the overlay."""
@@ -521,6 +539,136 @@ class TrustDashboard(QMainWindow):
     def _mean_or(values, fallback):
         return sum(values) / len(values) if values else fallback
 
+    # ════════════════════════════════════════════════════════════════════════
+    # Baseline reporting (post-calibration popup + Excel)
+    # ════════════════════════════════════════════════════════════════════════
+    #
+    # One builder feeding both readers. The popup and the workbook must never
+    # disagree about what this participant was calibrated to, and the only way
+    # to guarantee that is for neither to compute anything itself.
+    #
+    # Every row carries whether it was actually *measured*. A signal that was
+    # never captured — nobody spoke, no strap worn, no face detected — silently
+    # keeps its population default (see TrustEngine.apply_calibration), and a
+    # default shown without that mark reads as a measurement of the participant.
+    # That distinction is the whole point of showing baselines at all.
+
+    def _baseline_report(self) -> list[tuple[str, list[dict]]]:
+        """Per-sensor resting baselines as [(sensor, [row, ...]), ...].
+
+        Values come from the objects that actually do the scoring —
+        TrustEngine.input_baseline, HRVAnalyzer's resting RMSSD, WorkloadEngine's
+        resting pupil — rather than from _calibration_baseline, which keeps its
+        own display-only fallbacks and would otherwise report a number the
+        scorers are not using. The raw calibration buffers are consulted only to
+        decide measured vs default.
+        """
+        ib   = self.trust.input_baseline
+        cal  = self._calibration_baseline
+        face, voc = self._calibration_face, self._calibration_vocal
+
+        def row(label, value, measured, unit="", note=""):
+            return {"label": label, "value": value, "measured": bool(measured),
+                    "unit": unit, "note": note}
+
+        facial = [
+            row("Eye openness", _opt_mul(ib.get("eye_ar"), 100), face["eye_ar"], "%",
+                "Eye Aspect Ratio × 100"),
+            row("Blink rate", ib.get("blink_rate"), face["blink_rate"], "/min"),
+            row("Duchenne smile", ib.get("duchenne"), self._calibration_duchenne, "",
+                "0 = not smiling at rest"),
+        ]
+        gaze = [
+            row("Gaze deviation", _opt_mul(ib.get("gaze_deviation"), 100),
+                face["gaze_deviation"], "%", "0 % = perfectly centred"),
+        ]
+        vocal = [
+            row("Pitch stability", _opt_mul(ib.get("pitch_stability"), 100),
+                voc["pitch_stability"], "%"),
+            row("Voice energy", _opt_mul(ib.get("energy_level"), 100),
+                voc["energy_level"], "%"),
+            row("Tremor index", _opt_mul(ib.get("tremor_index"), 100),
+                voc["tremor_index"], "%"),
+            row("Alpha ratio", ib.get("alpha_ratio"), voc["alpha_ratio"], "dB"),
+            row("Spectral flux", ib.get("spectral_flux"), voc["spectral_flux"]),
+            row("HNR", cal.get("voice_hnr_db"), voc["hnr_db"], "dB"),
+            row("Jitter", _opt_mul(cal.get("voice_jitter"), 100), voc["jitter"], "%"),
+        ]
+        hrv = [
+            row("Resting RMSSD", self.hrv.get_display().get("baseline_rmssd"),
+                self._calibration_rmssd, "ms",
+                "Scores read as a ratio to this: resting → 50, double → 75"),
+        ]
+        # baseline_pupil stays None when no pupil was captured, and the workload
+        # engine then returns early on every update — so this reads "not
+        # measured" and the cognitive-load channel is inert for the session.
+        load = [
+            row("Resting pupil", self.workload.baseline_pupil,
+                self._calibration_pupil, "", "Normalised iris radius; PCPS 1000 = this value"),
+        ]
+        resting = [
+            row("Facial",  self.trust.baseline.get("facial"), face["eye_ar"]),
+            row("Vocal",   self.trust.baseline.get("vocal"),  voc["pitch_stability"]),
+            row("Gaze",    self.trust.baseline.get("gaze"),   face["gaze_deviation"]),
+            row("HRV",     self.trust.baseline.get("hrv"),    self._calibration_rmssd),
+            row("Total",   getattr(self, "_baseline_total", None), True,
+                "", "Where the gauge marker sits — should read 50 after a good calibration"),
+        ]
+        return [("Facial", facial), ("Gaze", gaze), ("Vocal", vocal),
+                ("HRV", hrv), ("Cognitive Load", load),
+                ("Resting scores (0–100)", resting)]
+
+    # Excel row-key → baseline value, in the *display units each sheet uses*.
+    # The sheets store several signals pre-scaled (eye_ar × 100, jitter × 100,
+    # …; see _record_row), so a baseline written straight from input_baseline
+    # would sit in a different unit from the column above it and look wrong by
+    # two orders of magnitude.
+    def _baseline_by_row_key(self) -> dict[str, tuple[float, bool]]:
+        ib  = self.trust.input_baseline
+        cal = self._calibration_baseline
+        face, voc = self._calibration_face, self._calibration_vocal
+        pairs = {
+            "eye_openness":  (_opt_mul(ib.get("eye_ar"), 100),          face["eye_ar"]),
+            "blink_rate":    (ib.get("blink_rate"),                     face["blink_rate"]),
+            "gaze_dev":      (_opt_mul(ib.get("gaze_deviation"), 100),  face["gaze_deviation"]),
+            "duchenne":      (ib.get("duchenne"),                       self._calibration_duchenne),
+            "pupil_norm":    (self.workload.baseline_pupil,             self._calibration_pupil),
+            "pitch_stab":    (_opt_mul(ib.get("pitch_stability"), 100), voc["pitch_stability"]),
+            "energy_level":  (_opt_mul(ib.get("energy_level"), 100),    voc["energy_level"]),
+            "tremor":        (_opt_mul(ib.get("tremor_index"), 100),    voc["tremor_index"]),
+            "alpha_ratio":   (ib.get("alpha_ratio"),                    voc["alpha_ratio"]),
+            "spectral_flux": (ib.get("spectral_flux"),                  voc["spectral_flux"]),
+            "hnr_db":        (cal.get("voice_hnr_db"),                  voc["hnr_db"]),
+            "jitter":        (_opt_mul(cal.get("voice_jitter"), 100),   voc["jitter"]),
+            "rmssd_ms":      (self.hrv.get_display().get("baseline_rmssd"), self._calibration_rmssd),
+            "facial":        (self.trust.baseline.get("facial"),        face["eye_ar"]),
+            "vocal":         (self.trust.baseline.get("vocal"),         voc["pitch_stability"]),
+            "gaze":          (self.trust.baseline.get("gaze"),          face["gaze_deviation"]),
+            "hrv":           (self.trust.baseline.get("hrv"),           self._calibration_rmssd),
+            "total":         (getattr(self, "_baseline_total", None),   True),
+            # PCPS/WIV are defined *relative* to the resting pupil — 1000 means
+            # "exactly at baseline" — so their baseline is 1000 by construction,
+            # but only once a resting pupil exists to be relative to.
+            "pcps":          (1000.0 if self._calibration_pupil else None, self._calibration_pupil),
+            "wiv":           (1000.0 if self._calibration_pupil else None, self._calibration_pupil),
+        }
+        return {k: (round(float(v), 4), bool(m))
+                for k, (v, m) in pairs.items() if v is not None}
+
+    def _show_baseline_dialog(self) -> None:
+        """Present the measured baselines and block until acknowledged.
+
+        Never allowed to stop a session starting: a failure here would strand
+        the researcher on the calibration screen with a completed window and no
+        way forward, which is worse than not seeing the numbers.
+        """
+        try:
+            BaselineDialog(self._baseline_report(),
+                           coverage_pct=self._baseline_coverage,
+                           parent=self).exec()
+        except Exception as exc:                   # noqa: BLE001
+            print(f"[baseline] could not show summary: {exc!r}", flush=True)
+
     def _enter_live_session(self):
         """Calibration complete (or skipped) — switch to live dashboard."""
         self._calibration_baseline = {
@@ -583,6 +731,38 @@ class TrustDashboard(QMainWindow):
         if self._calibration_pupil:
             self.workload.set_baseline(sum(self._calibration_pupil) / len(self._calibration_pupil))
         self._calibrating = False
+
+        # Mark the gauge with this user's resting score. Pushing the engine's own
+        # resting sample back through the live engine measures it the same way
+        # every live frame is measured, rather than asserting a number — it lands
+        # on 50 whenever calibration worked, so a marker sitting anywhere else is
+        # a visible sign that something in the window did not take.
+        #
+        # Runs before the session starts rather than after, because the baseline
+        # popup reports this number and the clock below must not already be
+        # running while a modal dialog waits on the researcher.
+        probe_engine = TrustEngine()
+        probe_engine.input_baseline = self.trust.input_baseline
+        probe_engine.baseline = dict(self.trust.baseline)
+        face_probe, vocal_probe = self.trust.resting_samples()
+        for _ in range(20):
+            probe_engine.update(face_probe, vocal_probe, hrv_resting)
+        result = probe_engine.update(face_probe, vocal_probe, hrv_resting)
+        self._baseline_total = int(result["total"])
+        self.score_panel.gauge.setBaseline(self._baseline_total)
+
+        if self._cal_frames_total > 0:
+            self._baseline_coverage = 100.0 * self._cal_frames_face / self._cal_frames_total
+            self.score_panel.set_baseline_quality(self._baseline_coverage)
+        else:
+            self._baseline_coverage = None
+            self.score_panel.hide_baseline_quality()
+
+        # Show what was measured, then start. Everything below this line begins
+        # the session proper — clock, recording, sync event — so the dialog is
+        # the last point at which a bad calibration window costs nothing to redo.
+        self._show_baseline_dialog()
+
         self._session_id = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
         self._best_thumb_frame = None
         self._best_thumb_conf = -1.0
@@ -611,27 +791,6 @@ class TrustDashboard(QMainWindow):
         except Exception:
             pass
 
-        # Mark the gauge with this user's resting score. Pushing the engine's own
-        # resting sample back through the live engine measures it the same way
-        # every live frame is measured, rather than asserting a number — it lands
-        # on 50 whenever calibration worked, so a marker sitting anywhere else is
-        # a visible sign that something in the window did not take.
-        probe_engine = TrustEngine()
-        probe_engine.input_baseline = self.trust.input_baseline
-        probe_engine.baseline = dict(self.trust.baseline)
-        face_probe, vocal_probe = self.trust.resting_samples()
-        for _ in range(20):
-            probe_engine.update(face_probe, vocal_probe, hrv_resting)
-        result = probe_engine.update(face_probe, vocal_probe, hrv_resting)
-        self._baseline_total = int(result["total"])
-        self.score_panel.gauge.setBaseline(self._baseline_total)
-
-        if self._cal_frames_total > 0:
-            self._baseline_coverage = 100.0 * self._cal_frames_face / self._cal_frames_total
-            self.score_panel.set_baseline_quality(self._baseline_coverage)
-        else:
-            self._baseline_coverage = None
-            self.score_panel.hide_baseline_quality()
         self.flag_sidebar.clear_flags()
         self._flag_cooldowns = {}
         self._last_flag_total = None
@@ -1384,6 +1543,12 @@ class TrustDashboard(QMainWindow):
     # Main UI tick
     # ════════════════════════════════════════════════════════════════════════
     def _update_body(self):
+        # TEMPORARY — BPM readout. Updated ahead of every early return below so
+        # the number keeps ticking on the summary screen too, where the strap is
+        # still connected but the dashboard tick otherwise does nothing.
+        if self._bpm_monitor.isVisible():
+            self._bpm_monitor.update_from(self.hrv.get_display())
+
         # Skip when nothing dashboard-related is visible (overview / summary)
         cur = self._stack.currentWidget()
         if cur is None or cur is self._overview or cur is self._sum:
@@ -1801,10 +1966,10 @@ class TrustDashboard(QMainWindow):
                         best = max(best, min(max_w, len(str(cell.value)) + 2))
                 ws.column_dimensions[get_column_letter(col[0].column)].width = best
 
-        def _write_legend(ws, legend, n_data_rows, total_cols):
+        def _write_legend(ws, legend, last_data_row, total_cols):
             """Shared LEGEND block writer — used by every 1/sec sheet so
             self-documentation stays consistent across the workbook."""
-            leg_start = n_data_rows + 3   # blank row gap
+            leg_start = last_data_row + 2   # blank row gap
             title_cell = ws.cell(row=leg_start, column=1, value="LEGEND")
             title_cell.font      = LEG_TITLE
             title_cell.fill      = LEG_FILL
@@ -1823,7 +1988,57 @@ class TrustDashboard(QMainWindow):
                     ws.merge_cells(start_row=i, start_column=2,
                                    end_row=i,   end_column=total_cols)
 
-        def _write_sheet(ws, columns, legend):
+        # ── Baseline banner, written under the header of every sensor sheet ──
+        #
+        # Two rows rather than one: the value has to stay a real number so it
+        # can be used in formulas and charted against the column below it, which
+        # rules out writing "27.4 (default)" into the cell. The provenance goes
+        # in its own text row instead, because a population default and this
+        # participant's measurement are not interchangeable and a reader given
+        # only the number cannot tell which one they are looking at.
+        baselines = self._baseline_by_row_key()
+        BASE_FILL     = PatternFill("solid", fgColor="DBEAFE")   # measured — light blue
+        BASE_DEF_FILL = PatternFill("solid", fgColor="FEF3C7")   # default  — amber
+        BASE_FONT     = Font(bold=True, name="Calibri", size=10, color="1E3A5F")
+        BASE_SRC_FONT = Font(italic=True, name="Calibri", size=9, color="475569")
+
+        BASELINE_LEGEND = [
+            ("Baseline (resting)",
+             "Row 2 — this participant's resting value for the column, measured during "
+             "the calibration window and used as the reference the session is scored "
+             "against. Blank where the column has no baseline (timestamps, labels)."),
+            ("Baseline source",
+             "Row 3 — 'measured' means taken from this participant. 'default' means the "
+             "signal was never captured during calibration (nobody spoke, no strap worn, "
+             "no face detected) and the population reference value is being used instead, "
+             "so that column is NOT personalised."),
+        ]
+
+        def _write_baseline_rows(ws, columns) -> int:
+            """Write the baseline value/source rows. Returns the first data row."""
+            if not baselines:
+                return 2
+            lbl = ws.cell(row=2, column=1, value="Baseline (resting)")
+            lbl.font = BASE_FONT; lbl.alignment = CENTER; lbl.fill = BASE_FILL
+            src = ws.cell(row=3, column=1, value="Baseline source")
+            src.font = BASE_SRC_FONT; src.alignment = CENTER; src.fill = BASE_FILL
+
+            for c, (_, key, _fmt) in enumerate(columns, 1):
+                if c == 1 or key not in baselines:
+                    if c > 1:
+                        for r in (2, 3):
+                            ws.cell(row=r, column=c).fill = BASE_FILL
+                    continue
+                value, measured = baselines[key]
+                v = ws.cell(row=2, column=c, value=value)
+                v.font = BASE_FONT; v.alignment = CENTER
+                v.fill = BASE_FILL if measured else BASE_DEF_FILL
+                s = ws.cell(row=3, column=c, value="measured" if measured else "default")
+                s.font = BASE_SRC_FONT; s.alignment = CENTER
+                s.fill = BASE_FILL if measured else BASE_DEF_FILL
+            return 4
+
+        def _write_sheet(ws, columns, legend, with_baseline=True):
             """columns: list of (header_label, row_key, formatter_fn | None)
                legend:  list of (field_name, description)"""
             # ── header ──────────────────────────────────────────────────────
@@ -1833,11 +2048,17 @@ class TrustDashboard(QMainWindow):
                 cell.fill      = HDR_FILL
                 cell.alignment = CENTER
                 cell.border    = BORDER
-            ws.freeze_panes = "A2"
             ws.row_dimensions[1].height = 20
 
+            # ── baseline banner ─────────────────────────────────────────────
+            data_start = _write_baseline_rows(ws, columns) if with_baseline else 2
+            # Freeze below the baseline too, so the resting value stays on
+            # screen while scrolling the session — the comparison the rows are
+            # there to support only works if both halves are visible at once.
+            ws.freeze_panes = f"A{data_start}"
+
             # ── data rows ───────────────────────────────────────────────────
-            for r_idx, row in enumerate(rows, 2):
+            for r_idx, row in enumerate(rows, data_start):
                 fill = ALT_FILL if r_idx % 2 == 0 else None
                 for c, (_, key, fmt) in enumerate(columns, 1):
                     raw = row.get(key, "")
@@ -1849,7 +2070,8 @@ class TrustDashboard(QMainWindow):
                         cell.fill = fill
 
             # ── legend ──────────────────────────────────────────────────────
-            _write_legend(ws, legend, len(rows), len(columns))
+            full_legend = (legend + BASELINE_LEGEND) if (with_baseline and baselines) else legend
+            _write_legend(ws, full_legend, data_start + len(rows) - 1, len(columns))
             _auto_width(ws)
 
         wb = openpyxl.Workbook()
@@ -1968,11 +2190,21 @@ class TrustDashboard(QMainWindow):
             cell.font = HDR_FONT; cell.fill = HDR_FILL_BS
             cell.alignment = CENTER; cell.border = BORDER
 
-        ws2.freeze_panes = "A2"
         ws2.row_dimensions[1].height = 32
 
+        # ── baseline banner ────────────────────────────────────────────────
+        # Only the fixed metrics carry a baseline; the 52 blendshape columns
+        # are left blank rather than filled with the reference zeros, which
+        # would assert a resting measurement that calibration never took.
+        f_start = _write_baseline_rows(ws2, FACIAL_FIXED)
+        if f_start > 2:
+            for i in range(len(BS_ORDER)):
+                for r in (2, 3):
+                    ws2.cell(row=r, column=n_fixed + 1 + i).fill = BASE_FILL
+        ws2.freeze_panes = f"A{f_start}"
+
         # ── data rows ──────────────────────────────────────────────────────
-        for r_idx, row in enumerate(rows, 2):
+        for r_idx, row in enumerate(rows, f_start):
             fill = ALT_FILL if r_idx % 2 == 0 else None
             # Fixed columns
             for c, (_, key, fmt) in enumerate(FACIAL_FIXED, 1):
@@ -1991,7 +2223,8 @@ class TrustDashboard(QMainWindow):
                 if fill: cell.fill = fill
 
         # ── legend ─────────────────────────────────────────────────────────
-        _write_legend(ws2, FULL_FACIAL_LEGEND, len(rows), total_cols)
+        _write_legend(ws2, FULL_FACIAL_LEGEND + (BASELINE_LEGEND if f_start > 2 else []),
+                      f_start + len(rows) - 1, total_cols)
 
         # ── column widths ───────────────────────────────────────────────────
         from openpyxl.utils import get_column_letter as gcl
@@ -2173,7 +2406,7 @@ class TrustDashboard(QMainWindow):
                 ("Gaze Dev",        "Raw head-pose deviation (0–1) before the ×100 scaling used on the 1/sec sheets."),
                 ("Pupil (norm)",    "Iris radius normalised to inter-ocular distance, sampled every frame."),
                 ("Duchenne",        "Binary flag: AU06 + AU12 both active in this frame."),
-            ], len(self._raw_facial_rows), len(rf_cols))
+            ], len(self._raw_facial_rows) + 1, len(rf_cols))
             _auto_width(ws_rf)
 
         # ═══════════════════════════════════════════════════════════════════════════
@@ -2214,7 +2447,7 @@ class TrustDashboard(QMainWindow):
                                       "rather than the 1/sec throttle used on the Vocal Analysis sheet."),
                 ("HNR (dB)",         "Harmonics-to-Noise Ratio for this audio chunk. Normal speech > 20 dB."),
                 ("Jitter",           "Local jitter (fraction, not ×100) for this audio chunk. Normal speech < 0.01."),
-            ], len(self._raw_vocal_rows), len(rv_cols))
+            ], len(self._raw_vocal_rows) + 1, len(rv_cols))
             _auto_width(ws_rv)
 
         # ═══════════════════════════════════════════════════════════════════════════
@@ -2303,7 +2536,7 @@ class TrustDashboard(QMainWindow):
                              "voice tremor, sharp trust drop). Each flag type is debounced ~8s."),
             ("Trust Band",  "Trust-total band in effect at the moment the flag fired, "
                              "matching the colour bands used in the live sidebar."),
-        ], len(self._session_flags), len(fl_cols))
+        ], len(self._session_flags) + 1, len(fl_cols))
         _auto_width(ws_fl)
 
         # ═══════════════════════════════════════════════════════════════════════════
@@ -2472,6 +2705,14 @@ class TrustDashboard(QMainWindow):
 
     def keyPressEvent(self, event):
         key = event.key()
+        # TEMPORARY — outside the live-session guard on purpose: the point of
+        # the readout is to compare against a watch whenever, not only mid-run.
+        if key == Qt.Key.Key_H:
+            if self._bpm_monitor.isVisible():
+                self._bpm_monitor.hide()
+            else:
+                self._bpm_monitor.place_near(self)
+                self._bpm_monitor.show()
         # Only fire hotkeys during a live session
         if self._session_start_ns and not self._session_ended:
             if key == Qt.Key.Key_B:
@@ -2547,6 +2788,9 @@ class TrustDashboard(QMainWindow):
     # ════════════════════════════════════════════════════════════════════════
     def closeEvent(self, event):
         self._running = False
+        # TEMPORARY — a Tool window is not parented into the widget tree, so it
+        # would outlive the dashboard and keep the app alive with no way to quit.
+        self._bpm_monitor.close()
         self.hrv.stop()
         # Flush and release writer before anything else
         with self._writer_lock:
