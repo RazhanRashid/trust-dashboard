@@ -43,7 +43,7 @@ class TopStrip(QFrame):
     end_session_clicked   = pyqtSignal()
     phase_advance_clicked = pyqtSignal()
 
-    _PHASE_NAMES = ["Trust Establishment", "Trust Violation", "Trust Recovery"]
+    _PHASE_NAMES = ["Phase 1", "Phase 2", "Phase 3"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -71,7 +71,7 @@ class TopStrip(QFrame):
                 border-radius: 5px;
             }}
         """)
-        logo_text = QLabel("TRUST")
+        logo_text = QLabel("COMPOSURE")
         logo_text.setFont(ui_font(11, QFont.Weight.Bold))
         logo_text.setStyleSheet(f"color: {TEXT}; letter-spacing: 1.5px; background: transparent;")
         logo_wrap.addWidget(mark)
@@ -610,6 +610,8 @@ class ScorePanel(QFrame):
 # Voice panel
 # ═══════════════════════════════════════════════════════════════════════════
 class VoicePanel(QFrame):
+    switch_mic_clicked = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("voicePanel")
@@ -645,14 +647,29 @@ class VoicePanel(QFrame):
             }}
         """)
         self._spec_btn.toggled.connect(self._toggle_spectrum)
-        id_lbl = QLabel("MIC_00 · 44.1k")
-        id_lbl.setFont(mono_font(8))
-        id_lbl.setStyleSheet(f"color: {TEXT_GHOST}; background: transparent;")
+        self._switch_mic_btn = QPushButton("⇄")
+        self._switch_mic_btn.setFixedSize(QSize(sp(24), sp(24)))
+        self._switch_mic_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._switch_mic_btn.setToolTip("Switch microphone")
+        self._switch_mic_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {TEXT_FAINT};
+                border: 1px solid {LINE_SOFT}; border-radius: 4px;
+                font-size: 14px;
+            }}
+            QPushButton:hover {{ border-color: {TEXT_FAINT}; color: {TEXT}; }}
+        """)
+        self._switch_mic_btn.clicked.connect(self.switch_mic_clicked.emit)
+        self._mic_label = QLabel("MIC_00 · 44.1k")
+        self._mic_label.setFont(mono_font(8))
+        self._mic_label.setStyleSheet(f"color: {TEXT_GHOST}; background: transparent;")
         head_h.addWidget(title_lbl)
         head_h.addStretch()
         head_h.addWidget(self._spec_btn)
         head_h.addSpacing(sp(8))
-        head_h.addWidget(id_lbl)
+        head_h.addWidget(self._switch_mic_btn)
+        head_h.addSpacing(sp(8))
+        head_h.addWidget(self._mic_label)
         v.addWidget(head_frame)
 
         body_l = QVBoxLayout()
@@ -689,6 +706,17 @@ class VoicePanel(QFrame):
         body_l.addLayout(grid)
 
         v.addLayout(body_l)
+
+    def set_mic_info(self, index: int, name: str = "", label: str = "",
+                     samplerate: float = 0.0):
+        khz = f"{samplerate / 1000:.1f}k" if samplerate else "—"
+        self._mic_label.setText(f"MIC_{index:02d} · {khz}")
+        tip = "Choose microphone"
+        if name:
+            tip = f"{name}" + (f" · {label}" if label else "")
+            tip += "\nClick to choose a different microphone"
+        self._switch_mic_btn.setToolTip(tip)
+        self._mic_label.setToolTip(tip)
 
     def _toggle_spectrum(self, checked: bool):
         self._spec.setVisible(checked)

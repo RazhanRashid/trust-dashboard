@@ -82,6 +82,8 @@ from overlays import OverviewScreen, CalibrationOverlay, SessionSummary
 from demographics_dialog import DemographicsDialog
 from camera_dialog import CameraDialog
 import camera_scanner
+from mic_dialog import MicDialog
+import mic_scanner
 
 try:
     import websockets
@@ -140,7 +142,7 @@ class TrustDashboard(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Trust Level Dashboard")
+        self.setWindowTitle("Composure Dashboard")
         self.setStyleSheet(f"background: {BG};")
         # Scaled like everything else, so the minimum can't demand more room
         # than the screen the design was just scaled down to fit.
@@ -231,9 +233,9 @@ class TrustDashboard(QMainWindow):
         # TopStrip button) — the system never infers phase changes from the
         # score. Order is enforced: Establishment → Violation → Recovery.
         self._phase_defs = [
-            ("establishment", "Trust Establishment", ACCENT),
-            ("violation",      "Trust Violation",     DANGER),
-            ("recovery",        "Trust Recovery",      C_WORKLOAD),
+            ("establishment", "Phase 1", ACCENT),
+            ("violation",      "Phase 2",     DANGER),
+            ("recovery",        "Phase 3",      C_WORKLOAD),
         ]
         self._phase_index = -1                  # -1 = no phase marked yet this session
         self._phase_segments: list[dict] = []    # [{key,label,color,start_s,end_s}], end_s=None while ongoing
@@ -249,6 +251,14 @@ class TrustDashboard(QMainWindow):
         self._cam_dialog = None
         self._cam_threads_started = False
         self._mic_ok = False
+        # Everything known about the microphone in use, from the last scan:
+        # {"index", "name", "transport", "label", "samplerate"}. Recorded in
+        # the export alongside the camera, for the same reason — vocal
+        # readings aren't comparable across a laptop mic and an external one
+        # (e.g. a GoPro used as a wireless lav mic over Bluetooth).
+        self._mic_info: dict = {}
+        self._mic_dialog = None
+        self._audio_stream = None
 
         # ── Data directories ─────────────────────────────────────────────────
         self._data_dir      = Path.home() / "Desktop" / "trust-dashboard"
@@ -331,6 +341,7 @@ class TrustDashboard(QMainWindow):
         self.score_panel.setFixedWidth(sp(520))
 
         self.voice_panel = VoicePanel()
+        self.voice_panel.switch_mic_clicked.connect(self._switch_mic)
         self.voice_panel.setMaximumWidth(sp(380))
 
         # Cap height so panels don't over-stretch on tall windows
@@ -448,14 +459,20 @@ class TrustDashboard(QMainWindow):
         self._demographics = result
         # Confirm the camera before calibration rather than after: a baseline
         # recorded through the wrong lens is a wasted 30 seconds and, worse, a
-        # wrong baseline for the whole session.
+        # wrong baseline for the whole session. Mic picker chains right after
+        # the camera one, for the same reason — a baseline recorded through
+        # the wrong mic (e.g. a laptop mic left selected when a GoPro should
+        # be picking up vocal data over Bluetooth) is just as wasted.
         self._open_camera_picker(
-            on_chosen=lambda info: self._begin_session_setup(info["index"]),
+            on_chosen=lambda info: self._open_mic_picker(
+                on_chosen=lambda _minfo: self._begin_session_setup(info["index"]),
+                on_cancelled=self._back_to_overview,
+            ),
             on_cancelled=self._back_to_overview,
         )
 
     def _begin_session_setup(self, camera_index: int):
-        """Camera confirmed — open calibration and bring the sensors up."""
+        """Camera + mic confirmed — open calibration and bring the sensors up."""
         self._show_calibration()
         # Start camera + audio in background so the calibration preview
         # already has a live feed when the user clicks Start Calibration.
@@ -1403,6 +1420,114 @@ class TrustDashboard(QMainWindow):
         """
         self._open_camera_picker()
 
+    # ════════════════════════════════════════════════════════════════════════
+    # Microphone picker
+    # ════════════════════════════════════════════════════════════════════════
+    # ── Mic preference persistence ───────────────────────────────────────────
+    # Mirrors _load_camera_pref/_save_camera_pref — saves the last-used mic
+    # index to a small JSON file so the same input (e.g. a paired GoPro) is
+    # selected automatically on the next launch.
+
+    def _load_mic_pref(self) -> int | None:
+        """Return the saved preferred mic index, or None if not set."""
+        try:
+            p = self._data_dir / "mic_pref.json"
+            if p.exists():
+                return int(json.loads(p.read_text()).get("index", -1)) or None
+        except Exception:
+            pass
+        return None
+
+    def _save_mic_pref(self, index: int):
+        """Persist the chosen mic index for next launch."""
+        try:
+            p = self._data_dir / "mic_pref.json"
+            p.write_text(json.dumps({"index": index}))
+        except Exception:
+            pass
+
+    def _pick_mic(self) -> dict:
+        """Choose a microphone without asking — used only as a fallback.
+
+        The picker dialog is the normal path. This runs when the dialog is
+        bypassed, and prefers the remembered index if it's still present,
+        otherwise whichever device the scanner ranked first (system default,
+        then built-in before USB before Bluetooth).
+        """
+        mics = mic_scanner.list_input_devices()
+
+        saved = self._load_mic_pref()
+        if saved is not None and any(m["index"] == saved for m in mics):
+            chosen = next(m for m in mics if m["index"] == saved)
+            print(f"[mic] Restored preferred index {saved} ({chosen['name']!r})")
+            self._mic_info = chosen
+            return chosen
+
+        if mics:
+            chosen = mics[0]
+            print(f"[mic] Selected index {chosen['index']} "
+                  f"({chosen['name']!r}) — {chosen['label']}")
+            self._mic_info = chosen
+            return chosen
+
+        print("[mic] No microphone found — falling back to system default")
+        self._mic_info = {}
+        return {"index": None, "name": "", "transport": "", "label": "",
+                "samplerate": 0.0}
+
+    def _apply_mic_choice(self, info: dict):
+        """Open the chosen mic and reflect it in the UI + saved preference.
+
+        Mirrors _apply_camera_choice: opens the stream immediately (reserving
+        the device) rather than waiting for the session to actually start, so
+        the researcher sees the level meter is live before calibration.
+        """
+        self._mic_info = dict(info)
+        idx = info.get("index")
+        self._start_audio(restart=True)
+        print(f"[mic] using index {idx} ({info.get('name', '?')} — "
+              f"{info.get('label', '?')})")
+        self.voice_panel.set_mic_info(idx if idx is not None else 0,
+                                      info.get("name", ""), info.get("label", ""),
+                                      info.get("samplerate", 0.0))
+        if idx is not None:
+            self._save_mic_pref(idx)
+
+    def _open_mic_picker(self, on_chosen=None, on_cancelled=None):
+        """Show the microphone picker.
+
+        The dialog's own level meter opens the device itself to prove it's
+        live, so the real stream is stopped first and only reopened once a
+        choice comes back — the audio equivalent of releasing the capture
+        before the camera picker's preview opens it.
+        """
+        was_running = self._audio_stream is not None
+        self._stop_audio()
+
+        def _done(result):
+            self._mic_dialog = None
+            if result is None:
+                # Cancelled: put back whatever was running before.
+                if was_running:
+                    self._apply_mic_choice(self._mic_info or self._pick_mic())
+                if on_cancelled is not None:
+                    on_cancelled()
+                return
+            self._apply_mic_choice(result)
+            if on_chosen is not None:
+                on_chosen(result)
+
+        self._mic_dialog = MicDialog(
+            preferred_index=(self._mic_info.get("index")
+                             if self._mic_info else self._load_mic_pref()),
+            parent=self)
+        self._mic_dialog.completed.connect(_done)
+        self._mic_dialog.open()
+
+    def _switch_mic(self):
+        """Voice panel button — reopen the picker mid-session."""
+        self._open_mic_picker()
+
     def _on_blendshape_changed(self, name: str):
         """User picked a different blendshape in the BlendshapeWatch dropdown.
         BlendshapeWatch has already wiped its own display buffer — we just
@@ -1501,12 +1626,25 @@ class TrustDashboard(QMainWindow):
     # ════════════════════════════════════════════════════════════════════════
     # Audio thread
     # ════════════════════════════════════════════════════════════════════════
-    def _start_audio(self):
-        # Guard against re-entry when a second session starts
-        if hasattr(self, "_audio_stream") and self._audio_stream is not None:
-            return
+    def _start_audio(self, restart: bool = False):
+        """Open the mic stream on whichever device `self._mic_info` names
+        (the picker's choice, or the system default if no picker has run
+        yet). *restart* tears down an already-open stream first — used when
+        switching mics — otherwise a stream already running is left alone,
+        matching `_start_camera`'s guard against a second session's threads
+        doubling up on the first."""
+        if self._audio_stream is not None:
+            if not restart:
+                return
+            self._stop_audio()
+
+        device = self._mic_info.get("index") if self._mic_info else None
         try:
-            self._sample_rate = int(sd.query_devices(kind="input")["default_samplerate"])
+            if device is not None:
+                self._sample_rate = int(self._mic_info.get("samplerate")
+                                        or sd.query_devices(device)["default_samplerate"])
+            else:
+                self._sample_rate = int(sd.query_devices(kind="input")["default_samplerate"])
         except Exception:
             self._sample_rate = 44100
 
@@ -1534,10 +1672,24 @@ class TrustDashboard(QMainWindow):
                 })
 
         try:
-            self._audio_stream = sd.InputStream(channels=1, blocksize=4096, callback=callback)
+            self._audio_stream = sd.InputStream(device=device, channels=1,
+                                                blocksize=4096, callback=callback)
             self._audio_stream.start()
         except Exception as e:
             print(f"Microphone unavailable: {e}")
+            self._audio_stream = None
+
+    def _stop_audio(self):
+        """Release the mic stream so another device can be opened on it —
+        the audio equivalent of `_release_capture`."""
+        if self._audio_stream is not None:
+            try:
+                self._audio_stream.stop()
+                self._audio_stream.close()
+            except Exception:
+                pass
+            self._audio_stream = None
+        self._mic_ok = False
 
     # ════════════════════════════════════════════════════════════════════════
     # Main UI tick
@@ -1632,7 +1784,7 @@ class TrustDashboard(QMainWindow):
             self._last_record_time = now
             total_now = int(scores.get("total", 50))
             if self._last_flag_total is not None and (self._last_flag_total - total_now) > 10:
-                self._emit_flag("Sharp trust drop", total_now)
+                self._emit_flag("Sharp composure drop", total_now)
             self._last_flag_total = total_now
 
         self._check_flags(scores, face_data, vocal_data)
@@ -1873,6 +2025,9 @@ class TrustDashboard(QMainWindow):
             # different height and field of view, so the device travels with the
             # session rather than being lost at the end of it.
             "camera":              dict(self._camera_info),
+            # Same rationale as camera, for the mic — e.g. a laptop mic vs. a
+            # GoPro paired over Bluetooth pick up voice very differently.
+            "mic":                 dict(self._mic_info),
         }
 
     # ════════════════════════════════════════════════════════════════════════
@@ -2555,6 +2710,7 @@ class TrustDashboard(QMainWindow):
 
         participant = stats.get("participant", {}) or {}
         camera = stats.get("camera", {}) or {}
+        mic = stats.get("mic", {}) or {}
         summary_rows = [
             ("Session ID",              getattr(self, "_session_id", "")),
             ("Participant Sex",         participant.get("sex", "—")),
@@ -2564,6 +2720,9 @@ class TrustDashboard(QMainWindow):
             ("Camera",                  (camera.get("name") or "—")),
             ("Camera Connection",       (camera.get("label")
                                          or camera.get("transport") or "—")),
+            ("Microphone",              (mic.get("name") or "—")),
+            ("Microphone Connection",   (mic.get("label")
+                                         or mic.get("transport") or "—")),
             ("Active Channels",         ", ".join(stats.get("active_channels", [])) or "—"),
             ("Duration",                stats.get("duration_str", "")),
             ("Samples Recorded",        stats.get("n_samples", 0)),
@@ -2806,9 +2965,7 @@ class TrustDashboard(QMainWindow):
         except Exception:
             pass
         try:
-            if hasattr(self, "_audio_stream"):
-                self._audio_stream.stop()
-                self._audio_stream.close()
+            self._stop_audio()
         except Exception:
             pass
         super().closeEvent(event)
@@ -2817,8 +2974,8 @@ class TrustDashboard(QMainWindow):
 # ═══════════════════════════════════════════════════════════════════════════
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("Trust")
-    app.setOrganizationName("Trust")
+    app.setApplicationName("Composure")
+    app.setOrganizationName("Composure")
 
     # Measure the screen and scale the design to fit it. Must run before any
     # widget is constructed — sizes are read once, at construction.

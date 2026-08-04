@@ -1070,7 +1070,7 @@ class OverviewScreen(QWidget):
 
         title_col = QVBoxLayout()
         title_col.setSpacing(sp(2))
-        t = QLabel("Trust Level Dashboard")
+        t = QLabel("Composure Dashboard")
         t.setFont(ui_font(17, QFont.Weight.Bold))
         t.setStyleSheet(f"color: {TEXT}; letter-spacing: -0.2px; background: transparent;")
         s = QLabel("Facial · vocal · gaze · HRV · workload analysis")

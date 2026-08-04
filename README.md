@@ -89,6 +89,8 @@ trust-dashboard/
 ├── bpm_monitor.py                   # TEMPORARY — always-on-top BPM readout for checking the strap against a watch (press H)
 ├── camera_scanner.py                # Finds cameras and identifies how each is connected
 ├── camera_dialog.py                 # Camera picker with live preview
+├── mic_scanner.py                   # Finds audio input devices and identifies how each is connected
+├── mic_dialog.py                    # Microphone picker with a live level meter
 ├── theme.py                         # Colours, fonts, and screen-relative sizing
 ├── trust_dashboard.spec             # PyInstaller spec for building a Windows .exe
 ├── requirements.txt                 # Python dependencies
@@ -155,6 +157,25 @@ To see what the scanner detects without launching the app:
 ```bash
 python camera_scanner.py
 ```
+
+---
+
+## Choosing a microphone
+
+Right after the camera, the app lists every audio input device it can see, each labelled with how it is connected:
+
+| Badge | Meaning |
+|---|---|
+| **Built-in microphone** | The laptop's own mic |
+| **USB — wired** | An external mic or audio interface plugged in over USB |
+| **Bluetooth** | A mic paired and connected over Bluetooth — including a GoPro used as a wireless lav mic once it is paired and connected as an audio input |
+| **Unknown connection** | Listed by the OS, but the name doesn't match any known hint — still selectable, just unlabelled |
+
+This picker is simpler than the camera one: `sounddevice` (PortAudio) already reports a real name, channel count, and sample rate for every device cross-platform, so there's no OS-specific device enumeration to do. What it *can't* tell you is transport, so that badge is a best-effort guess from the device name only — trust the live level meter over the badge if they disagree. Selecting a device opens that meter; speak normally and confirm the bar moves before continuing. **Rescan** picks up a device connected after the dialog opened (e.g. a GoPro paired mid-setup). The choice is remembered and preselected next time, and the voice panel's ⇄ button reopens the picker mid-session.
+
+A device the OS lists but that fails a basic settings check is still offered, marked *did not pass a settings check* — usually another app has it open in exclusive mode.
+
+The chosen mic is recorded in the export (Summary sheet) alongside the camera, for the same reason: vocal readings aren't comparable across a laptop mic and an external one.
 
 ---
 
@@ -258,7 +279,7 @@ Each session produces an `.xlsx` workbook. Most sheets carry a legend below the 
 
 | Sheet | Contents | Rate |
 |---|---|---|
-| Summary | Participant details, camera used, duration, averages, peak/low trust, flag count, phase breakdown | once |
+| Summary | Participant details, camera + mic used, duration, averages, peak/low trust, flag count, phase breakdown | once |
 | Trust Session | Total score, all four sub-scores, and the headline metric from each channel | 1 fps |
 | Facial Analysis | Expression, eye openness, blink rate, gaze deviation, pupil, Duchenne smile | 1 fps |
 | Vocal Analysis | Pitch, loudness, tremor, jitter, shimmer, HNR, spectral flux, alpha ratio, Hammarberg index, F1–F2, MFCCs 1–4 | 1 fps |
@@ -281,7 +302,7 @@ Every per-second sheet carries the marked phase alongside the timestamp, so rows
 
 - Python 3.14 (3.10+ should work, but 3.14 is what the app is tested on)
 - A camera — the built-in one, a USB webcam, or a Bluetooth camera (you pick at session start)
-- Microphone (optional — voice analysis is skipped if unavailable)
+- A microphone — the built-in one, a USB mic, or a Bluetooth mic such as a GoPro (you pick at session start; voice analysis is skipped if none is available)
 - Polar H10 or another BLE Heart Rate Service strap (optional)
 - `ffmpeg` and `ffprobe` on your PATH (used for thumbnail extraction and H.264 transcoding)
 
