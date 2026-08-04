@@ -50,7 +50,7 @@ Two things follow from this:
 
 A deliberately wild calibration window — a yawn, a half-covered camera, someone leaning out of frame — cannot rescale a whole channel: the stretch factor is clamped to between 0.5× and 2× the population reference.
 
-The measured baseline is written into the **Score Config** sheet of every export, so a session's numbers can be reproduced and compared against another participant's.
+The measured baseline is shown in a review popup right after calibration (see [How a session works](#how-a-session-works)), and written into the **Score Config** sheet plus a baseline banner on every other sheet of the export, so a session's numbers can be reproduced and compared against another participant's.
 
 ---
 
@@ -61,6 +61,8 @@ The measured baseline is written into the **Score Config** sheet of every export
 2. **Camera** — the app scans for every camera attached to the machine and asks which one to use. See [Choosing a camera](#choosing-a-camera).
 
 3. **Calibration (30 seconds)** — the app records the participant's resting facial metrics, pupil size, voice characteristics, and RMSSD while they are relaxed and unguarded. The camera, microphone, and BLE scan all start before this screen so the preview is already live. A coverage indicator reports what fraction of frames actually found a face. Calibration can be skipped, at the cost described above.
+
+   Right after calibration ends, a **baseline review popup** (`baseline_dialog.py`) shows every sensor's resting value before any session data is recorded — each row marked *measured* or *default* (fell back to the population reference because that signal was never captured), with a warning if face-detection coverage was low. A bad calibration window (participant out of frame, nobody speaking, strap unpaired) is cheap to redo here and expensive to discover after the session.
 
 4. **Live session** — the dashboard runs in real time. Trust score, sub-scores, and waveforms update every second. A face mesh overlay and emotion bars are drawn onto the live video feed.
 
@@ -83,6 +85,8 @@ trust-dashboard/
 ├── overlays.py                      # Calibration overlay, face mesh and emotion overlay rendering
 ├── widgets.py                       # Custom UI widgets (gauges, channel bars, charts)
 ├── demographics_dialog.py           # Participant details collected before calibration
+├── baseline_dialog.py               # Post-calibration popup reviewing every sensor's measured baseline
+├── bpm_monitor.py                   # TEMPORARY — always-on-top BPM readout for checking the strap against a watch (press H)
 ├── camera_scanner.py                # Finds cameras and identifies how each is connected
 ├── camera_dialog.py                 # Camera picker with live preview
 ├── theme.py                         # Colours, fonts, and screen-relative sizing
